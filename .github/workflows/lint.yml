@@ -1,0 +1,42 @@
+name: Lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    env:
+      DPIC_GITHUB_SSH_KEY: ${{ secrets.DPIC_GITHUB_SSH_KEY }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Configure SSH for private dependencies
+        if: ${{ env.DPIC_GITHUB_SSH_KEY != '' }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DPIC_GITHUB_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Check notebook outputs are stripped
+        run: find notebooks -name '*.ipynb' -print0 | xargs -0 -r uv run nbstripout --verify

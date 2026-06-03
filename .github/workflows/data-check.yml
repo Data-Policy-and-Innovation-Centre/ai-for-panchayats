@@ -1,0 +1,38 @@
+name: Data Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  no-raw-data-in-git:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Reject directly committed data and outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bad_files="$(
+            git ls-files 'data/**' 'outputs/**' |
+              grep -Ev '(^|/)\.gitkeep$|\.dvc$' || true
+          )"
+
+          if [ -n "$bad_files" ]; then
+            echo "The following data/output files are tracked directly by Git:"
+            echo "$bad_files"
+            echo ""
+            echo "Use DVC for approved data or keep stakeholder-facing artifacts in Box."
+            exit 1
+          fi
+
+      - name: Check DVC files are present
+        shell: bash
+        run: |
+          test -f .dvc/config
+          test -f dvc.yaml

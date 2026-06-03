@@ -1,0 +1,14 @@
+# Define project-specific pipeline stages here once the processing workflow is
+# known. Keep commands and dependencies explicit so DVC can reproduce outputs.
+#
+# Example:
+# stages:
+#   <stage-name>:
+#     cmd: <command>
+#     deps:
+#       - <input-path>
+#       - <script-or-notebook-path>
+#     outs:
+#       - <output-path>
+
+stages: {}

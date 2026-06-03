@@ -1,0 +1,53 @@
+name: Pipeline
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-validate-pipeline:
+    runs-on: ubuntu-latest
+    env:
+      DPIC_GITHUB_SSH_KEY: ${{ secrets.DPIC_GITHUB_SSH_KEY }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Configure SSH for private dependencies
+        if: ${{ env.DPIC_GITHUB_SSH_KEY != '' }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DPIC_GITHUB_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Validate DVC pipeline file
+        run: uv run dvc dag
+
+      - name: Run DVC pipeline when stages exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(uv run dvc stage list)" ]; then
+            uv run dvc repro
+          else
+            echo "No DVC stages defined yet; skipping dvc repro."
+          fi

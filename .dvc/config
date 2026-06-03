@@ -1,0 +1,5 @@
+[core]
+    remote = s3remote
+['remote "s3remote"']
+    url = s3://dpic-dvc-cache/ai-for-panchayats
+    region = ap-south-1
