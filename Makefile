@@ -1,7 +1,7 @@
 .DEFAULT_GOAL  := help
-INCOMING_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Data/Raw'
+INCOMING_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Data/Raw/'
 RAW_LOCAL       := data/raw/
-EXHIBITS_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Analysis/Exhibits'
+EXHIBITS_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Analysis/Exhibits/'
 EXHIBITS_LOCAL  := outputs/
 SHELL          := /bin/bash
 .SHELLFLAGS    := -euo pipefail -c
