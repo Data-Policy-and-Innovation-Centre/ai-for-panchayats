@@ -10,6 +10,31 @@ Run:
 make setup
 ```
 
+The Makefile defaults to the shared project Box path, but Box may expose
+folders differently depending on a person's access. Check the configured paths:
+
+```bash
+make box-paths
+```
+
+If your Box path differs, override the project root when running a command:
+
+```bash
+make ingest DATA=survey_dump.csv BOX_PROJECT_ROOT="/All Files/AI for Panchayats"
+```
+
+You can also put the override in your shell profile:
+
+```bash
+export BOX_PROJECT_ROOT="/All Files/AI for Panchayats"
+```
+
+If only one endpoint differs, override the full rclone remote instead:
+
+```bash
+make deliver EXHIBITS_REMOTE="box:'/Shared/AI for Panchayats/Analysis/Exhibits/'"
+```
+
 Import a stakeholder-provided original from the Box incoming folder, then
 record an approved version through DVC:
 

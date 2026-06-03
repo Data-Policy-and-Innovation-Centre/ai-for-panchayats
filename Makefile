@@ -1,8 +1,10 @@
 .DEFAULT_GOAL  := help
-INCOMING_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Data/Raw/'
-RAW_LOCAL       := data/raw/
-EXHIBITS_REMOTE := box:'/2. Projects/11. PR&DW/AI for Panchayats/Analysis/Exhibits/'
-EXHIBITS_LOCAL  := outputs/
+BOX_REMOTE      ?= box
+BOX_PROJECT_ROOT ?= /2. Projects/11. PR&DW/AI for Panchayats
+INCOMING_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Data/Raw/'
+RAW_LOCAL       ?= data/raw/
+EXHIBITS_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Analysis/Exhibits/'
+EXHIBITS_LOCAL  ?= outputs/
 SHELL          := /bin/bash
 .SHELLFLAGS    := -euo pipefail -c
 
@@ -16,6 +18,7 @@ help:
 	@echo "  make run             Run the analytics pipeline"
 	@echo "  make exhibits        Regenerate all figures and tables"
 	@echo "  make deliver         Copy exhibits to Box without deleting remote files"
+	@echo "  make box-paths       Show configured Box paths"
 	@echo "  make status          Show what has changed"
 	@echo ""
 
@@ -68,6 +71,12 @@ deliver:
 	@echo "Delivering exhibits to Box..."
 	rclone copy $(EXHIBITS_LOCAL) $(EXHIBITS_REMOTE) --progress
 	@echo "Exhibits delivered. Existing Box files were not deleted."
+
+box-paths:
+	@echo "BOX_REMOTE=$(BOX_REMOTE)"
+	@echo "BOX_PROJECT_ROOT=$(BOX_PROJECT_ROOT)"
+	@echo "INCOMING_REMOTE=$(INCOMING_REMOTE)"
+	@echo "EXHIBITS_REMOTE=$(EXHIBITS_REMOTE)"
 
 status:
 	@echo "=== Git ==="
