@@ -118,6 +118,11 @@ Keep pull requests small enough for a reviewer to understand in one sitting.
 Separate unrelated changes into separate PRs, especially when data, analysis
 logic, and report formatting change independently.
 
+Interns should work on feature-based branches, for example
+`feature/add-gpdp-scraper` or `analysis/ortps-topic-modeling`. Open pull
+requests against `dev`, not `main`; `main` is reserved for reviewed,
+release-ready work.
+
 Before opening a PR, run:
 
 ```bash
