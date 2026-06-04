@@ -7,6 +7,27 @@ PATH="${USER_BIN}:${PATH}"
 
 echo "=== DPIC Workspace Setup ==="
 
+guard_supported_location() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "Do not run setup as root or with sudo."
+        echo "Exit the root shell and run: make setup"
+        exit 1
+    fi
+
+    local repo_dir
+    repo_dir="$(pwd -P)"
+    if grep -qi microsoft /proc/version 2>/dev/null && [[ "${repo_dir}" == /mnt/* ]]; then
+        echo "This repository is on the Windows filesystem: ${repo_dir}"
+        echo "Python virtual environments often fail there under WSL."
+        echo "Clone the repo inside the WSL Linux filesystem, for example:"
+        echo "  mkdir -p ~/Documents/GitHub"
+        echo "  cd ~/Documents/GitHub"
+        echo "  git clone <repo-url>"
+        echo "Then rerun: make setup"
+        exit 1
+    fi
+}
+
 ensure_user_bin_on_path() {
     mkdir -p "${USER_BIN}" "${USER_OPT}"
 
@@ -105,6 +126,7 @@ install_missing_prereqs() {
     command -v aws >/dev/null
 }
 
+guard_supported_location
 install_missing_prereqs
 
 echo "[2/6] Initializing Git repository..."

@@ -26,6 +26,11 @@ Do not run setup with `sudo`, including on WSL. The setup script installs
 missing user-level tools into `~/.local/bin` where possible and adds that
 directory to your shell path.
 
+On WSL, clone this repository inside the Linux filesystem, such as
+`~/Documents/GitHub/ai-for-panchayats`, not under `/mnt/c/...`. Creating the
+Python virtual environment on the Windows-mounted filesystem can fail with
+permission errors.
+
 The Makefile defaults to the shared project Box path, but Box may expose
 folders differently depending on a person's access. Check the configured paths:
 
