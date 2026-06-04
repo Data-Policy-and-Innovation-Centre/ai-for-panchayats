@@ -1,13 +1,111 @@
 #!/bin/bash
 set -euo pipefail
 
+USER_BIN="${HOME}/.local/bin"
+USER_OPT="${HOME}/.local/opt"
+PATH="${USER_BIN}:${PATH}"
+
 echo "=== DPIC Workspace Setup ==="
 
-echo "[1/6] Checking prerequisites..."
-command -v git    >/dev/null || (echo "Install Git: https://git-scm.com/downloads" && exit 1)
-command -v uv     >/dev/null || (echo "Install uv: https://docs.astral.sh/uv/" && exit 1)
-command -v rclone >/dev/null || (echo "Install rclone: https://rclone.org/install/" && exit 1)
-command -v aws    >/dev/null || (echo "Install AWS CLI" && exit 1)
+ensure_user_bin_on_path() {
+    mkdir -p "${USER_BIN}" "${USER_OPT}"
+
+    local path_line='export PATH="${HOME}/.local/bin:${PATH}"'
+    for profile in "${HOME}/.bashrc" "${HOME}/.profile"; do
+        if [ -e "${profile}" ] && ! grep -Fq '.local/bin' "${profile}"; then
+            printf '\n# DPIC workspace tools\n%s\n' "${path_line}" >> "${profile}"
+        fi
+    done
+}
+
+require_command() {
+    command -v "$1" >/dev/null || (echo "Missing required tool: $1" && exit 1)
+}
+
+install_uv() {
+    echo "Installing uv into the current user account..."
+    require_command curl
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    PATH="${HOME}/.cargo/bin:${USER_BIN}:${PATH}"
+}
+
+platform_suffix() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+
+    case "${os}:${arch}" in
+        Linux:x86_64) echo "linux-amd64" ;;
+        Linux:aarch64|Linux:arm64) echo "linux-arm64" ;;
+        Darwin:x86_64) echo "osx-amd64" ;;
+        Darwin:arm64) echo "osx-arm64" ;;
+        *) echo "Unsupported platform for automatic install: ${os} ${arch}" >&2; return 1 ;;
+    esac
+}
+
+install_rclone() {
+    echo "Installing rclone into ${USER_BIN}..."
+    require_command curl
+    require_command unzip
+
+    local suffix tmpdir
+    suffix="$(platform_suffix)"
+    tmpdir="$(mktemp -d)"
+
+    curl -fsSL "https://downloads.rclone.org/rclone-current-${suffix}.zip" -o "${tmpdir}/rclone.zip"
+    unzip -q "${tmpdir}/rclone.zip" -d "${tmpdir}"
+    install -m 0755 "${tmpdir}"/rclone-*-*/rclone "${USER_BIN}/rclone"
+}
+
+install_aws() {
+    echo "Installing AWS CLI into the current user account..."
+    require_command curl
+    require_command unzip
+
+    local os arch aws_arch tmpdir install_dir bin_dir
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    install_dir="${USER_OPT}/aws-cli"
+    bin_dir="${USER_BIN}"
+    tmpdir="$(mktemp -d)"
+
+    if [ "${os}" != "Linux" ]; then
+        echo "Automatic AWS CLI install is only configured for Linux/WSL."
+        echo "Install AWS CLI manually, then rerun make setup."
+        exit 1
+    fi
+
+    case "${arch}" in
+        x86_64) aws_arch="x86_64" ;;
+        aarch64|arm64) aws_arch="aarch64" ;;
+        *) echo "Unsupported AWS CLI architecture: ${arch}" >&2; exit 1 ;;
+    esac
+
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmpdir}/awscliv2.zip"
+    unzip -q "${tmpdir}/awscliv2.zip" -d "${tmpdir}"
+    "${tmpdir}/aws/install" --install-dir "${install_dir}" --bin-dir "${bin_dir}" --update
+}
+
+install_missing_prereqs() {
+    ensure_user_bin_on_path
+
+    echo "[1/6] Checking prerequisites..."
+    command -v git >/dev/null || {
+        echo "Git is required before setup can continue."
+        echo "On WSL, install it with: sudo apt-get update && sudo apt-get install -y git"
+        exit 1
+    }
+    command -v uv >/dev/null || install_uv
+    command -v rclone >/dev/null || install_rclone
+    command -v aws >/dev/null || install_aws
+
+    command -v git >/dev/null
+    command -v uv >/dev/null
+    command -v rclone >/dev/null
+    command -v aws >/dev/null
+}
+
+install_missing_prereqs
 
 echo "[2/6] Initializing Git repository..."
 if [ ! -e .git ]; then
@@ -18,8 +116,7 @@ echo "[3/6] Setting up Python environment..."
 uv sync
 
 echo "[4/6] Configuring DVC credentials..."
-source .venv/bin/activate
-dvc remote modify --local s3remote profile default
+uv run dvc remote modify --local s3remote profile default
 
 echo "[5/6] Authenticating with Box (browser will open)..."
 rclone config reconnect box:
@@ -27,7 +124,7 @@ rclone config reconnect box:
 echo "[6/6] Pulling latest data..."
 make pull
 
-nbstripout --install
+uv run nbstripout --install
 
 echo ""
 echo "=== Setup complete. Run 'make help' to see available commands. ==="

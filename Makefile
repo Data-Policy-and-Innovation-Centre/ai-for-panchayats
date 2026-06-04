@@ -7,6 +7,8 @@ EXHIBITS_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Analysis/Exhibits/'
 EXHIBITS_LOCAL  ?= outputs/
 SHELL          := /bin/bash
 .SHELLFLAGS    := -euo pipefail -c
+USER_BIN       := $(HOME)/.local/bin
+export PATH    := $(USER_BIN):$(PATH)
 
 help:
 	@echo ""
@@ -22,7 +24,7 @@ help:
 	@echo "  make status          Show what has changed"
 	@echo ""
 
-setup: _check_prereqs
+setup:
 	bash scripts/setup.sh
 
 pull: _check_git_clean
@@ -35,7 +37,7 @@ pull: _check_git_clean
 	@echo "[2/3] Syncing Python environment..."
 	uv sync
 	@echo "[3/3] Pulling approved data versions..."
-	dvc pull
+	uv run dvc pull
 	@echo "Done."
 
 ingest: _require_data
@@ -50,21 +52,21 @@ publish-raw: _require_data
 
 push: _require_data _check_git_clean
 	@echo "[1/3] Versioning $(DATA) with DVC..."
-	dvc add $(RAW_LOCAL)$(DATA)
+	uv run dvc add $(RAW_LOCAL)$(DATA)
 	@echo "[2/3] Committing version pointer..."
 	git add $(RAW_LOCAL)$(DATA).dvc .gitignore
 	git commit -m "data: update $(DATA) $$(date +%Y-%m-%d)"
 	@echo "[3/3] Pushing to team remote..."
-	dvc push
+	uv run dvc push
 	git push
 	@echo "Done. Team can now pull $(DATA)."
 
 run:
-	source .venv/bin/activate && dvc repro
+	uv run dvc repro
 	@echo "Pipeline complete. Check outputs/."
 
 exhibits:
-	source .venv/bin/activate && dvc repro
+	uv run dvc repro
 	@echo "Pipeline complete. Check outputs/ for regenerated exhibits."
 
 deliver:
@@ -83,10 +85,10 @@ status:
 	@git status --short
 	@echo ""
 	@echo "=== DVC (local) ==="
-	@dvc status
+	@uv run dvc status
 	@echo ""
 	@echo "=== DVC (remote) ==="
-	@dvc status --cloud
+	@uv run dvc status --cloud
 
 _check_git_clean:
 	@git diff --quiet && git diff --cached --quiet || \

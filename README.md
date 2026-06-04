@@ -22,6 +22,10 @@ Run:
 make setup
 ```
 
+Do not run setup with `sudo`, including on WSL. The setup script installs
+missing user-level tools into `~/.local/bin` where possible and adds that
+directory to your shell path.
+
 The Makefile defaults to the shared project Box path, but Box may expose
 folders differently depending on a person's access. Check the configured paths:
 
