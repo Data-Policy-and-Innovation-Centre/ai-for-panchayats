@@ -25,6 +25,7 @@ help:
 	@echo ""
 
 setup:
+	perl -pi -e 's/\r$$//' scripts/setup.sh
 	bash scripts/setup.sh
 
 pull: _check_git_clean
