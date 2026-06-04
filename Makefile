@@ -26,7 +26,7 @@ help:
 
 setup:
 	perl -pi -e 's/\r$$//' scripts/setup.sh
-	bash scripts/setup.sh
+	BOX_REMOTE="$(BOX_REMOTE)" bash scripts/setup.sh
 
 pull: _check_git_clean
 	@echo "[1/3] Pulling latest code..."

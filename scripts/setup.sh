@@ -3,6 +3,7 @@ set -euo pipefail
 
 USER_BIN="${HOME}/.local/bin"
 USER_OPT="${HOME}/.local/opt"
+BOX_REMOTE="${BOX_REMOTE:-box}"
 PATH="${USER_BIN}:${PATH}"
 
 echo "=== DPIC Workspace Setup ==="
@@ -126,6 +127,18 @@ install_missing_prereqs() {
     command -v aws >/dev/null
 }
 
+ensure_box_remote() {
+    local remote_name
+    remote_name="${BOX_REMOTE%:}"
+
+    if ! rclone listremotes | grep -Fxq "${remote_name}:"; then
+        echo "Creating rclone Box remote '${remote_name}'..."
+        rclone config create "${remote_name}" box
+    fi
+
+    rclone config reconnect "${remote_name}:"
+}
+
 guard_supported_location
 install_missing_prereqs
 
@@ -141,7 +154,7 @@ echo "[4/6] Configuring DVC credentials..."
 uv run dvc remote modify --local s3remote profile default
 
 echo "[5/6] Authenticating with Box (browser will open)..."
-rclone config reconnect box:
+ensure_box_remote
 
 echo "[6/6] Pulling latest data..."
 make pull
