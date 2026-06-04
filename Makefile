@@ -5,6 +5,7 @@ INCOMING_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Data/Raw/'
 RAW_LOCAL       ?= data/raw/
 EXHIBITS_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Analysis/Exhibits/'
 EXHIBITS_LOCAL  ?= outputs/
+-include .env
 SHELL          := /bin/bash
 .SHELLFLAGS    := -euo pipefail -c
 USER_BIN       := $(HOME)/.local/bin

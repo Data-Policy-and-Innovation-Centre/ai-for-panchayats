@@ -31,29 +31,49 @@ On WSL, clone this repository inside the Linux filesystem, such as
 Python virtual environment on the Windows-mounted filesystem can fail with
 permission errors.
 
+### Local Box Paths
+
 The Makefile defaults to the shared project Box path, but Box may expose
-folders differently depending on a person's access. Check the configured paths:
+folders differently depending on a person's access. To set your local paths
+once, create a `.env` file in the repository root:
+
+```make
+BOX_REMOTE=box
+BOX_PROJECT_ROOT=/2. Projects/11. PR&DW/AI for Panchayats
+```
+
+Use Make-style assignments in `.env`; do not use shell `export` lines or shell
+quotes around values with spaces. The `.env` file is optional, local to your
+machine, and already ignored by Git. Do not put credentials or data files in
+`.env`; use it only for local path and remote names.
+
+Most users only need to set `BOX_REMOTE` and `BOX_PROJECT_ROOT`. The Makefile
+derives the raw-data and exhibit remotes from those values:
+
+```make
+INCOMING_REMOTE=$(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Data/Raw/'
+EXHIBITS_REMOTE=$(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Analysis/Exhibits/'
+```
+
+After editing `.env`, check the configured paths:
 
 ```bash
 make box-paths
 ```
 
-If your Box path differs, override the project root when running a command:
+Command-line Make variables still override `.env`, so one-off path changes can
+be passed directly:
 
 ```bash
 make ingest DATA=survey_dump.csv BOX_PROJECT_ROOT="/All Files/AI for Panchayats"
 ```
 
-You can also put the override in your shell profile:
+If the derived paths do not match your Box layout, override the full rclone
+remotes in `.env`:
 
-```bash
-export BOX_PROJECT_ROOT="/All Files/AI for Panchayats"
-```
-
-If only one endpoint differs, override the full rclone remote instead:
-
-```bash
-make deliver EXHIBITS_REMOTE="box:'/Shared/AI for Panchayats/Analysis/Exhibits/'"
+```make
+INCOMING_REMOTE=box:'/Shared/AI for Panchayats/Data/Raw/'
+EXHIBITS_REMOTE=box:'/Shared/AI for Panchayats/Analysis/Exhibits/'
 ```
 
 Import a stakeholder-provided original from the Box incoming folder, then
