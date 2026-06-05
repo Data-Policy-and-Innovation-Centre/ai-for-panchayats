@@ -184,6 +184,10 @@ data/raw/*
 data/clean/*
 data/interim/*
 data/processed/*
+!data/raw/*.dvc
+!data/clean/*.dvc
+!data/interim/*.dvc
+!data/processed/*.dvc
 outputs/*
 !outputs/figures/
 !outputs/tables/
