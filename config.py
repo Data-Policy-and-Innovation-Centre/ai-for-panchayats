@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     ENV: str = os.getenv("ENV", "local")
     DEBUG: bool = os.getenv("DEBUG", "True").lower() in ("true", "1", "yes")
 
-    DB_URL: str = os.getenv(
+    DB_URL: str | None = os.getenv(
         "DB_URL"
     )
     DB_PASSWORD: str | None = os.getenv("DB_PASSWORD")
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
     AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
-    AWS_S3_BUCKET_NAME: str = os.getenv("AWS_S3_BUCKET_NAME")
+    AWS_S3_BUCKET_NAME: str | None = os.getenv("AWS_S3_BUCKET_NAME")
 
     model_config = ConfigDict(env_file=directories.ROOT_DIR / ".env")
 
