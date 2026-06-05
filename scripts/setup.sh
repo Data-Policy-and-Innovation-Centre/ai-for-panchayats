@@ -111,7 +111,7 @@ install_aws() {
 install_missing_prereqs() {
     ensure_user_bin_on_path
 
-    echo "[1/6] Checking prerequisites..."
+    echo "[1/7] Checking prerequisites..."
     command -v git >/dev/null || {
         echo "Git is required before setup can continue."
         echo "On WSL, install it with: sudo apt-get update && sudo apt-get install -y git"
@@ -142,21 +142,24 @@ ensure_box_remote() {
 guard_supported_location
 install_missing_prereqs
 
-echo "[2/6] Initializing Git repository..."
+echo "[2/7] Initializing Git repository..."
 if [ ! -e .git ]; then
     git init
 fi
 
-echo "[3/6] Setting up Python environment..."
+echo "[3/7] Setting up Python environment..."
 uv sync
 
-echo "[4/6] Configuring DVC credentials..."
+echo "[4/7] Installing skills..."
+uv run dpic-sync-opencode-skills
+
+echo "[5/7] Configuring DVC credentials..."
 uv run dvc remote modify --local s3remote profile default
 
-echo "[5/6] Authenticating with Box (browser will open)..."
+echo "[6/7] Authenticating with Box (browser will open)..."
 ensure_box_remote
 
-echo "[6/6] Pulling latest data..."
+echo "[7/7] Pulling latest data..."
 make pull
 
 uv run nbstripout --install
