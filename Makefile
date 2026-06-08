@@ -44,12 +44,12 @@ pull: _check_git_clean
 
 ingest: _require_data
 	@echo "Copying original $(DATA) from Box..."
-	rclone copy $(INCOMING_REMOTE)$(DATA) $(RAW_LOCAL) --progress
+	rclone copyto $(INCOMING_REMOTE)$(DATA) $(RAW_LOCAL)$(DATA) --progress
 	@echo "Ingested $(DATA). The original Box file was not modified."
 
 publish-raw: _require_data
 	@echo "Publishing latest $(DATA) to Box..."
-	rclone copy $(RAW_LOCAL)$(DATA) $(INCOMING_REMOTE) --progress
+	rclone copyto $(RAW_LOCAL)$(DATA) $(INCOMING_REMOTE)$(DATA) --progress
 	@echo "Published $(DATA). Existing Box files with other names were not deleted."
 
 push: _require_data _check_git_clean
