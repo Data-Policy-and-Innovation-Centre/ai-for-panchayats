@@ -38,8 +38,8 @@ target_gps:
 pilot_gp_limit: null
 
 output:
-  root: 'C:\Users\dpico\Box\Data'
-  folder: "meri_panchayat_ravi_"
+  root: '/home/dpico/ai-for-panchayats/data/raw'
+  folder: "meri_panchayat"
   files:
     activities:       "odisha_gp_activities"
     activity_summary: "odisha_gp_activity_summary"
