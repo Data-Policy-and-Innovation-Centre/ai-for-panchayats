@@ -47,6 +47,7 @@ output:
     funds:            "odisha_gp_funds"
     beneficiaries:    "odisha_gp_beneficiaries_all_years"
     villages:         "odisha_gp_villages"
+    panchayat_payment_register:  "odisha_gp_epayment_orders"
 
 save_every_gp: 100
 

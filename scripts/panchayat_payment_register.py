@@ -23,7 +23,7 @@ from config_loader import (
     build_headers, output_paths,
 )
 
-OUTPUT_FILE_CSV, OUTPUT_FILE_JSON = output_paths("epayment_orders")
+OUTPUT_FILE_CSV, OUTPUT_FILE_JSON = output_paths("panchayat_payment_register")
 
 MASTER_HEADERS = build_headers(MASTER_SECRET_KEY, lang="null-IN")
 EPO_HEADERS    = build_headers(FUNDS_SECRET_KEY,  lang="en-IN")
