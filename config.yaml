@@ -19,7 +19,7 @@ target_gps:
   - [119599, "Barimunda"]
   - [119605, "Itipur"]
   - [116936, "Dadhapatna"]
-  - [116978, "Govindpur"]
+  - [117153, "Govindapur"]
   - [116350, "Hirlipali"]
   - [116400, "Bhatigaon"]
   - [116438, "Bheden"]
@@ -34,7 +34,7 @@ target_gps:
   - [121663, "Haldikudar"]
   - [121526, "Karuabahal"]
   - [275075, "Mendarajpur"]
-
+  - [118012, "Sharagada"]
 pilot_gp_limit: null
 
 output:
