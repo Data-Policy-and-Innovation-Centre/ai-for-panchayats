@@ -202,3 +202,4 @@ outputs/reports/*
 !outputs/figures/.gitkeep
 !outputs/tables/.gitkeep
 !outputs/reports/.gitkeep
+.DS_Store
