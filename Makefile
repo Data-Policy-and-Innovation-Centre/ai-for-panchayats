@@ -59,6 +59,7 @@ push: _require_data _check_git_clean
 	git add $(RAW_LOCAL)$(DATA).dvc .gitignore
 	git commit -m "data: update $(DATA) $$(date +%Y-%m-%d)"
 	@echo "[3/3] Pushing to team remote..."
+	uv run dvc repro
 	uv run dvc push
 	git push
 	@echo "Done. Team can now pull $(DATA)."
