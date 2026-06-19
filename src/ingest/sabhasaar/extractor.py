@@ -27,6 +27,7 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
         zp_response = fetch_json(f"{base_url}/gp_report/{state_code}", headers=headers, params={"fin_year": filters["fin_year"]})
         if not zp_response or "data" not in zp_response:
             print("Failed to retrieve Zilla Panchayat data.")
+            audit_log.append(["ALL", "ALL", "ALL", "N/A", "FAILED", "State API failed to return ZP data"])
             return
 
         for zp in zp_response["data"]:
@@ -36,6 +37,8 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
 
             bp_response = fetch_json(f"{base_url}/gp_report/{state_code}/{zp_code}", headers=headers, params=filters)
             if not bp_response or "data" not in bp_response:
+                # Log the BP failure before skipping
+                audit_log.append([zp_name, "ALL", "ALL", "N/A", "FAILED", "API failed to return BP data for this District"])
                 continue
 
             for bp in bp_response["data"]:
@@ -45,6 +48,8 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
 
                 gp_response = fetch_json(f"{base_url}/gp_report/{state_code}/{zp_code}/{bp_code}", headers=headers, params=filters)
                 if not gp_response or "data" not in gp_response:
+                    # Log the GP failure before skipping
+                    audit_log.append([zp_name, bp_name, "ALL", "N/A", "FAILED", "API failed to return GP data for this Block"])
                     continue
 
                 for gp in gp_response["data"]:
@@ -55,6 +60,8 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
                     mom_response = fetch_json(f"{base_url}/dashboard-minutes", headers=headers, params=mom_params)
 
                     if not mom_response or "meetings" not in mom_response or len(mom_response["meetings"]) == 0:
+                        # Log the empty/failed meeting fetch before skipping
+                        audit_log.append([zp_name, bp_name, gp_name, "N/A", "SKIPPED", "No meetings found or API failed"])
                         continue
 
                     print(f"    -> Found {len(mom_response['meetings'])} meetings for {gp_name}. Processing...")
@@ -72,6 +79,7 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
                         audit_log.append([zp_name, bp_name, gp_name, json_filename, "DOWNLOADED", "RAW JSON DATA"])
                     except Exception as e:
                         print(f"      Error saving JSON {json_filename}: {e}")
+                        audit_log.append([zp_name, bp_name, gp_name, json_filename, "FAILED", f"JSON Save Error: {e}"])
 
                     # ==========================================
                     # 2. SAVE FORMATTED HTML (Multiple files per GP)
@@ -118,13 +126,14 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
                         styled_doc = generate_styled_document(metadata, clean_html)
 
                         status_note = truncation_note if truncation_note else "DOWNLOADED"
-                        audit_log.append([zp_name, bp_name, gp_name, base_filename, "DOWNLOADED", status_note])
 
                         try:
                             with open(os.path.join(html_target_dir, base_filename), "w", encoding="utf-8") as file:
                                 file.write(styled_doc)
+                            audit_log.append([zp_name, bp_name, gp_name, base_filename, "DOWNLOADED", status_note])
                         except Exception as e:
                             print(f"      Error saving HTML {base_filename}: {e}")
+                            audit_log.append([zp_name, bp_name, gp_name, base_filename, "FAILED", f"HTML Save Error: {e}"])
 
     finally:
         csv_path = os.path.join(output_base_path, "Extraction_Audit_Report.csv")
