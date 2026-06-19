@@ -57,9 +57,7 @@ def get_gps(zp_id, bp_id):
     data = fetch_json(url, MASTER_HEADERS)
     return data.get("response", []) if data else []
 
-def save_outputs(df, csv_path=None, json_path=None):
+def save_outputs(df, json_path=None):
     """Unified file preservation utility."""
-    if csv_path:
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     if json_path:
         df.to_json(json_path, orient="records", indent=2, force_ascii=False)
