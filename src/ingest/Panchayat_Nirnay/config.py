@@ -1,4 +1,3 @@
-# --- 1. THE PILOT CATALOG (20 Target GPs) ---
 TARGET_GPS = [
     {"zp_name": "Khordha", "zp_id": 321, "bp_name": "Bhubaneswar", "bp_id": 3823, "gp_name": "Andhrua", "gp_code": 119598},
     {"zp_name": "Khordha", "zp_id": 321, "bp_name": "Bhubaneswar", "bp_id": 3823, "gp_name": "Barimunda", "gp_code": 119599},
@@ -35,11 +34,12 @@ HEADERS = {
     "uuid": "cc8e6f63-3e9b-4320-bfcd-738e5f9f98bb",
     
     # !!! UPDATE THESE TWO WITH FRESH VALUES IF THE SCRIPT HALTS !!!
-    "secretkey": "b2d238d1131fbfe834a9fad7d4e37df802a15bac31dcda0736fde51873c11c6a",
-    "timestamp": "19062026070010"
+    "secretkey": "7ffb5623a39f30271808ea583359d5252788a540b542de5c715c58ee12163836",
+    "timestamp": "22062026095208"
 }
 
 # --- 3. API ENDPOINTS ---
 MEETINGS_LIST_API = "https://meetingonline.gov.in/gsn_api/live/gsn_get_recent/v1/meetings"
+AGENDA_LIST_API = "https://meetingonline.gov.in/gsn_api/live/gsn_get_recent/v1/agenda"
 MEETING_DETAILS_API = "https://meetingonline.gov.in/gsn_api/live/meetings/v2/get_meeting_summary"
 DOWNLOAD_BASE = "https://meetingonline.gov.in/gsn_api/live/nrega/v1/download_file/meetings"
