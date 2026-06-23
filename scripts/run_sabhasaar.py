@@ -1,10 +1,4 @@
-import sys
 from datetime import datetime
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(PROJECT_ROOT))
-
 from src.ingest.sabhasaar.config import SOURCE_PORTAL, STATE_CODE, HEADERS, FILTERS
 from src.ingest.sabhasaar.extractor import run_extraction
 from config import directories
