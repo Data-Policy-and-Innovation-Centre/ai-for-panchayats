@@ -1,9 +1,3 @@
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(PROJECT_ROOT))
-
 from config import directories
 from src.ingest.Panchayat_Nirnay.config import TARGET_GPS, HEADERS, MEETINGS_LIST_API, AGENDA_LIST_API, MEETING_DETAILS_API, DOWNLOAD_BASE
 from src.ingest.Panchayat_Nirnay.extractor import scrape_catalog

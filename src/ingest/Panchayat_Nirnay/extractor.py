@@ -18,7 +18,7 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
     run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     csv_path = output_dir / f"Extraction_Audit_Report_{run_timestamp}.csv"
 
-    print(f"--- INITIALIZING AUDIT SCRAPE ---")
+    print("--- INITIALIZING AUDIT SCRAPE ---")
 
     try:
         for idx in range(start_idx, len(target_gps)):
@@ -27,9 +27,9 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
             bp_name = gp['bp_name']
             gp_name = gp['gp_name']
 
-            print(f"\n=======================================================")
+            print("\n=======================================================")
             print(f"📍 PROCESSING GP [{idx+1}/{len(target_gps)}]: {gp_name} (Code: {gp['gp_code']})")
-            print(f"=======================================================")
+            print("=======================================================")
             
             zp_folder = f"{safe_name(zp_name)} ({gp['zp_id']})"
             bp_folder = f"{safe_name(bp_name)} ({gp['bp_id']})"
@@ -63,19 +63,19 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
             try:
                 res_meetings = requests.post(list_api, headers=headers, json=payload, timeout=15)
                 if res_meetings.status_code == 401:
-                    print(f"\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Recent Meetings.")
+                    print("\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Recent Meetings.")
                     audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Recent Meetings API", "FAILED", "HTTP 401: Skeleton Key Expired"])
                     return
                 extract_meetings(res_meetings.json())
             except Exception as e:
-                print(f"[!] FAILED to fetch Recent Meetings list: {e}")
+                print("[!] FAILED to fetch Recent Meetings list: {e}")
                 audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Recent Meetings API", "FAILED", str(e)])
 
             # --- PHASE 1B: Fetch from 'Agenda Items' Tab ---
             try:
                 res_agenda = requests.post(agenda_api, headers=headers, json=payload, timeout=15)
                 if res_agenda.status_code == 401:
-                    print(f"\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Agenda Items.")
+                    print("\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Agenda Items.")
                     audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Agenda API", "FAILED", "HTTP 401: Skeleton Key Expired"])
                     return
                 extract_meetings(res_agenda.json())
@@ -99,7 +99,7 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                 try:
                     detail_res = requests.post(details_api, headers=headers, json={"meeting_id": m_id}, timeout=15)
                     if detail_res.status_code == 401:
-                        print(f"\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) during details fetch.")
+                        print("\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) during details fetch.")
                         audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, folder_name, "FAILED", "HTTP 401: Skeleton Key Expired"])
                         return
                     detail_res.raise_for_status()
