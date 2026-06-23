@@ -1,0 +1,37 @@
+state:
+  id: 21
+  name: "Odisha"
+
+financial_years:
+  - "2019-2020"
+  - "2020-2021"
+  - "2021-2022"
+  - "2022-2023"
+  - "2023-2024"
+  - "2024-2025"
+  - "2025-2026"
+  - "2026-2027"
+
+hierarchy_fin_year: "2020-2021"
+
+output:
+  root: '~/ai-for-panchayats/data/raw'
+  folder: "meri_panchayat"
+
+save_every_gp: 100
+
+request_delay: 0.50
+request_timeout: 30
+
+api:
+  access_key: "541C469D-4E5E-4A72-8F84-DB9AF490F362"
+  secret_keys:
+    master:           "b41e7d10e6c9758c9bc88ab9fabcce964713908c1fd8252596af21f3e7687838"
+    activities:       "fdc4c410f5fb6489faea03102c28b07a4e3cb012d31b73b8654d730410eb7502"
+    activity_summary: "5081066954ccbb464ab8122b5a62d5389ec7e4c56da091936aa4742bf689b32a"
+    action_plans:     "7b21f117a42d1c68611642ee098d9a86f19643eac109a3f47af3ebb257fdf42a"
+    funds:            "bcd8e455f4c8bc2825a1d9a503cc438c401defe3918a5cd0311e8039095be0e4"
+    beneficiaries:    "0d80f1a436d6b147cd9d0f5968e432792f2e83fbaf75e1fa098c39efdf34d229"
+    gp_profile:       "e702eb4b1e716e7dd0bab927b073799f4f3c3f931449a06b752c549cf0f58154"
+
+base_url: "https://egramswaraj.gov.in/meri_panchayat"

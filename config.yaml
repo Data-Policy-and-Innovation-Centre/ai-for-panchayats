@@ -1,0 +1,68 @@
+state:
+  id: 21
+  name: "Odisha"
+
+financial_years:
+  - "2019-2020"
+  - "2020-2021"
+  - "2021-2022"
+  - "2022-2023"
+  - "2023-2024"
+  - "2024-2025"
+  - "2025-2026"
+  - "2026-2027"
+
+hierarchy_fin_year: "2026-2027"
+
+target_gps:
+  - [119598, "Andhrua"]
+  - [119599, "Barimunda"]
+  - [119605, "Itipur"]
+  - [116936, "Dadhapatna"]
+  - [117153, "Govindapur"]
+  - [116350, "Hirlipali"]
+  - [116400, "Bhatigaon"]
+  - [116438, "Bheden"]
+  - [116397, "Bandhpali"]
+  - [117835, "Chikilli"]
+  - [117951, "Biswamathpur"]
+  - [119717, "Boipariguda"]
+  - [119862, "Laxmipur"]
+  - [118939, "Dutimendi"]
+  - [121162, "Kalyansinghpur"]
+  - [119936, "Kalimela"]
+  - [121663, "Haldikudar"]
+  - [121526, "Karuabahal"]
+  - [275075, "Mendarajpur"]
+  - [118012, "Sharagada"]
+pilot_gp_limit: null
+
+output:
+  root: '/home/dpico/ai-for-panchayats/data/raw'
+  folder: "meri_panchayat"
+  files:
+    activities:       "odisha_gp_activities"
+    activity_summary: "odisha_gp_activity_summary"
+    action_plans:     "odisha_gp_action_plans"
+    funds:            "odisha_gp_funds"
+    beneficiaries:    "odisha_gp_beneficiaries_all_years"
+    villages:         "odisha_gp_villages"
+    panchayat_payment_register:  "odisha_gp_epayment_orders"
+
+save_every_gp: 100
+
+request_delay: 0.50
+request_timeout: 30
+
+api:
+  access_key: "541C469D-4E5E-4A72-8F84-DB9AF490F362"
+  secret_keys:
+    master:           "b41e7d10e6c9758c9bc88ab9fabcce964713908c1fd8252596af21f3e7687838"
+    activities:       "fdc4c410f5fb6489faea03102c28b07a4e3cb012d31b73b8654d730410eb7502"
+    activity_summary: "5081066954ccbb464ab8122b5a62d5389ec7e4c56da091936aa4742bf689b32a"
+    action_plans:     "7b21f117a42d1c68611642ee098d9a86f19643eac109a3f47af3ebb257fdf42a"
+    funds:            "98495991df1622b15c90b6955ec5a3334e8d24abf85e2c4a9c128e43a3933023"
+    beneficiaries:    "0d80f1a436d6b147cd9d0f5968e432792f2e83fbaf75e1fa098c39efdf34d229"
+    gp_profile:       "e702eb4b1e716e7dd0bab927b073799f4f3c3f931449a06b752c549cf0f58154"
+
+base_url: "https://egramswaraj.gov.in/meri_panchayat"
