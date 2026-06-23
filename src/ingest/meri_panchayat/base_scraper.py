@@ -2,9 +2,7 @@
 # Centralized core engine for Meri Panchayat Data Extraction
 # Author: Ravishankar Singh
 
-import os
 import requests
-import pandas as pd
 from config import (
     BASE_URL, STATE_ID, HIERARCHY_FIN_YEAR, 
     MASTER_SECRET_KEY, REQUEST_TIMEOUT, build_headers

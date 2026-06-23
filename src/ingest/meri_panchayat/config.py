@@ -41,6 +41,8 @@ ACTION_PLANS_SECRET_KEY      = _keys["action_plans"]
 FUNDS_SECRET_KEY             = _keys["funds"]
 BENEFICIARIES_SECRET_KEY     = _keys["beneficiaries"]
 GP_PROFILE_SECRET_KEY        = _keys["gp_profile"]
+FUNDS_SECRET_KEY             = _keys["funds"]
+
 
 def build_headers(secret_key: str, lang: str = "null-IN", extra: dict = None) -> dict:
     h = {
