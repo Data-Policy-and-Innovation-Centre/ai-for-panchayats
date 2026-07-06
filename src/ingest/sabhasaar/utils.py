@@ -2,8 +2,9 @@ import re
 
 def clean_minutes_html(raw_minutes_html: str) -> str:
     """Sanitizes AI-generated HTML by removing rogue tags and excessive breaks."""
-    if not raw_minutes_html:
-        return "<p>No minutes recorded.</p>"
+    # Return empty string if the input is empty or only whitespace
+    if not raw_minutes_html or not str(raw_minutes_html).strip():
+        return ""
 
     clean_minutes = re.sub(r'</?div[^>]*>', '', raw_minutes_html)
     clean_minutes = re.sub(r'(<br\s*/?>\s*){3,}', '<br><br>', clean_minutes)

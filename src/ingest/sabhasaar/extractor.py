@@ -88,6 +88,12 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
                     os.makedirs(html_target_dir, exist_ok=True)
 
                     for idx, meeting in enumerate(mom_response["meetings"]):
+                        # ---  Check for empty minutes and skip ---
+                        raw_minutes = meeting.get("minutes", "")
+                        if not raw_minutes or not str(raw_minutes).strip():
+                            audit_log.append([zp_name, bp_name, gp_name, "N/A", "SKIPPED", "No minutes content found in meeting record"])
+                            continue
+                        
                         date = meeting.get("meeting_date", "YYYY-MM-DD")
                         original_title = meeting.get("meeting_title", "Untitled Meeting")
                         title_to_process = original_title
@@ -122,7 +128,7 @@ def run_extraction(base_url, state_code, headers, filters, output_base_path):
                             "date": date
                         }
 
-                        clean_html = clean_minutes_html(meeting.get("minutes", ""))
+                        clean_html = clean_minutes_html(raw_minutes)
                         styled_doc = generate_styled_document(metadata, clean_html)
 
                         status_note = truncation_note if truncation_note else "DOWNLOADED"

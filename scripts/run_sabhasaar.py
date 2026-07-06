@@ -1,11 +1,12 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from src.ingest.sabhasaar.config import SOURCE_PORTAL, STATE_CODE, HEADERS, FILTERS
 from src.ingest.sabhasaar.extractor import run_extraction
 from config import directories
 
 if __name__ == "__main__":
-    RUN_DATE = datetime.now().strftime("%Y-%m-%d")
-    
+    RUN_DATE = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d_%H:%M:%S")
+
     OUTPUT_DATASET = directories.RAW_DATA / f"SabhaSaar_{RUN_DATE}"
     
     run_extraction(
