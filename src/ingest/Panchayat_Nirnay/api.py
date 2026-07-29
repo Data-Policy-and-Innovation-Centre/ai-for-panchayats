@@ -12,5 +12,7 @@ def download_file(url: str, save_path: Path, headers: dict):
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
         print("        ✓ Saved.")
+        return True 
     except Exception as e:
         print(f"        [!] DOWNLOAD ERROR: {e}")
+        return False 

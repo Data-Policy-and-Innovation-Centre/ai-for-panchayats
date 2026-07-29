@@ -115,8 +115,9 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                 for photo in data_payload.get('meeting_photos', []):
                     if p := photo.get('photo_url'):
                         save_name = f"[PHOTO]_{p.split('file_name=')[-1]}"
-                        download_file(f"{download_base}?{p}", meeting_folder / save_name, headers)
-                        downloaded_count += 1
+                        # Only increment if the download succeeds
+                        if download_file(f"{download_base}?{p}", meeting_folder / save_name, headers):
+                            downloaded_count += 1
 
                 # --- Extract Register "Documents" ---
                 for doc_type in ['agenda_copy', 'decision_copy', 'attendance_copy']:
@@ -124,8 +125,9 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                         if p := doc.get(f"{doc_type.split('_')[0]}_url"):
                             clean_doc_tag = f"[{doc_type.split('_')[0].upper()}]"
                             save_name = f"{clean_doc_tag}_{p.split('file_name=')[-1]}"
-                            download_file(f"{download_base}?{p}", meeting_folder / save_name, headers)
-                            downloaded_count += 1
+                            # Only increment if the download succeeds
+                            if download_file(f"{download_base}?{p}", meeting_folder / save_name, headers):
+                                downloaded_count += 1
 
                 # Log the success for this specific meeting
                 audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, folder_name, "SUCCESS", f"Downloaded {downloaded_count} files"])
