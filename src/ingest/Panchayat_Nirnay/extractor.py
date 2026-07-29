@@ -66,9 +66,11 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                     print("\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Recent Meetings.")
                     audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Recent Meetings API", "FAILED", "HTTP 401: Skeleton Key Expired"])
                     return
+                
+                res_meetings.raise_for_status() 
                 extract_meetings(res_meetings.json())
             except Exception as e:
-                print("[!] FAILED to fetch Recent Meetings list: {e}")
+                print(f"[!] FAILED to fetch Recent Meetings list: {e}")
                 audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Recent Meetings API", "FAILED", str(e)])
 
             # --- PHASE 1B: Fetch from 'Agenda Items' Tab ---
@@ -78,6 +80,8 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                     print("\n[!] ALERT: SKELETON KEY EXPIRED! (HTTP 401) on Agenda Items.")
                     audit_log.append([datetime.now().isoformat(), zp_name, bp_name, gp_name, "Agenda API", "FAILED", "HTTP 401: Skeleton Key Expired"])
                     return
+                
+                res_agenda.raise_for_status() 
                 extract_meetings(res_agenda.json())
             except Exception as e:
                 print(f"[!] FAILED to fetch Agenda list: {e}")
@@ -115,7 +119,6 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                 for photo in data_payload.get('meeting_photos', []):
                     if p := photo.get('photo_url'):
                         save_name = f"[PHOTO]_{p.split('file_name=')[-1]}"
-                        # Only increment if the download succeeds
                         if download_file(f"{download_base}?{p}", meeting_folder / save_name, headers):
                             downloaded_count += 1
 
@@ -125,7 +128,6 @@ def scrape_catalog(target_gps, headers, list_api, agenda_api, details_api, downl
                         if p := doc.get(f"{doc_type.split('_')[0]}_url"):
                             clean_doc_tag = f"[{doc_type.split('_')[0].upper()}]"
                             save_name = f"{clean_doc_tag}_{p.split('file_name=')[-1]}"
-                            # Only increment if the download succeeds
                             if download_file(f"{download_base}?{p}", meeting_folder / save_name, headers):
                                 downloaded_count += 1
 
