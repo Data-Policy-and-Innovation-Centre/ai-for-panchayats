@@ -5,13 +5,21 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "beautifulsoup4>=4.14.3",
     "dpic",
+    "duckdb>=1.5.5",
+    "duckdb-engine>=0.17.0",
     "dvc[s3]>=3.67.1",
     "loguru>=0.7.3",
+    "lxml>=6.1.1",
+    "openpyxl>=3.1.5",
     "pandas>=3.0.3",
     "pandera>=0.31.1",
     "polars>=1.41.2",
+    "psycopg2-binary>=2.9.12",
     "pyarrow>=24.0.0",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.51",
 ]
 
 [tool.uv.sources]
