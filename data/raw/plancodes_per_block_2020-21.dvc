@@ -1,0 +1,6 @@
+outs:
+- md5: 81a8dcd58ccffa4e35a92035b9e6ec89.dir
+  size: 5051
+  nfiles: 16
+  hash: md5
+  path: plancodes_per_block_2020-21
