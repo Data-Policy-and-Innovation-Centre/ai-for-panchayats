@@ -1,0 +1,6 @@
+outs:
+- md5: c9448ea900b314c493917b48f8e5a0ee.dir
+  size: 3551481
+  nfiles: 21
+  hash: md5
+  path: accounting
