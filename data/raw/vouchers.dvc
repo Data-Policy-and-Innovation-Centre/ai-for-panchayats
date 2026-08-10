@@ -1,0 +1,6 @@
+outs:
+- md5: a20861f32cf35277e357ecf05c09551a.dir
+  size: 2808533
+  nfiles: 20
+  hash: md5
+  path: vouchers
