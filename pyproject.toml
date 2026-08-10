@@ -6,12 +6,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dpic",
+    "duckdb>=1.5.5",
+    "duckdb-engine>=0.17.0",
     "dvc[s3]>=3.67.1",
     "loguru>=0.7.3",
     "pandas>=3.0.3",
     "pandera>=0.31.1",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
+    "sqlalchemy>=2.0.51",
 ]
 
 [tool.uv.sources]
