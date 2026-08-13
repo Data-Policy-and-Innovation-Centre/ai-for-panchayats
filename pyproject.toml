@@ -7,11 +7,13 @@ requires-python = ">=3.13"
 dependencies = [
     "dpic",
     "dvc[s3]>=3.67.1",
+    "indic-transliteration>=2.3.82",
     "loguru>=0.7.3",
     "pandas>=3.0.3",
     "pandera>=0.31.1",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
+    "requests>=2.34.2",
 ]
 
 [tool.uv.sources]
