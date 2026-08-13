@@ -1,62 +1,64 @@
-import os
+#!/usr/bin/env python3
+"""Run the Meri Panchayat ingestion adapters in order.
+
+Each adapter is imported and called in this process, so an import error or a
+FetchError surfaces immediately instead of being reported as a skipped script.
+The pipeline exits non-zero on the first failure and never claims success after
+one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import sys
-import subprocess
 
-# 1. Define absolute project locations
-PROJECT_ROOT = "/home/dpico/ai-for-panchayats"
-TARGET_DIR = os.path.join(PROJECT_ROOT, "src/ingest/meri_panchayat")
-SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+from ingest.meri_panchayat.config import MissingCredential
 
-# 2. Sequence of files to run
-SCRIPTS_TO_RUN = [
-    "village_population.py",
-    "panchayat_funds.py",
-    "panchayat_payment_register.py",
-    "action_plans.py",
-    "activity_summary.py",
-    "beneficiaries.py",
-    "work_activities.py"
+STAGES = [
+    "village_population",
+    "panchayat_funds",
+    "panchayat_payment_register",
+    "action_plans",
+    "activity_summary",
+    "beneficiaries",
+    "work_activities",
 ]
 
-def run_pipeline():
-    print("==================================================")
-    print("  Starting Meri Panchayat Ingestion Pipeline")
-    print("==================================================")
-    print(f"Project Root: {PROJECT_ROOT}\n")
+logger = logging.getLogger("meri_panchayat")
 
-    # 3. Build a dual-layer PYTHONPATH environment.
-    # This forces Python to look in BOTH 'src' and the local folder,
-    # resolving 'import config' and 'from ingest...' perfectly.
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{SRC_DIR}:{TARGET_DIR}:{env.get('PYTHONPATH', '')}"
 
-    for script in SCRIPTS_TO_RUN:
-        script_path = os.path.join(TARGET_DIR, script)
-        
-        if not os.path.exists(script_path):
-            print(f"[WARNING] File not found: {script_path}. Skipping...")
-            continue
+def run_stage(name: str) -> None:
+    module = __import__(f"ingest.meri_panchayat.{name}", fromlist=["main"])
+    module.main()
 
-        print(f"🚀 Running: {script}")
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=STAGES,
+                        metavar="STAGE",
+                        help=f"stages to run (default: all of {' '.join(STAGES)})")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s | %(levelname)-8s | %(message)s")
+
+    for stage in args.stages:
+        logger.info("Running %s", stage)
         try:
-            # We keep the cwd as PROJECT_ROOT since your scripts/configs 
-            # likely map paths relative to where you stand in the terminal.
-            subprocess.run(
-                [sys.executable, script_path],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True
-            )
-            print(f"✅ Successfully completed: {script}\n")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"\n❌ [CRITICAL ERROR] {script} failed with exit code {e.returncode}")
-            print("Aborting pipeline immediately to prevent partial data state.")
-            sys.exit(e.returncode)
+            run_stage(stage)
+        except MissingCredential as exc:
+            logger.error("%s: %s", stage, exc)
+            return 2
+        except Exception:
+            logger.exception("%s failed; aborting before a partial state is "
+                             "published", stage)
+            return 1
+        logger.info("Completed %s", stage)
 
-    print("==================================================")
-    print("  Pipeline Completed Successfully!")
-    print("==================================================")
+    logger.info("Pipeline completed: %s", ", ".join(args.stages))
+    return 0
+
 
 if __name__ == "__main__":
-    run_pipeline()
+    sys.exit(main(sys.argv[1:]))

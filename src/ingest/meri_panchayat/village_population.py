@@ -4,24 +4,22 @@
 # Date: 16-06-2026
 
 import os
-import sys
 import time
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (
+from .config import (
+    in_scope,
     STATE_ID, STATE_NAME,
     FIN_YEARS,
     OUTPUT_DIR, SAVE_EVERY_GP,
     REQUEST_DELAY, BASE_URL,
-    GP_PROFILE_SECRET_KEY,
     build_headers, get_output_path,
 )
-from base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
-PROFILE_HEADERS = build_headers(GP_PROFILE_SECRET_KEY, lang="null-IN")
+PROFILE_HEADERS = build_headers("gp_profile", lang="null-IN")
 
 # Villages come directly out of profile listings tracked safely across bounding timelines
 PROFILE_QUERY_FIN_YEAR = FIN_YEARS[-1]
@@ -54,6 +52,9 @@ def main():
 
             for gp in get_gps(zp_id, bp_id):
                 gp_id, gp_name = gp.get("gpId"), gp.get("name")
+
+                if not in_scope(gp_id):
+                    continue
                 print(f"    GP {processed_gp_count + 1}: {gp_name}")
                 
                 villages = get_villages(gp_id)
@@ -69,7 +70,10 @@ def main():
                         "bp_name":      bp_name,
                         "gp_id":        gp_id,
                         "gp_name":      gp_name,
-                        "lgd_code":     village.get("ldgCode"),
+                        # The profile feed has shipped both spellings; "ldgCode"
+                        # alone silently nulled every village LGD code.
+                        "lgd_code":     village.get("lgdCode",
+                                                    village.get("ldgCode")),
                         "village_name": village.get("name"),
                         "population":   village.get("population"),
                     })

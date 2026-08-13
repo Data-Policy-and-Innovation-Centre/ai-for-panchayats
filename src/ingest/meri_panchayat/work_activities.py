@@ -4,25 +4,22 @@
 # Date: 07-06-2026
 
 import os
-import sys
 import time
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (
+from .config import (
+    in_scope,
     STATE_ID, STATE_NAME,
     FIN_YEARS,
-    TARGET_GP_IDS,
     OUTPUT_DIR, SAVE_EVERY_GP,
     REQUEST_DELAY, BASE_URL,
-    ACTIVITIES_SECRET_KEY,
     build_headers, output_paths,
 )
-from base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_CSV, OUTPUT_FILE_JSON = output_paths("activities")
-ACTIVITY_HEADERS = build_headers(ACTIVITIES_SECRET_KEY, lang="null-IN")
+ACTIVITY_HEADERS = build_headers("activities", lang="null-IN")
 
 
 # ------------------------------------------------------------------
@@ -69,7 +66,7 @@ def main():
             for gp in get_gps(zp_id, bp_id):
                 gp_id, gp_name = gp.get("gpId"), gp.get("name")
 
-                if gp_id not in TARGET_GP_IDS:
+                if not in_scope(gp_id):
                     continue
 
                 print(f"      + GP: {gp_name} ({gp_id})")
@@ -120,11 +117,12 @@ def main():
 
                 processed_gp_count += 1
                 if processed_gp_count % SAVE_EVERY_GP == 0 and rows:
-                    save_outputs(pd.DataFrame(rows), OUTPUT_FILE_CSV, OUTPUT_FILE_JSON)
+                    save_outputs(pd.DataFrame(rows), json_path=OUTPUT_FILE_JSON,
+                                 csv_path=OUTPUT_FILE_CSV)
                     print(f"Checkpoint saved after {processed_gp_count} GPs")
 
     df = pd.DataFrame(rows)
-    save_outputs(df, OUTPUT_FILE_CSV, OUTPUT_FILE_JSON)
+    save_outputs(df, json_path=OUTPUT_FILE_JSON, csv_path=OUTPUT_FILE_CSV)
     print(f"\n{'='*60}\nProcessed {processed_gp_count} GPs | Saved {len(df)} rows\n{'='*60}")
 
 
