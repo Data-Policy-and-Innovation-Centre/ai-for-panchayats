@@ -31,8 +31,13 @@ def env_path(name: str) -> Path | None:
 REPO_ROOT = find_repo_root()
 DATA_ROOT = env_path("PANCHAYAT_DATA_ROOT") or REPO_ROOT / "data"
 
-INPUT_DIR = env_path("PANCHAYAT_INPUT_DIR") or DATA_ROOT / "raw" / "Gram_Panchayat"
-OUTPUT_DIR = env_path("PANCHAYAT_OUTPUT_DIR") or DATA_ROOT / "raw" / "eGramSwaraj"
+# Producer contract: src/ingest/egramSwaraj_API writes GP folders beneath
+# data/raw/eGramSwaraj_Data. Flattened tables are derived, so they land in
+# interim, never back in raw.
+INPUT_DIR = (env_path("PANCHAYAT_INPUT_DIR")
+             or DATA_ROOT / "raw" / "eGramSwaraj_Data" / "Gram_Panchayat")
+OUTPUT_DIR = (env_path("PANCHAYAT_OUTPUT_DIR")
+              or DATA_ROOT / "interim" / "eGramSwaraj")
 LOG_FILE = REPO_ROOT / "logs" / "flatten_egramswaraj.log"
 
 KINDS = ("AA", "PL", "PP", "RE", "TA")
@@ -51,6 +56,11 @@ LEVEL_SEP = "/"           # nesting level inside a row_id; never in a top-level 
 
 # Copied onto every descendant table for direct joins to the top-level row.
 BUSINESS_KEYS = ("activityCd",)
+
+# Keys the API uses to wrap a record list. A dict carrying one of these is an
+# envelope and is unwrapped; any other dict is a domain record and is kept
+# whole, so its arrays become child tables rather than being dropped.
+ENVELOPE_KEYS = frozenset({"data", "response", "result", "records", "rows"})
 
 LEADING_COLUMNS = (ROW_ID, PARENT_ID, POS, "lgd_code", "gram_panchayat_name",
                    "plan_year", "doc_type", "source_file", "activityCd")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -26,7 +27,8 @@ from .config import (BATCH_DIRNAME, BATCH_SIZE, BUSINESS_KEYS, KINDS,
                      LEADING_COLUMNS, LEVEL_SEP, MASTER_MAX_ROWS, PARENT_ID,
                      POS, ROW_ID, TABLE_SEP)
 from .utils import (coerce_nested, concat_batch, iter_json_files, list_columns,
-                    load_json, parse_gp_folder, sanitise, tidy, to_records)
+                    load_json, parse_gp_folder, parse_plan_year, sanitise,
+                    tidy, to_records)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,8 @@ def split_list_columns(
     """Move every list-of-dict column into its own table, recursively.
 
     Returns frame without those columns. Non-dict members of a mixed list are
-    JSON-encoded into a <col>_scalars column on the parent.
+    JSON-encoded into a <col>_scalars column on the parent, each tagged with its
+    source index so the original array can be rebuilt by merging on pos.
     """
     while True:
         cols = list_columns(frame)
@@ -57,15 +60,16 @@ def split_list_columns(
             for idx, (row_id, value) in enumerate(zip(frame[ROW_ID], values)):
                 if not isinstance(value, list):
                     continue
-                kept = 0
-                for element in value:
+                # pos is the index in the source array, not a count of the
+                # objects kept, so mixed arrays stay reconstructable.
+                for source_pos, element in enumerate(value):
                     if not isinstance(element, dict):
-                        strays.setdefault(idx, []).append(element)
+                        strays.setdefault(idx, []).append(
+                            {POS: source_pos, "value": element})
                         continue
                     parents.append(row_id)
-                    positions.append(kept)
+                    positions.append(source_pos)
                     elements.append(element)
-                    kept += 1
 
             if strays:
                 frame[f"{col}{sep}scalars"] = [
@@ -125,7 +129,7 @@ def flatten_file(
     frame = pd.json_normalize(records, sep="_")
 
     lgd_code, gp_name = parse_gp_folder(path.parent.name)
-    plan_year = path.stem.split("_", 1)[0]
+    plan_year = parse_plan_year(path)
     frame.insert(0, ROW_ID,
                  [f"{lgd_code}|{plan_year}|{kind}|{i}" for i in range(len(frame))])
 
@@ -230,28 +234,47 @@ def union_columns(paths: list[Path]) -> list[str]:
     return lead + [c for c in seen if c not in lead]
 
 
+def existing_masters(output_dir: Path, kind: str, table: str) -> list[Path]:
+    """Every master file a previous run may have left for this table."""
+    directory = output_dir / kind
+    if not directory.is_dir():
+        return []
+    stem = master_path(output_dir, kind, table).stem
+    return sorted(
+        path for path in directory.glob(f"{stem}*.csv")
+        if path.stem == stem or re.fullmatch(rf"{re.escape(stem)}_p\d{{3}}", path.stem)
+    )
+
+
 def build_master(paths: list[Path], output_dir: Path, kind: str, table: str,
                  max_rows: int = MASTER_MAX_ROWS) -> tuple[int, list[Path]]:
     """Stream one table's batches into a single master CSV.
 
     Rows are copied as text: a missing column gets an empty cell, and lgd_code
     keeps leading zeros. One batch open at a time.
+
+    Parts are built under a staging directory and published only once the whole
+    table is written, after every master file from a previous run is removed.
+    A rerun therefore cannot leave a stale unsplit master beside new parts, or
+    orphan _pNNN parts beside a new unsplit master.
     """
     columns = union_columns(paths)
     part = 1 if max_rows else None
-    written: list[Path] = []
+    staging = output_dir / kind / f".{table}{TABLE_SEP}staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    staged: list[Path] = []
     rows = rows_in_part = 0
     sink = writer = None
 
     def open_part() -> None:
         nonlocal sink, writer, rows_in_part
-        out = master_path(output_dir, kind, table, part)
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = staging / master_path(output_dir, kind, table, part).name
         sink = out.open("w", newline="", encoding="utf-8")
         writer = csv.DictWriter(sink, fieldnames=columns, restval="",
                                 extrasaction="ignore")
         writer.writeheader()
-        written.append(out)
+        staged.append(out)
         rows_in_part = 0
 
     open_part()
@@ -266,14 +289,27 @@ def build_master(paths: list[Path], output_dir: Path, kind: str, table: str,
                     writer.writerow(record)
                     rows += 1
                     rows_in_part += 1
+        if sink is not None:
+            sink.close()
+            sink = None
     finally:
         if sink is not None:
             sink.close()
+            shutil.rmtree(staging, ignore_errors=True)
 
-    if len(written) == 1 and part is not None:
-        final = master_path(output_dir, kind, table)   # no split; drop _p001
-        written[0].replace(final)
-        written = [final]
+    # Publish: clear the old layout, then move the new one into place.
+    for stale in existing_masters(output_dir, kind, table):
+        stale.unlink()
+
+    single = len(staged) == 1 and part is not None
+    written: list[Path] = []
+    for number, source in enumerate(staged, start=1):
+        final = master_path(output_dir, kind, table,
+                            None if single else number)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(final)
+        written.append(final)
+    shutil.rmtree(staging, ignore_errors=True)
 
     logger.info("Master %s: %d row(s), %d col(s), %d file(s)",
                 table, rows, len(columns), len(written))

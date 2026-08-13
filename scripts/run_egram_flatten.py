@@ -11,8 +11,6 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 from ingest.egramSwaraj_Flatten.config import (BATCH_SIZE, INPUT_DIR, KINDS,
                                                MASTER_MAX_ROWS, OUTPUT_DIR,
                                                configure_logging)
