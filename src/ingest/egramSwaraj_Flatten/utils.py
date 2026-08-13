@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 import pandas as pd
 
-from .config import FILE_RE, FOLDER_RE, KINDS, LEADING_COLUMNS
+from .config import ENVELOPE_KEYS, FILE_RE, FOLDER_RE, KINDS, LEADING_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,16 @@ def parse_gp_folder(folder_name: str) -> tuple[str | None, str | None]:
     return match.group("code"), match.group("name").replace("_", " ").strip()
 
 
+def parse_plan_year(path: Path) -> str:
+    """2021_PL.json and 2021-PL.json both give "2021"."""
+    match = FILE_RE.match(path.stem)
+    if match:
+        return match.group("year")
+    fallback = re.split(r"[_-]", path.stem, maxsplit=1)[0]
+    logger.warning("Unparseable file name %s; plan_year=%s", path.name, fallback)
+    return fallback
+
+
 def load_json(path: Path) -> Any | None:
     """Read one JSON; None on any read/parse failure."""
     try:
@@ -56,8 +66,21 @@ def load_json(path: Path) -> Any | None:
     return None
 
 
+def _unwrap(payload: dict, key: str) -> list[dict]:
+    """Rows of payload[key], with the scalar siblings broadcast onto each row."""
+    header = {k: v for k, v in payload.items()
+              if k != key and not isinstance(v, (list, dict))}
+    return [{**header, **row} for row in payload[key]]
+
+
 def to_records(payload: Any) -> list[dict]:
-    """List of records from a list, a single dict, or a dict wrapping a record list."""
+    """List of records from a list, a single dict, or a dict wrapping a record list.
+
+    A dict is only unwrapped when it is unambiguously a response envelope:
+    either it uses a known envelope key, or it holds exactly one list-of-dicts
+    and no other nested value. Anything else is a domain record and is returned
+    whole, so its arrays become child tables instead of being discarded.
+    """
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
     if not isinstance(payload, dict):
@@ -70,11 +93,22 @@ def to_records(payload: Any) -> list[dict]:
     if not list_keys:
         return [payload]
 
-    # Longest list-of-dicts is the record list; scalar siblings broadcast onto rows.
-    key = max(list_keys, key=lambda k: len(payload[k]))
-    header = {k: v for k, v in payload.items()
-              if k != key and not isinstance(v, (list, dict))}
-    return [{**header, **row} for row in payload[key]]
+    named = [k for k in list_keys if k in ENVELOPE_KEYS]
+    if len(named) == 1:
+        return _unwrap(payload, named[0])
+    if len(named) > 1:
+        logger.warning(
+            "Multiple envelope keys %s; treating payload as a single record", named)
+        return [payload]
+
+    nested = [k for k, v in payload.items() if isinstance(v, (list, dict))]
+    if len(list_keys) == 1 and len(nested) == 1:
+        return _unwrap(payload, list_keys[0])
+
+    # Several nested members: a domain record carrying child arrays, not an
+    # envelope. Unwrapping one would silently drop the siblings.
+    logger.debug("Ambiguous payload (nested keys %s); kept as one record", nested)
+    return [payload]
 
 
 def _holds_list_of_dicts(mapping: dict) -> bool:

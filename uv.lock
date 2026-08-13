@@ -13,7 +13,7 @@ resolution-markers = [
 [[package]]
 name = "ai-for-panchayats"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dpic" },
     { name = "dvc", extra = ["s3"] },
@@ -22,6 +22,7 @@ dependencies = [
     { name = "pandera" },
     { name = "polars" },
     { name = "pyarrow" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -42,6 +43,7 @@ requires-dist = [
     { name = "pandera", specifier = ">=0.31.1" },
     { name = "polars", specifier = ">=1.41.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
 ]
 
 [package.metadata.requires-dev]
