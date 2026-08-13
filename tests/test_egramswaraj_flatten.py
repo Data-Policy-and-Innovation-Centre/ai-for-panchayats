@@ -34,9 +34,17 @@ def test_envelope_key_is_unwrapped():
     ]
 
 
-def test_lone_record_list_is_unwrapped():
+def test_an_unrecognised_key_is_not_treated_as_an_envelope():
+    """Only ENVELOPE_KEYS unwrap. An unknown key keeps its array as a child.
+
+    The cost of guessing wrong in this direction is one extra table, which is
+    visible and reversible. Guessing wrong the other way destroys the parent
+    row and the relationship, silently. If the feed turns out to wrap records
+    under this key, add it to ENVELOPE_KEYS after inspecting a payload.
+    """
     payload = {"gp": "115550", "activities": [{"activityCd": "1"}]}
-    assert to_records(payload) == [{"gp": "115550", "activityCd": "1"}]
+
+    assert to_records(payload) == [payload]
 
 
 def test_single_record_with_sibling_arrays_is_kept_whole():
@@ -184,3 +192,103 @@ def test_rerun_is_idempotent(tmp_path: Path):
     assert run() == first
     assert master_csvs(out, "PL") == [
         "egramswaraj_pl.csv", "egramswaraj_pl__fundlist.csv"]
+
+
+# --------------------------------------------------- envelope discipline
+# Structure alone cannot distinguish an envelope from a domain record, so only
+# a recognised key unwraps. These cover the second Codex review on PR #8.
+
+
+def test_a_lone_child_array_stays_attached_to_its_record():
+    """{"activityCd": ..., "fundList": [...]} is a record, not an envelope."""
+    payload = {"activityCd": "A1", "fundList": [{"amount": 10}, {"amount": 20}]}
+
+    assert to_records(payload) == [payload]
+
+
+def test_a_lone_child_array_becomes_its_own_table(tmp_path: Path):
+    gp_dir = tmp_path / "LGD_115550_Angarbandha"
+    path = write_json(gp_dir, "2021_PL.json",
+                      {"activityCd": "A1", "fundList": [{"amount": 10}]})
+
+    parent, children = flatten_file(path, "PL")
+
+    assert len(parent) == 1
+    assert "pl__fundlist" in children
+    assert children["pl__fundlist"]["amount"].tolist() == [10]
+
+
+def test_an_empty_named_envelope_is_zero_records():
+    """Otherwise an empty response becomes one fabricated row holding "[]"."""
+    assert to_records({"status": "OK", "data": []}) == []
+
+
+def test_an_empty_envelope_file_produces_no_rows(tmp_path: Path):
+    gp_dir = tmp_path / "LGD_115550_Angarbandha"
+    path = write_json(gp_dir, "2021_PL.json", {"status": "OK", "data": []})
+
+    assert flatten_file(path, "PL") is None
+
+
+def test_a_populated_named_envelope_still_unwraps():
+    payload = {"status": "OK", "data": [{"activityCd": "1"}]}
+
+    assert to_records(payload) == [{"status": "OK", "activityCd": "1"}]
+
+
+# --------------------------------------------------- publication, continued
+
+
+def test_splitting_disabled_publishes_an_unsuffixed_master(tmp_path: Path):
+    batch = make_batch(tmp_path / "b.csv", [{"row_id": "1"}])
+
+    build_master([batch], tmp_path / "out", "PL", "pl", max_rows=0)
+
+    assert master_csvs(tmp_path / "out", "PL") == ["egramswaraj_pl.csv"]
+
+
+def test_a_table_that_vanishes_leaves_no_master_behind(tmp_path: Path):
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    gp_dir = raw / "LGD_115550_Angarbandha"
+
+    write_json(gp_dir, "2021_PL.json",
+               [{"activityCd": "A1", "fundList": [{"amount": 10}]}])
+    process(raw, out, kinds=("PL",))
+    assert "egramswaraj_pl__fundlist.csv" in master_csvs(out, "PL")
+
+    write_json(gp_dir, "2021_PL.json", [{"activityCd": "A1"}])
+    process(raw, out, kinds=("PL",))
+
+    assert master_csvs(out, "PL") == ["egramswaraj_pl.csv"]
+
+
+def test_a_table_that_vanishes_leaves_no_batch_behind(tmp_path: Path):
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    gp_dir = raw / "LGD_115550_Angarbandha"
+
+    write_json(gp_dir, "2021_PL.json",
+               [{"activityCd": "A1", "fundList": [{"amount": 10}]}])
+    process(raw, out, kinds=("PL",))
+
+    write_json(gp_dir, "2021_PL.json", [{"activityCd": "A1"}])
+    process(raw, out, kinds=("PL",))
+
+    batches = sorted(p.name for p in (out / "PL" / "batches").glob("*.csv"))
+    assert batches == ["pl__b0001.csv"]
+
+
+def test_a_shorter_run_leaves_no_tail_batches(tmp_path: Path):
+    """Numbering restarts at 1, so old high-numbered batches must not survive."""
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    for i in range(3):
+        write_json(raw / f"LGD_11555{i}_Gp{i}", "2021_PL.json",
+                   [{"activityCd": f"A{i}"}])
+    process(raw, out, kinds=("PL",), batch_size=1)
+    assert len(list((out / "PL" / "batches").glob("pl__b*.csv"))) == 3
+
+    for i in range(1, 3):
+        (raw / f"LGD_11555{i}_Gp{i}" / "2021_PL.json").unlink()
+    process(raw, out, kinds=("PL",), batch_size=1)
+
+    assert sorted(p.name for p in (out / "PL" / "batches").glob("pl__b*.csv")) \
+        == ["pl__b0001.csv"]

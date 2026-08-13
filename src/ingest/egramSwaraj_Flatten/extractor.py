@@ -246,6 +246,24 @@ def existing_masters(output_dir: Path, kind: str, table: str) -> list[Path]:
     )
 
 
+def table_from_master(path: Path) -> str:
+    """egramswaraj_pl__fundlist_p002.csv -> pl__fundlist."""
+    stem = re.sub(r"_p\d{3}$", "", path.stem)
+    return stem.removeprefix("egramswaraj_")
+
+
+def obsolete_masters(output_dir: Path, kind: str,
+                     produced: set[str]) -> list[Path]:
+    """Master files for tables this run did not produce."""
+    directory = output_dir / kind
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path for path in directory.glob("egramswaraj_*.csv")
+        if table_from_master(path) not in produced
+    )
+
+
 def build_master(paths: list[Path], output_dir: Path, kind: str, table: str,
                  max_rows: int = MASTER_MAX_ROWS) -> tuple[int, list[Path]]:
     """Stream one table's batches into a single master CSV.
@@ -301,7 +319,9 @@ def build_master(paths: list[Path], output_dir: Path, kind: str, table: str,
     for stale in existing_masters(output_dir, kind, table):
         stale.unlink()
 
-    single = len(staged) == 1 and part is not None
+    # One staged file is always published unsuffixed, including when splitting
+    # is disabled with --master-max-rows 0.
+    single = len(staged) == 1
     written: list[Path] = []
     for number, source in enumerate(staged, start=1):
         final = master_path(output_dir, kind, table,
@@ -356,6 +376,16 @@ def process(
         return
     logger.info("Found %d file(s) under %s", len(files), input_dir)
 
+    # Batch numbering restarts at 1 every run, so a shorter run would overwrite
+    # the low-numbered files and leave the previous run's tail behind, along
+    # with batches for tables that no longer exist. With --no-master the
+    # batches are the output, so consumers would read those stale rows.
+    for kind in kinds:
+        batch_dir = output_dir / kind / BATCH_DIRNAME
+        if batch_dir.is_dir():
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            logger.info("[%s] cleared previous batch directory", kind)
+
     writers = {kind: BatchWriter(output_dir, kind, batch_size) for kind in kinds}
     empty = 0
     per_kind: Counter = Counter()
@@ -382,6 +412,12 @@ def process(
         for kind, writer in writers.items():
             for table, paths in sorted(writer.batches.items()):
                 build_master(paths, output_dir, kind, table, master_max_rows)
+            # A table the source no longer produces has no batches, so the loop
+            # above never touches it. Left alone, last run's master stays beside
+            # the rebuilt ones and consumers keep joining a table that is gone.
+            for stale in obsolete_masters(output_dir, kind, set(writer.batches)):
+                stale.unlink()
+                logger.info("[%s] removed obsolete master %s", kind, stale.name)
             if not keep_batches and writer.batches:
                 shutil.rmtree(output_dir / kind / BATCH_DIRNAME,
                               ignore_errors=True)

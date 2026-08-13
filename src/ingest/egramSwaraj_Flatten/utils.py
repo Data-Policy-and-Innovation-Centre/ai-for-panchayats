@@ -76,38 +76,33 @@ def _unwrap(payload: dict, key: str) -> list[dict]:
 def to_records(payload: Any) -> list[dict]:
     """List of records from a list, a single dict, or a dict wrapping a record list.
 
-    A dict is only unwrapped when it is unambiguously a response envelope:
-    either it uses a known envelope key, or it holds exactly one list-of-dicts
-    and no other nested value. Anything else is a domain record and is returned
-    whole, so its arrays become child tables instead of being discarded.
+    A dict is unwrapped only when it uses a known ENVELOPE_KEYS key. Structure
+    alone cannot tell an envelope from a domain record: {"data": [...]} and
+    {"activityCd": "A1", "fundList": [...]} are the same shape, and unwrapping
+    the second promotes its children to top-level rows and destroys the
+    fundList relationship. So anything without a recognised key is a domain
+    record, and its arrays become child tables.
+
+    An envelope whose list is empty means zero records, not one record
+    describing an empty list.
     """
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
     if not isinstance(payload, dict):
         return []
 
-    list_keys = [
+    named = [
         k for k, v in payload.items()
-        if isinstance(v, list) and v and all(isinstance(i, dict) for i in v)
+        if k in ENVELOPE_KEYS and isinstance(v, list)
+        and all(isinstance(i, dict) for i in v)
     ]
-    if not list_keys:
-        return [payload]
-
-    named = [k for k in list_keys if k in ENVELOPE_KEYS]
-    if len(named) == 1:
-        return _unwrap(payload, named[0])
     if len(named) > 1:
         logger.warning(
             "Multiple envelope keys %s; treating payload as a single record", named)
         return [payload]
+    if named:
+        return _unwrap(payload, named[0])
 
-    nested = [k for k, v in payload.items() if isinstance(v, (list, dict))]
-    if len(list_keys) == 1 and len(nested) == 1:
-        return _unwrap(payload, list_keys[0])
-
-    # Several nested members: a domain record carrying child arrays, not an
-    # envelope. Unwrapping one would silently drop the siblings.
-    logger.debug("Ambiguous payload (nested keys %s); kept as one record", nested)
     return [payload]
 
 
