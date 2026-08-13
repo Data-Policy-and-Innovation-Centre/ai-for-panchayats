@@ -13,11 +13,25 @@ dependencies = [
     "pandera>=0.31.1",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
+    "pyyaml>=6.0.2",
     "requests>=2.34.2",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# src layout: scripts, tests and notebooks import `ingest` identically, so no
+# runner needs to mutate sys.path.
+packages = ["src/ingest"]
+
 [tool.uv.sources]
 dpic = { git = "ssh://git@github.com/Data-Policy-and-Innovation-Centre/dpic-org.git", rev = "main" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
