@@ -1,14 +1,22 @@
-# Define project-specific pipeline stages here once the processing workflow is
-# known. Keep commands and dependencies explicit so DVC can reproduce outputs.
-#
-# Example:
-# stages:
-#   <stage-name>:
-#     cmd: <command>
-#     deps:
-#       - <input-path>
-#       - <script-or-notebook-path>
-#     outs:
-#       - <output-path>
+# Project pipeline stages. Keep commands and dependencies explicit so DVC can
+# reproduce outputs, and so `make run` does real work rather than reporting a
+# completed pipeline that ran nothing.
 
-stages: {}
+stages:
+  build_database:
+    # Rebuilds the analytical read model from the versioned source extracts.
+    # The database is derived and disposable: it is never edited in place, so
+    # reproducing this stage is always safe.
+    cmd: uv run python scripts/build_panchayat_db.py build
+    deps:
+      - scripts/build_panchayat_db.py
+      - src/database
+      - data/raw/planning/gram_panchayat_filtered.csv
+      - data/raw/Activity_expenditure/expenditure_all.csv
+      - data/processed/all_vouchers_flat.csv
+    outs:
+      - data/interim/panchayat.duckdb:
+          # Rebuilt from source on demand; no value in pushing a binary that
+          # any checkout can regenerate.
+          cache: false
+          persist: false

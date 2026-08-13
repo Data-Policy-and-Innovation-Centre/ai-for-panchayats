@@ -41,13 +41,21 @@ jobs:
       - name: Validate DVC pipeline file
         run: uv run dvc dag
 
-      - name: Run DVC pipeline when stages exist
+      # CI validates the pipeline's structure but does not reproduce it.
+      # Reproduction needs the protected source extracts, which CI must not
+      # hold. Stage logic is covered by tests on synthetic fixtures instead;
+      # `dvc repro` belongs on a machine that has the data.
+      - name: Check every stage is well formed
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -n "$(uv run dvc stage list)" ]; then
-            uv run dvc repro
-          else
-            echo "No DVC stages defined yet; skipping dvc repro."
+          stages="$(uv run dvc stage list --name-only)"
+          if [ -z "$stages" ]; then
+            echo "::error::No DVC stages are defined, so the pipeline does no"
+            echo "::error::project work. Define a stage or document why not."
+            exit 1
           fi
+
+          echo "Stages defined:"
+          echo "$stages" | sed 's/^/  - /'

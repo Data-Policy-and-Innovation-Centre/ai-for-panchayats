@@ -13,7 +13,7 @@ resolution-markers = [
 [[package]]
 name = "ai-for-panchayats"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dpic" },
     { name = "duckdb" },
@@ -25,6 +25,7 @@ dependencies = [
     { name = "pandera" },
     { name = "polars" },
     { name = "pyarrow" },
+    { name = "pyyaml" },
     { name = "sqlalchemy" },
 ]
 
@@ -49,6 +50,7 @@ requires-dist = [
     { name = "pandera", specifier = ">=0.31.1" },
     { name = "polars", specifier = ">=1.41.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "sqlalchemy", specifier = ">=2.0.51" },
 ]
 
