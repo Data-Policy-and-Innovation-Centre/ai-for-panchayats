@@ -1,0 +1,39 @@
+# Versioned expectations for the panchayat read model.
+#
+# This replaces the row counts that were typed into notebook cells. When a
+# rebuild disagrees with this file, either the source data changed and this
+# manifest needs a reviewed update, or the build broke. Both deserve a look;
+# neither should be silently absorbed.
+#
+# Bump `version` and record why in the changelog whenever a number moves.
+
+version: 1
+source_snapshot: "2026-08 planning + expenditure + accounting extracts"
+
+# Leave a table out to skip its count check. Populate these from a build you
+# have actually reviewed, not from a build you merely ran.
+expected_rows: {}
+#  gram_panchayat: 20
+#  planned_activity: 12704
+#  activity_expenditure: 12730
+#  voucher: 12440
+
+thresholds:
+  # Share of bridge rows that must resolve to a voucher. Parsing each voucher's
+  # year from its own number rather than the plan year is what makes a high
+  # floor achievable; the remainder is GP-years the accounting extract does
+  # not cover.
+  bridge_match_rate: 0.0
+
+  # Ceiling on rows the build may quarantine. Left open until a reviewed
+  # baseline exists; set it once, then treat growth as a regression.
+  max_quarantined_rows: null
+
+changelog:
+  - version: 1
+    note: >
+      Initial manifest extracted from the notebook build. Counts are
+      intentionally empty: the numbers in the notebooks were observations from
+      one machine's inputs, not reviewed expectations, so they are not
+      promoted to assertions until someone confirms them against a DVC-tracked
+      snapshot.
