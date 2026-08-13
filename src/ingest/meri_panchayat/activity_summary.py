@@ -4,24 +4,22 @@
 # Date: 08-06-2026
 
 import os
-import sys
 import time
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (
+from .config import (
+    in_scope,
     STATE_ID, STATE_NAME,
     FIN_YEARS,
     OUTPUT_DIR, SAVE_EVERY_GP,
     REQUEST_DELAY, BASE_URL,
-    ACTIVITY_SUMMARY_SECRET_KEY,
     build_headers, get_output_path,
 )
-from base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
-ACTIVITY_HEADERS = build_headers(ACTIVITY_SUMMARY_SECRET_KEY, lang="null-IN")
+ACTIVITY_HEADERS = build_headers("activity_summary", lang="null-IN")
 
 
 # ------------------------------------------------------------------
@@ -51,6 +49,9 @@ def main():
 
             for gp in get_gps(zp_id, bp_id):
                 gp_id, gp_name = gp.get("gpId"), gp.get("name")
+
+                if not in_scope(gp_id):
+                    continue
                 print(f"      + Gram Panchayat: {gp_name} ({gp_id})")
 
                 for fin_year in FIN_YEARS:

@@ -3,21 +3,20 @@
 # Author: Ravishankar Singh
 
 import os
-import sys
 import time
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import (
+from .config import (
+    in_scope,
     STATE_ID, STATE_NAME, FIN_YEARS, OUTPUT_DIR, SAVE_EVERY_GP,
-    REQUEST_DELAY, BASE_URL, BENEFICIARIES_SECRET_KEY,
+    REQUEST_DELAY, BASE_URL,
     build_headers, get_output_path
 )
-from base_scraper import get_zps, get_blocks, get_gps, fetch_json_post, save_outputs
+from .base_scraper import get_zps, get_blocks, get_gps, fetch_json_post, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
-HEADERS = build_headers(BENEFICIARIES_SECRET_KEY, lang="null-IN")
+HEADERS = build_headers("beneficiaries", lang="null-IN")
 
 def get_beneficiaries(gp_id, fin_year):
     url = f"{BASE_URL}/api/beneficiary/v1/getSchemeWiseBeneficiariesCount"
@@ -49,6 +48,9 @@ def main():
 
             for gp in get_gps(zp_id, bp_id):
                 gp_id, gp_name = gp.get("gpId"), gp.get("name")
+
+                if not in_scope(gp_id):
+                    continue
                 print(f"    GP {processed_gp_count + 1}: {gp_name}")
 
                 for fin_year in FIN_YEARS:
