@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 from database import transform
-from database.clean import (to_code, to_fiscal_year, year_from_voucher_no)
+from database.clean import (count_coordinates, to_code, to_fiscal_year,
+                            year_from_voucher_no)
 from database.transform import Quarantine
 
 
@@ -213,3 +214,95 @@ def test_nsap_expands_non_zero_counts(planning_csv):
     assert result.iloc[0]["category"] == "widow"
     assert result.iloc[0]["gender"] == "female"
     assert result.iloc[0]["beneficiary_count"] == 3
+
+
+# ------------------------------------------------- second Codex review
+
+
+def test_missing_coordinates_count_as_zero_captures():
+    """A null latitude with n_coords=1 contradicts itself."""
+    counts = count_coordinates(
+        pd.Series([None, "", "  ", "20.29", "20.29,20.30"]))
+
+    assert counts.tolist() == [0, 0, 0, 1, 2]
+
+
+def test_physical_progress_rows_without_a_coordinate_report_none(
+        physical_progress_csv):
+    frame = physical_progress_csv.copy()
+    frame.loc[0, "latitude"] = None
+    frame.loc[0, "longitude"] = None
+
+    result = transform.physical_progress(frame, {"128856295"}, Quarantine())
+
+    assert result["n_coords"].tolist() == [0, 2]
+    assert pd.isna(result["latitude"].iloc[0])
+
+
+def test_rows_rejected_for_a_null_key_are_still_counted():
+    """value_counts drops nulls, so these vanished without a trace."""
+    quarantine = Quarantine()
+
+    quarantine.add("physical_progress", "activity_code not in parent",
+                   "activity_code", pd.Series(["A1", None, None]))
+
+    assert quarantine.total("physical_progress") == 3
+    frame = quarantine.frame()
+    assert set(frame["key_value"]) == {"A1", Quarantine.NULL_KEY}
+    assert frame.loc[frame["key_value"] == Quarantine.NULL_KEY,
+                     "row_count"].iloc[0] == 2
+
+
+def test_a_null_activity_code_is_quarantined_not_dropped(expenditure_csv):
+    cleaned = transform.clean_expenditure(expenditure_csv)
+    cleaned.loc[0, "activity_code"] = None
+    quarantine = Quarantine()
+
+    result = transform.activity_expenditure(cleaned, {"128856619"}, quarantine)
+
+    assert len(result) == 1
+    assert quarantine.total("activity_expenditure") == 1
+
+
+def test_geography_collapses_each_side_before_joining():
+    """Merging at fact grain pairs every voucher with every expenditure row."""
+    gps = ["119598", "119599"]
+    vouchers = pd.DataFrame([
+        {"gp_lgd_code": g, "gp_name": f"GP{g}", "state": "21",
+         "district": "321", "block": "3823"}
+        for g in gps for _ in range(50)])
+    expenditure = pd.DataFrame([
+        {"gp_lgd_code": g, "state_name": "Odisha", "zp_name": "Khordha",
+         "block_name": "Bhubaneswar"}
+        for g in gps for _ in range(50)])
+    quarantine = Quarantine()
+
+    result = transform.gram_panchayat(vouchers, expenditure, quarantine)
+
+    assert len(result) == 2
+    # 50x50 per GP would report 4,900 conflicting duplicates; identical rows
+    # collapsing to a dimension grain are not conflicts at all.
+    assert quarantine.total("gram_panchayat") == 0
+
+
+def test_conflicting_geography_is_counted_once_not_once_per_opposite_row():
+    """One disagreeing voucher row is one conflict, whatever the other side's size.
+
+    Joining at fact grain first would pair it with every expenditure row for
+    the same panchayat and report the conflict that many times.
+    """
+    vouchers = pd.DataFrame([
+        {"gp_lgd_code": "119598", "gp_name": "Andhrua", "state": "21",
+         "district": "321", "block": "3823"},
+        {"gp_lgd_code": "119598", "gp_name": "Andhrua RENAMED", "state": "21",
+         "district": "321", "block": "3823"},
+    ])
+    expenditure = pd.DataFrame([
+        {"gp_lgd_code": "119598", "state_name": "Odisha", "zp_name": "Khordha",
+         "block_name": "Bhubaneswar"} for _ in range(20)])
+    quarantine = Quarantine()
+
+    result = transform.gram_panchayat(vouchers, expenditure, quarantine)
+
+    assert len(result) == 1
+    assert quarantine.total("gram_panchayat") == 1

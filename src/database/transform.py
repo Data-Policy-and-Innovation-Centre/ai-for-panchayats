@@ -93,9 +93,15 @@ class Quarantine:
 
     records: list[dict] = field(default_factory=list)
 
+    NULL_KEY = "<null>"
+
     def add(self, table: str, reason: str, key_column: str,
             keys: pd.Series) -> None:
-        for value, count in keys.astype("string").value_counts().items():
+        # value_counts drops nulls by default, so rows rejected *because* their
+        # key was null would be removed and never counted, understating the
+        # totals a quarantine ceiling is meant to police.
+        keys = keys.astype("string").fillna(self.NULL_KEY)
+        for value, count in keys.value_counts().items():
             self.records.append({
                 "table_name": table, "reason": reason,
                 "key_column": key_column, "key_value": value,
@@ -178,13 +184,25 @@ def clean_vouchers(raw: pd.DataFrame) -> pd.DataFrame:
 
 def gram_panchayat(vouchers: pd.DataFrame, expenditure: pd.DataFrame,
                    quarantine: Quarantine) -> pd.DataFrame:
-    frame = (vouchers[["gp_lgd_code", "gp_name", "state", "district", "block"]]
-             .rename(columns={"state": "state_code", "district": "district_code",
-                              "block": "block_code"})
-             .merge(expenditure[["gp_lgd_code", "state_name", "zp_name",
-                                 "block_name"]],
-                    on="gp_lgd_code", how="outer"))
-    frame = _dedupe(frame, "gp_lgd_code", "gram_panchayat", quarantine)
+    """Geography, one row per panchayat, from two fact-grain extracts.
+
+    Each side collapses to its dimension grain before the join. Merging first
+    would pair every voucher with every expenditure row for the same
+    panchayat: on the documented extracts that is 7.2 million intermediate
+    rows to produce twenty, and it multiplies any conflicting-geography count
+    by the size of the opposite side.
+    """
+    codes = _dedupe(
+        vouchers[["gp_lgd_code", "gp_name", "state", "district", "block"]]
+        .rename(columns={"state": "state_code", "district": "district_code",
+                         "block": "block_code"}),
+        "gp_lgd_code", "gram_panchayat", quarantine)
+
+    names = _dedupe(
+        expenditure[["gp_lgd_code", "state_name", "zp_name", "block_name"]],
+        "gp_lgd_code", "gram_panchayat", quarantine)
+
+    frame = codes.merge(names, on="gp_lgd_code", how="outer")
     return frame[["gp_lgd_code", "gp_name", "state_code", "state_name",
                   "district_code", "zp_name", "block_code", "block_name"]]
 

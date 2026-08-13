@@ -66,5 +66,12 @@ def first_coordinate(series: pd.Series) -> pd.Series:
 
 
 def count_coordinates(series: pd.Series) -> pd.Series:
-    """How many captures a cell holds, so a multi-capture row stays visible."""
-    return (series.astype("string").str.count(",").fillna(0).astype(int) + 1)
+    """How many captures a cell holds, so a multi-capture row stays visible.
+
+    A missing or blank cell holds none. Counting commas and adding one would
+    report a row with no coordinate as having a capture, which contradicts a
+    null latitude sitting next to it.
+    """
+    text = series.astype("string").str.strip()
+    present = text.notna() & (text != "")
+    return (text.str.count(",") + 1).where(present, 0).astype("int64")

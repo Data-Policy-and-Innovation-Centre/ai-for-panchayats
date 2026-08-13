@@ -8,12 +8,23 @@ stages:
     # The database is derived and disposable: it is never edited in place, so
     # reproducing this stage is always safe.
     cmd: uv run python scripts/build_panchayat_db.py build
+    # Every file load_sources() reads. An undeclared input means dvc repro can
+    # call the stage unchanged after that file is updated, leaving the
+    # approval, progress and lookup tables stale against a rebuilt core.
     deps:
       - scripts/build_panchayat_db.py
       - src/database
+      # core
       - data/raw/planning/gram_panchayat_filtered.csv
       - data/raw/Activity_expenditure/expenditure_all.csv
       - data/processed/all_vouchers_flat.csv
+      # eGramSwaraj approvals and physical progress
+      - data/raw/egramswaraj_aa_filtered.csv
+      - data/raw/egramswaraj_aa__admapprovalschemewebservice_filtered.csv
+      - data/raw/egramswaraj_ta_filtered.csv
+      - data/raw/egramswaraj_pp__physicalprogressassetstageuploadwebservice_filtered.csv
+      # code lookups
+      - data/external/code_descriptions_updated.xlsx
     outs:
       - data/interim/panchayat.duckdb:
           # Rebuilt from source on demand; no value in pushing a binary that
