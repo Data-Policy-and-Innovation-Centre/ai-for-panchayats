@@ -1,3 +1,12 @@
+"""Panchayat Nirnay portal settings.
+
+Request credentials come from the environment and are never tracked; see
+.env.example for the variable names.
+"""
+
+import os
+
+# --- 1. PILOT SCOPE ---
 TARGET_GPS = [
     {"zp_name": "Khordha", "zp_id": 321, "bp_name": "Bhubaneswar", "bp_id": 3823, "gp_name": "Andhrua", "gp_code": 119598},
     {"zp_name": "Khordha", "zp_id": 321, "bp_name": "Bhubaneswar", "bp_id": 3823, "gp_name": "Barimunda", "gp_code": 119599},
@@ -21,22 +30,56 @@ TARGET_GPS = [
     {"zp_name": "Sundargarh", "zp_id": 332, "bp_name": "Balisankara", "bp_id": 3936, "gp_name": "Karuabahal", "gp_code": 121526}
 ]
 
-# --- 2. API HEADERS & SKELETON KEY ---
-HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Connection": "keep-alive",
-    "Content-Type": "application/json",
-    "Origin": "https://meetingonline.gov.in",
-    "Referer": "https://meetingonline.gov.in/recent?tab=recent_meeting",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-    "accesskey": "541C469D-4E5E-4A72-8F84-DB9AF490F362",
-    "device-ip": "117.239.20.25",
-    "uuid": "cc8e6f63-3e9b-4320-bfcd-738e5f9f98bb",
-    
-    # !!! UPDATE THESE TWO WITH FRESH VALUES IF THE SCRIPT HALTS !!!
-    "secretkey": "7ffb5623a39f30271808ea583359d5252788a540b542de5c715c58ee12163836",
-    "timestamp": "22062026095208"
-}
+# --- 2. API HEADERS ---
+#
+# The portal binds `secretkey` to `timestamp`, and the pair goes stale: the
+# previous hard-coded values are why this scraper stops with no useful error
+# and needs someone to paste in fresh ones. They are supplied at run time
+# instead, so a stale pair fails loudly at the point of use.
+#
+# Nothing identifying the machine belongs here. The former `device-ip` and
+# `uuid` entries pinned one operator's address and session into tracked
+# source; the server sees the real source address regardless.
+
+ACCESS_KEY_ENV = "PANCHAYAT_NIRNAY_ACCESS_KEY"
+SECRET_KEY_ENV = "PANCHAYAT_NIRNAY_SECRET_KEY"
+TIMESTAMP_ENV = "PANCHAYAT_NIRNAY_TIMESTAMP"
+
+
+class MissingCredential(RuntimeError):
+    """A required request header is not set in the environment."""
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise MissingCredential(
+            f"{name} is not set. Copy .env.example and fill in the current "
+            f"values before running the scraper; the secretkey/timestamp pair "
+            f"expires and has to be refreshed."
+        )
+    return value
+
+
+def build_headers(extra: dict | None = None) -> dict:
+    """Request headers, with the volatile values resolved at call time."""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Origin": "https://meetingonline.gov.in",
+        "Referer": "https://meetingonline.gov.in/recent?tab=recent_meeting",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+        ),
+        "accesskey": _require_env(ACCESS_KEY_ENV),
+        "secretkey": _require_env(SECRET_KEY_ENV),
+        "timestamp": _require_env(TIMESTAMP_ENV),
+    }
+    if extra:
+        headers.update(extra)
+    return headers
 
 # --- 3. API ENDPOINTS ---
 MEETINGS_LIST_API = "https://meetingonline.gov.in/gsn_api/live/gsn_get_recent/v1/meetings"
