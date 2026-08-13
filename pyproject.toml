@@ -9,6 +9,7 @@ dependencies = [
     "duckdb>=1.5.5",
     "duckdb-engine>=0.17.0",
     "dvc[s3]>=3.67.1",
+    "indic-transliteration>=2.3.82",
     "loguru>=0.7.3",
     "openpyxl>=3.1.5",
     "pandas>=3.0.3",
@@ -16,6 +17,7 @@ dependencies = [
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
     "pyyaml>=6.0.2",
+    "requests>=2.34.2",
     "sqlalchemy>=2.0.51",
 ]
 
