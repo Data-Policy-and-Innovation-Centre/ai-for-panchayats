@@ -59,7 +59,27 @@ def output_paths(stem: str) -> tuple[Path, Path]:
 
 # ---------------------------------------------------------------- scope
 
-ALL_GPS = bool(_cfg.get("all_gps", False))
+class ConfigError(RuntimeError):
+    """config.yaml holds a value this module cannot safely act on."""
+
+
+def _strict_bool(value, key: str) -> bool:
+    """A scope flag must be a real YAML boolean, never a truthy string.
+
+    `bool("false")` is True, so a quoted `all_gps: "false"` -- easy to write by
+    hand or emit from a template -- would widen a 20-GP pilot into a statewide
+    scrape of a government portal with no error. Fail closed instead.
+    """
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"{key} must be a YAML boolean (true/false), got "
+            f"{type(value).__name__} {value!r}. Quoted values like \"false\" "
+            "are truthy and would widen the scrape scope."
+        )
+    return value
+
+
+ALL_GPS = _strict_bool(_cfg.get("all_gps", False), "all_gps")
 TARGET_GPS = _cfg.get("target_gps") or []
 TARGET_GP_IDS = frozenset(gp["gp_code"] for gp in TARGET_GPS)
 

@@ -102,11 +102,18 @@ def test_a_genuinely_empty_response_is_a_valid_empty_list(monkeypatch):
 
 
 def test_a_malformed_response_body_is_not_treated_as_empty(monkeypatch):
-    """A dict where a list was expected means schema drift, not no records."""
+    """A dict where a list was expected means schema drift, not no records.
+
+    This test previously asserted `get_zps() == []`, which is what its name
+    says must not happen. The name and docstring were right and the assertion
+    was wrong: coercing schema drift to an empty list is the same
+    successful-empty-output failure the 401 case above guards against.
+    """
     monkeypatch.setattr(requests, "get",
                         lambda *a, **k: Response(payload={"response": {"x": 1}}))
 
-    assert get_zps() == []
+    with pytest.raises(FetchError):
+        get_zps()
 
 
 # ---------------------------------------------------------------- hierarchy
@@ -190,3 +197,33 @@ def test_save_outputs_accepts_json_positionally(tmp_path):
     save_outputs(pd.DataFrame([{"a": 1}]), path)
 
     assert path.exists()
+
+
+# --------------------------------------------------------------------------
+# A malformed envelope is a failure, not an empty hierarchy
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "envelope, why",
+    [
+        ({"status": "error", "message": "invalid key"}, "200 carrying an error envelope"),
+        ({}, "no `response` key at all"),
+        ({"response": None}, "`response` present but null"),
+        ({"response": "oops"}, "`response` present but not a list"),
+    ],
+)
+def test_a_malformed_envelope_raises_instead_of_reporting_no_districts(
+    monkeypatch, envelope, why
+):
+    """Returning [] here is the successful-empty-output bug this client prevents.
+
+    `get_zps` promises in its own docstring that "a hierarchy failure raises
+    rather than yielding no districts". Coercing every malformed envelope to
+    [] broke that promise silently: a scrape would report success with zero
+    districts and overwrite good saved data with nothing.
+    """
+    monkeypatch.setattr(base_scraper, "fetch_json", lambda url, headers: envelope)
+    with pytest.raises(base_scraper.FetchError):
+        base_scraper.get_zps()
+

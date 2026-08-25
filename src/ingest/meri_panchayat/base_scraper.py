@@ -72,15 +72,29 @@ def fetch_json_post(url: str, headers: dict, payload: dict) -> dict:
     return _parse(response, url)
 
 
-def _response_list(data: dict) -> list:
-    response = data.get("response")
-    return response if isinstance(response, list) else []
+def _response_list(data: dict, url: str) -> list:
+    """The `response` list from a hierarchy envelope, or FetchError.
+
+    A 200 carrying an error envelope, no `response` key, or a `response` that
+    is not a list is a schema failure, not an empty hierarchy. Returning `[]`
+    for both made `get_zps`/`get_blocks`/`get_gps` unable to tell them apart,
+    which is exactly the successful-empty-output overwrite this client exists
+    to prevent: a scrape would "succeed" with no districts and truncate the
+    saved data. `[]` now means only that the API sent an explicit empty list.
+    """
+    if "response" not in data:
+        raise FetchError(url, "malformed envelope: no `response` key")
+    response = data["response"]
+    if not isinstance(response, list):
+        raise FetchError(
+            url, f"malformed envelope: `response` is {type(response).__name__}, not a list")
+    return response
 
 
 def get_zps() -> list:
     """Districts. A hierarchy failure raises rather than yielding no districts."""
     url = f"{BASE_URL}/api/prd/master/v1/getZPList/{STATE_ID}"
-    return _response_list(fetch_json(url, build_headers("master")))
+    return _response_list(fetch_json(url, build_headers("master")), url)
 
 
 def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
@@ -96,7 +110,7 @@ def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
     seen: dict = {}
     for year in years:
         url = build_url(hierarchy_year(year))
-        for item in _response_list(fetch_json(url, build_headers("master"))):
+        for item in _response_list(fetch_json(url, build_headers("master")), url):
             seen.setdefault(item.get(key), item)
     return list(seen.values())
 
