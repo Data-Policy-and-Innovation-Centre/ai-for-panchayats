@@ -8,7 +8,8 @@ name: Codex Review Gate
 #
 #   1. Reactions emit no webhook, and neither does resolving a review thread,
 #      so a clean :+1: and the last resolve of a round cannot trigger a run.
-#      The schedule sweeps open pull requests to catch both.
+#      The schedule sweeps open pull requests to catch both, and is the only
+#      thing that ever will -- see the cadence note on the cron below.
 #   2. Runs from `issue_comment` and `pull_request_review` attach to the default
 #      branch, not the pull request head. The check run is therefore created
 #      against `head_sha` through the API rather than reported by the job.
@@ -29,6 +30,23 @@ on:
   issue_comment:
     types: [created]
   schedule:
+    # Asks for every 5 minutes; GitHub does not deliver that. Measured over
+    # 24h on the repository this gate was ported from: 37 sweeps, not the
+    # ~288 the expression implies, with gaps of min 21 / median 41 / max 77
+    # minutes. High-frequency schedules are dropped first under load, so the
+    # rate is a request, not a guarantee.
+    #
+    # This is the gate's real latency floor, because the sweep is the *only*
+    # route by which a clean :+1: or the final thread resolve of a round is
+    # ever noticed. Expect a pull request cleared that way to sit red for
+    # tens of minutes; up to about 77 is normal, not stuck. Anything holding
+    # a merge should use `workflow_dispatch` rather than wait:
+    #
+    #     gh workflow run codex-review-gate.yml -f pr=<number>
+    #
+    # Lowering the frequency is not obviously better and has not been
+    # measured; leaving it at */5 costs nothing, since asking for more than
+    # GitHub grants is harmless.
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
@@ -43,7 +61,7 @@ permissions:
 
 # Queue rather than cancel. This workflow fires on pull_request,
 # pull_request_review, pull_request_review_comment, issue_comment and a
-# 5-minute cron, and every per-PR trigger shares one group. With
+# throttled cron, and every per-PR trigger shares one group. With
 # cancel-in-progress the commonest sequence -- push a fix, then comment
 # `@codex review` -- has the comment's run cancel the push's run, leaving a
 # CANCELLED `evaluate` job attached to the head commit forever. The verdict
