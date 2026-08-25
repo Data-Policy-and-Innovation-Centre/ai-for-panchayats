@@ -19,6 +19,13 @@ dependencies = [
 [tool.uv.sources]
 dpic = { git = "ssh://git@github.com/Data-Policy-and-Innovation-Centre/dpic-org.git", rev = "main" }
 
+[tool.pytest.ini_options]
+# "src" for the ingest packages, "." for scripts and the src.* runner imports.
+# This is the superset the other open branches need; when resolving a conflict
+# against one that lists only ["src"], keep this version.
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.2.0",
