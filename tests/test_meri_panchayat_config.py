@@ -83,6 +83,31 @@ def test_all_gps_flag_opens_the_scope(monkeypatch):
 # ---------------------------------------------------------------- hierarchy
 
 
+@pytest.mark.parametrize("bad", ["false", "true", "no", 0, 1, None, []])
+def test_a_non_boolean_all_gps_is_rejected_rather_than_coerced(bad):
+    """`bool("false")` is True, so coercion fails open.
+
+    A quoted `all_gps: "false"` is easy to write by hand or emit from a
+    template. Coerced, it would admit every GP and turn the 20-GP pilot into a
+    statewide scrape of a government portal, silently. The scope flag is the
+    one value that must never be guessed at.
+    """
+    with pytest.raises(config.ConfigError) as excinfo:
+        config._strict_bool(bad, "all_gps")
+    assert "all_gps" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_a_real_boolean_all_gps_passes_through(value):
+    assert config._strict_bool(value, "all_gps") is value
+
+
+def test_the_shipped_config_uses_a_real_boolean():
+    """Guards the file itself, not just the helper."""
+    assert isinstance(config.ALL_GPS, bool)
+    assert config.ALL_GPS is False, "the pilot scope must ship closed"
+
+
 def test_hierarchy_year_defaults_to_the_year_being_scraped():
     """Pinning one year hides panchayats created later."""
     assert config.HIERARCHY_FIN_YEAR is None
