@@ -183,7 +183,14 @@ def test_thumbs_up_from_a_human_is_not_the_signal():
 
 
 def test_comments_without_reactions_are_not_fetched():
-    """total_count == 0 must not cost a request; the sweep runs every 5 minutes."""
+    """total_count == 0 must not cost a request.
+
+    The sweep re-reads every open pull request, so per-comment reaction
+    fetches multiply across the whole queue. It runs far less often than the
+    `*/5` cron asks -- measured at a 41-minute median -- which makes each
+    sweep cheaper in aggregate than the schedule suggests, but the fan-out
+    per sweep is unchanged and grows with the number of open PRs.
+    """
     api = FakeGitHub(comments=[{"id": 9, "reactions": {"total_count": 0}}])
     api.reactions = {}  # a fetch for comment 9 would raise in rest()
     assert not api.evaluate().ok
