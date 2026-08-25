@@ -168,5 +168,16 @@ def test_this_repository_has_no_unreviewed_credentials():
 
 
 def test_the_baseline_stays_small():
-    """The known exposure is two lines. Growth means leaks are being normalised."""
-    assert len(scan_secrets.load_allowlist()) <= 2
+    """One exposure, three committed values. Growth past that is normalising leaks.
+
+    The cap was two while only branch tips had been scanned. The dev -> main
+    range spans 27 commits and reaches e69daf2, which carries a third
+    `secretkey`: the file tells the next operator to paste in a fresh one when
+    the scraper halts, so every refresh committed another value of the same
+    header block. Three lines is still the one known exposure in #12, not a
+    new one -- but the ratchet only works if raising it stays deliberate, so
+    this number goes up by an explicit edit or not at all.
+
+    #28 removes the headers from tracked source and takes this to zero.
+    """
+    assert len(scan_secrets.load_allowlist()) <= 3
