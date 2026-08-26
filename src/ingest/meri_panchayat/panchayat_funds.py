@@ -8,6 +8,7 @@ import pandas as pd
 
 
 from .config import (
+    gp_key,
     in_scope,
     STATE_ID, STATE_NAME, FIN_YEARS, OUTPUT_DIR, SAVE_EVERY_GP,
     REQUEST_DELAY, BASE_URL,
@@ -72,9 +73,9 @@ def main():
                 # once. Adapters that do record bp_id have distinguishable
                 # duplicates and a live question about which parent is
                 # authoritative -- see #42.
-                if gp_id in seen_gps:
+                if gp_key(gp_id) in seen_gps:
                     continue
-                seen_gps.add(gp_id)
+                seen_gps.add(gp_key(gp_id))
 
                 print(f"    GP {processed_gp_count + 1}: {gp_name}")
 

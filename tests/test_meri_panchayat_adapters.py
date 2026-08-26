@@ -433,9 +433,13 @@ def test_a_reorganized_gp_is_scraped_once_where_rows_carry_no_block(
         {"bpId": 3823, "name": "Old Block"},
         {"bpId": 3824, "name": "New Block"},
     ])
-    # The same in-scope GP is returned under both blocks.
+    # The same in-scope GP under both blocks -- and the portal spells the id
+    # differently in each, which the hierarchy validation and in_scope both
+    # accept. A raw-set dedupe treats them as two panchayats.
+    spellings = iter([[{"gpId": 116350, "name": "Hirlipali"}],
+                      [{"gpId": "116350", "name": "Hirlipali"}]])
     monkeypatch.setattr(module, "get_gps",
-                        lambda *a, **k: [{"gpId": 119598, "name": "Andhrua"}])
+                        lambda *a, **k: next(spellings, [{"gpId": 116350, "name": "Hirlipali"}]))
 
     fetched = []
     fetcher = "get_funds" if module_name == "panchayat_funds" else "get_beneficiaries"
@@ -447,11 +451,14 @@ def test_a_reorganized_gp_is_scraped_once_where_rows_carry_no_block(
     monkeypatch.setattr(module, fetcher, record)
     module.main()
 
-    gp_ids = [gp for gp, _ in fetched]
-    assert gp_ids.count(119598) == len(set(a for _, a in fetched)), (
-        f"GP 119598 was fetched {gp_ids.count(119598)} times across "
-        f"{len(set(a for _, a in fetched))} distinct year(s) -- the second "
-        "block re-scraped it"
+    # One fetch per distinct year, not one per (block, year).
+    distinct_years = {args for _, args in fetched}
+    assert len(fetched) == len(distinct_years), (
+        f"{len(fetched)} fetches across {len(distinct_years)} distinct "
+        "year(s) -- the GP was re-scraped under its second block"
+    )
+    assert {str(gp).strip() for gp, _ in fetched} == {"116350"}, (
+        "the two id spellings were treated as different panchayats"
     )
 
 
