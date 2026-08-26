@@ -120,6 +120,20 @@ def test_forged_row_count_is_rejected(tmp_path: Path):
         validate_canonical_manifest(result.output_root)
 
 
+def test_max_buffered_rows_reports_observed_peak_not_configured_chunk_size(tmp_path: Path):
+    """max_buffered_rows must reflect what was actually buffered in memory.
+
+    With 5 rows and a chunk_size far larger than the data, the previous
+    implementation echoed the configured chunk_size (999999) back as if it
+    were an observed peak, which is not evidence that buffering is bounded.
+    """
+    run = make_run(tmp_path, "run-small", {
+        "2021_PL.json": [{"id": str(i)} for i in range(5)],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical", chunk_size=999999)
+    assert result.max_buffered_rows == 5
+
+
 def test_stale_outputs_are_removed_and_chunks_obey_boundary(tmp_path: Path):
     first = make_run(tmp_path, "run-a", {
         "2021_PL.json": [{"id": "1", "children": [{"x": 1}]}],

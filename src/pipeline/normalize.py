@@ -623,6 +623,7 @@ def normalize_egramswaraj(
 
     destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
     staged_tables: dict[str, list[Path]] = {}
+    observed_max_buffered_rows = 0
     with AtomicParquetPublication(destination) as publication:
         for table_name in sorted(table_types):
             schema = _arrow_schema(table_types[table_name])
@@ -632,6 +633,7 @@ def normalize_egramswaraj(
                 if item_name != table_name:
                     continue
                 buffer.append(value)
+                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
                 if len(buffer) >= chunk_size:
                     paths.extend(publication.write_rows(
                         table_name, buffer, chunk_size=chunk_size, schema=schema,
@@ -658,6 +660,7 @@ def normalize_egramswaraj(
                 if item_name is not None:
                     continue
                 buffer.append(value.as_row(manifest))
+                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
                 if len(buffer) >= chunk_size:
                     paths.extend(publication.write_rows(
                         "quarantine", buffer, chunk_size=chunk_size,
@@ -699,7 +702,7 @@ def normalize_egramswaraj(
     }
     # Quarantine rows are intentionally not retained in memory after staging.
     return NormalizationResult(
-        destination, manifest.run_id, published_tables, (), chunk_size, quarantine_count
+        destination, manifest.run_id, published_tables, (), observed_max_buffered_rows, quarantine_count
     )
 
 
