@@ -230,3 +230,17 @@ def test_a_malformed_envelope_raises_instead_of_reporting_no_districts(
     with pytest.raises(base_scraper.FetchError):
         base_scraper.get_zps()
 
+
+@pytest.mark.parametrize("entry, why", [
+    (None, "a scalar entry would raise AttributeError"),
+    ("gp", "a string entry would raise AttributeError"),
+    ({"name": "Andhrua"}, "an object with no bpId would be kept under None"),
+])
+def test_a_malformed_hierarchy_entry_raises(monkeypatch, entry, why):
+    """Entry-level drift takes the same typed failure as envelope-level drift."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [entry]}))
+
+    with pytest.raises(FetchError, match="malformed entry"):
+        get_blocks(321, "2024-2025")
+
