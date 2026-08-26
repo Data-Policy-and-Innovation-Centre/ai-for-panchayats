@@ -205,17 +205,35 @@ def get_gps(zp_id, bp_id, fin_year: str | None = None) -> list:
         "gpId", fin_year)
 
 
-def save_outputs(df, json_path=None, csv_path=None) -> None:
+def _checkpoint_path(path):
+    return path.with_suffix(path.suffix + ".partial")
+
+
+def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) -> None:
     """Write a frame to JSON and/or CSV, creating parent directories.
 
     Accepts either order used by the scrapers: save_outputs(df, json_path) and
     save_outputs(df, csv_path=..., json_path=...) both work.
+
+    `checkpoint=True` writes beside the target as `<name>.partial` instead of
+    to the target itself. Mid-run checkpoints wrote straight to the canonical
+    filename, so a stage that failed after its first checkpoint left a
+    previously complete artifact replaced by a partial one under the name
+    everything downstream reads -- an incomplete dataset wearing the name of a
+    complete one, which is the failure this client exists to prevent. The
+    final, unflagged save promotes the run and clears any stale partial.
     """
     for path, writer in ((json_path, "json"), (csv_path, "csv")):
         if path is None:
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
+        target = _checkpoint_path(path) if checkpoint else path
+        target.parent.mkdir(parents=True, exist_ok=True)
         if writer == "json":
-            df.to_json(path, orient="records", indent=2, force_ascii=False)
+            df.to_json(target, orient="records", indent=2, force_ascii=False)
         else:
-            df.to_csv(path, index=False)
+            df.to_csv(target, index=False)
+
+        if not checkpoint:
+            stale = _checkpoint_path(path)
+            if stale.exists():
+                stale.unlink()
