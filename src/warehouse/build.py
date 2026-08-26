@@ -1,0 +1,308 @@
+"""Build the panchayat DuckDB warehouse.
+
+Publication sequence, enforced in this order:
+
+    1. validate selected snapshots and manifests   (select.resolve_snapshots)
+    2. create a temporary DuckDB                    (tempfile, not target)
+    3. execute explicit DDL                         (schema.DDL)
+    4. load canonical Parquet through pure transforms (transform.py, load.py)
+    5. quarantine invalid rows                      (transform.Quarantine)
+    6. validate PK/FK/counts/grains/provenance      (validate.run_checks)
+    7. commit and close the temporary DB
+    8. atomically replace the target DuckDB path    (os.replace)
+
+A failed build (a rejected preflight, a Python exception mid-load, or a
+failed post-load check) never touches the target path: everything happens in
+a sibling temporary file that is removed on any exit other than a clean
+``os.replace`` at the very end. The previous database, if any, is therefore
+always left exactly as it was.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+from . import transform
+from .config import WarehouseSettings, load_settings
+from .load import DEFAULT_BATCH_SIZE, insert, read_table
+from .schema import CREATE_ORDER, DDL, RESET_ORDER
+from .select import SelectedSnapshot, resolve_snapshots
+from .transform import Quarantine
+from .validate import Check, ValidationFailed, run_checks
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BuildResult:
+    target: Path
+    counts: dict[str, int]
+    quarantine_count: int
+    checks: tuple[Check, ...]
+    consumed_tables: dict[str, tuple[str, ...]]
+    unconsumed_tables: dict[str, tuple[str, ...]]
+
+
+def create_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Drop children before parents, then create parents before children."""
+
+    for table in RESET_ORDER:
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+    for table in CREATE_ORDER:
+        con.execute(DDL[table])
+
+
+def _child_tables(tables: dict[str, tuple[str, ...]], parent_kind: str, keyword: str) -> list[str]:
+    """Direct children of ``parent_kind`` only -- never a grandchild.
+
+    ``pl__fundlist__lineitems`` must not match here just because "fund" is a
+    substring of "fundlist": a deeper nested array has its own, different
+    row shape and would otherwise be silently folded into the wrong table
+    (e.g. its rows have no ``schemeCode``/``amountTotal`` of their own,
+    so they would load as spurious all-null fund rows). A table one level
+    too deep is left for ``unconsumed_tables`` to report instead.
+    """
+
+    prefix = f"{parent_kind}__"
+    return sorted(
+        name for name in tables
+        if name.startswith(prefix)
+        and "__" not in name[len(prefix):]
+        and keyword in name[len(prefix):]
+    )
+
+
+def _read(root: Path, tables: dict[str, tuple[str, ...]], name: str) -> pd.DataFrame:
+    return read_table(root, tables.get(name, ()))
+
+
+def _merge_gram_panchayat(
+    con: duckdb.DuckDBPyConnection, frame: pd.DataFrame, quarantine: Quarantine,
+    *, source_system: str, source_run_id: str, batch_size: int,
+) -> int:
+    """Insert new GP codes, quarantine ones that conflict with what is loaded.
+
+    ``gram_panchayat`` is a conformed dimension with no per-source key (a GP
+    is the same GP no matter which run observed it), so merging a second
+    snapshot's contribution has to check what earlier snapshots in *this same
+    build* already inserted, not just what is unique within this frame.
+    """
+
+    if frame.empty:
+        return 0
+    existing = con.execute("SELECT gp_lgd_code, gp_name FROM gram_panchayat").fetchdf()
+    if existing.empty:
+        new_rows = frame
+    else:
+        merged = frame.merge(existing, on="gp_lgd_code", how="left", suffixes=("", "_existing"))
+        already_present = merged["gp_name_existing"].notna()
+        conflicting = already_present & (merged["gp_name"] != merged["gp_name_existing"])
+        if conflicting.any():
+            quarantine.add(
+                "gram_panchayat", "conflicting_duplicate_key",
+                "gp_lgd_code already loaded with a different gp_name",
+                "gp_lgd_code", frame.loc[conflicting.to_numpy(), "gp_lgd_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        new_rows = frame.loc[~already_present.to_numpy()]
+    return insert(con, "gram_panchayat", new_rows, batch_size=batch_size)
+
+
+def populate(
+    con: duckdb.DuckDBPyConnection, selected: tuple[SelectedSnapshot, ...],
+    *, batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    """Shape and load every table inside the caller's transaction."""
+
+    quarantine = Quarantine()
+    counts: dict[str, int] = {}
+    consumed: dict[str, tuple[str, ...]] = {}
+    unconsumed: dict[str, tuple[str, ...]] = {}
+
+    def add_count(table: str, n: int) -> None:
+        counts[table] = counts.get(table, 0) + n
+
+    for snapshot in selected:
+        source_system, source_run_id = snapshot.spec.source, snapshot.spec.run_id
+        tables = snapshot.tables
+        root = snapshot.snapshot_root
+        used: list[str] = []
+
+        top_level = {}
+        for kind in ("pl", "aa", "ta", "pp", "re"):
+            frame = _read(root, tables, kind)
+            top_level[kind] = frame
+            if kind in tables:
+                used.append(kind)
+        pl, aa, ta, pp, re = (top_level[k] for k in ("pl", "aa", "ta", "pp", "re"))
+
+        # Every kind independently records its own GP via the same
+        # folder-name parser, so the dimension is built from all of them,
+        # not only from the planning payload.
+        gp_frame = transform.gram_panchayat(
+            [frame for frame in top_level.values() if not frame.empty], quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        add_count("gram_panchayat", _merge_gram_panchayat(
+            con, gp_frame, quarantine, source_system=source_system,
+            source_run_id=source_run_id, batch_size=batch_size,
+        ))
+
+        if not pl.empty:
+            plans = transform.plan(pl, quarantine, source_system=source_system, source_run_id=source_run_id)
+            add_count("plan", insert(con, "plan", plans, batch_size=batch_size))
+
+            activities = transform.planned_activity(
+                pl, quarantine, source_system=source_system, source_run_id=source_run_id,
+            )
+            add_count("planned_activity", insert(con, "planned_activity", activities, batch_size=batch_size))
+            activity_codes = set(activities["activity_code"].dropna())
+
+            add_count("activity_delegation", insert(con, "activity_delegation", transform.activity_delegation(
+                pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            ), batch_size=batch_size))
+            add_count("activity_training", insert(con, "activity_training", transform.activity_training(
+                pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            ), batch_size=batch_size))
+            add_count("activity_community_service", insert(
+                con, "activity_community_service", transform.activity_community_service(
+                    pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+                ), batch_size=batch_size))
+            add_count("activity_nsap", insert(con, "activity_nsap", transform.activity_nsap(
+                pl, activity_codes, source_system=source_system, source_run_id=source_run_id,
+            ), batch_size=batch_size))
+
+            asset_children = _child_tables(tables, "pl", "asset")
+            asset_frame = pd.concat(
+                [_read(root, tables, name) for name in asset_children], ignore_index=True,
+            ) if asset_children else pd.DataFrame()
+            add_count("activity_asset", insert(con, "activity_asset", transform.activity_asset(
+                asset_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            ), batch_size=batch_size))
+            used.extend(asset_children)
+
+            fund_children = _child_tables(tables, "pl", "fund")
+            fund_frame = pd.concat(
+                [_read(root, tables, name) for name in fund_children], ignore_index=True,
+            ) if fund_children else pd.DataFrame()
+            add_count("activity_fund", insert(con, "activity_fund", transform.activity_fund(
+                fund_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            ), batch_size=batch_size))
+            used.extend(fund_children)
+        else:
+            activity_codes = set()
+
+        gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+
+        approvals = transform.admin_approval(
+            aa, activity_codes, gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
+        parent_row_ids = set(approvals["row_id"].dropna())
+
+        scheme_children = _child_tables(tables, "aa", "")
+        scheme_frame = pd.concat(
+            [_read(root, tables, name) for name in scheme_children], ignore_index=True,
+        ) if scheme_children else pd.DataFrame()
+        add_count("admin_approval_scheme", insert(con, "admin_approval_scheme", transform.admin_approval_scheme(
+            scheme_frame, parent_row_ids, quarantine, source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
+        used.extend(scheme_children)
+
+        add_count("technical_approval", insert(con, "technical_approval", transform.technical_approval(
+            ta, activity_codes, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
+
+        add_count("physical_progress", insert(con, "physical_progress", transform.physical_progress(
+            pp, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
+
+        add_count("recommended_expenditure", insert(con, "recommended_expenditure", transform.recommended_expenditure(
+            re, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
+
+        consumed[f"{source_system}/{source_run_id}"] = tuple(sorted(used))
+        leftover = tuple(sorted(set(tables) - set(used) - {"quarantine"}))
+        if leftover:
+            unconsumed[f"{source_system}/{source_run_id}"] = leftover
+
+    add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
+    return counts, quarantine, consumed, unconsumed
+
+
+def build_into(
+    path: Path, selected: tuple[SelectedSnapshot, ...], *, batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    """Create and populate a database at ``path``, in one transaction."""
+
+    con = duckdb.connect(str(path))
+    try:
+        create_schema(con)
+        con.execute("BEGIN TRANSACTION")
+        try:
+            result = populate(con, selected, batch_size=batch_size)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return result
+
+
+def build(
+    *,
+    snapshot_ids: tuple[str, ...],
+    target: Path | None = None,
+    settings: WarehouseSettings | None = None,
+    registry=None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    validate: bool = True,
+) -> BuildResult:
+    """Rebuild the warehouse, publishing it only if every check passes.
+
+    ``target`` is replaced atomically: a failed or invalid build cannot leave
+    the previous database missing or half-written, because every step before
+    the final ``os.replace`` runs against a sibling temporary file.
+    """
+
+    settings = settings or load_settings()
+    target = Path(target or settings.db_path)
+    selected = resolve_snapshots(settings, snapshot_ids, registry=registry)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(dir=target.parent, prefix=f".{target.stem}-build-"))
+    staging = staging_dir / target.name
+    try:
+        counts, quarantine, consumed, unconsumed = build_into(staging, selected, batch_size=batch_size)
+        logger.info("Loaded %d table(s): %s", len(counts), ", ".join(f"{t}={n}" for t, n in counts.items()))
+        if quarantine.total():
+            logger.warning("Quarantined %d row(s); see the quarantine table", quarantine.total())
+        if unconsumed:
+            logger.warning("Declared but unconsumed canonical tables: %s", unconsumed)
+
+        results: tuple[Check, ...] = ()
+        if validate:
+            con = duckdb.connect(str(staging), read_only=True)
+            try:
+                results = tuple(run_checks(con, counts, selected))
+            finally:
+                con.close()
+            failures = [check for check in results if not check.passed]
+            if failures:
+                raise ValidationFailed(failures)
+
+        os.replace(staging, target)
+        logger.info("Published %s", target)
+        return BuildResult(target, counts, quarantine.total(), results, consumed, unconsumed)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)

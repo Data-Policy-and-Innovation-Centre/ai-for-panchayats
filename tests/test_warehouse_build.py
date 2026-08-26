@@ -1,0 +1,370 @@
+"""End-to-end warehouse build tests, driven through ``warehouse.build.build``.
+
+Per the session's caution about helpers whose call site is never exercised,
+these tests go through the real publication sequence (preflight -> temp
+DuckDB -> DDL -> load+transform -> quarantine -> validate -> publish) rather
+than calling transform/load functions directly, for every behaviour listed
+as required coverage.
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+
+import duckdb
+import pytest
+
+from warehouse.build import BuildResult, build
+from warehouse.validate import ValidationFailed
+
+from _warehouse_helpers import approved, make_settings, normalize, publish_raw_run, registry, write_manual_snapshot
+
+
+def _pl_aa_run(tmp_path: Path, run_id: str = "run-1", *, activity_code: int = 7):
+    run = publish_raw_run(tmp_path, run_id, {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [
+                {
+                    "activityCd": activity_code, "planCode": "P1", "activityName": "Well digging",
+                    "totalCost": 15000.50, "activityStts": 1,
+                    "fundList": [
+                        {"schemeCode": "S1", "amountTotal": 5000.25},
+                        {"schemeCode": "S2", "amountTotal": 250.10},
+                    ],
+                    "assetDetails": [{"astTyp": "well", "astUnitCost": 15000.50}],
+                },
+            ],
+        },
+        "LGD_123_Test_GP/2021_AA.json": {
+            "data": [{"activityCd": activity_code, "wrkAdmApprNo": "007", "wrkProposedCost": 15000.5}],
+        },
+    })
+    return run
+
+
+def _build_settings_and_registry(tmp_path: Path, run_id: str = "run-1"):
+    settings = make_settings(tmp_path)
+    run = _pl_aa_run(tmp_path, run_id)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", run_id))
+    return settings, spec_registry
+
+
+# --------------------------------------------------------------------- happy path
+
+
+def test_full_build_publishes_and_reports_counts(tmp_path: Path):
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert isinstance(result, BuildResult)
+    assert result.target.exists()
+    assert result.counts["planned_activity"] == 1
+    assert result.counts["activity_fund"] == 2
+    assert result.counts["activity_asset"] == 1
+    assert result.counts["admin_approval"] == 1
+    assert result.quarantine_count == 0
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        row = con.execute("SELECT total_cost, typeof(total_cost) FROM planned_activity").fetchone()
+        assert row == (Decimal("15000.50"), "DECIMAL(18,2)")
+        total = con.execute("SELECT sum(fund_amount_total) FROM activity_fund").fetchone()[0]
+        assert total == Decimal("5250.35")  # exact; would drift under float64
+    finally:
+        con.close()
+
+
+def test_build_never_touches_real_default_db_path_unless_asked(tmp_path: Path):
+    """Settings default to data/interim/panchayat.duckdb; every test here
+    passes an explicit target instead, which this asserts stays true."""
+
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    assert "data/interim/panchayat.duckdb" not in str(settings.db_path) or str(tmp_path) in str(settings.db_path)
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert str(tmp_path) in str(result.target)
+
+
+# --------------------------------------------------------------------- PK/FK enforcement (through build)
+
+
+def test_orphan_admin_approval_is_quarantined_not_loaded(tmp_path: Path):
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 999, "wrkAdmApprNo": "1"}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert result.counts["admin_approval"] == 0
+    assert result.quarantine_count == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        reasons = con.execute("SELECT reason_code FROM quarantine").fetchall()
+        assert ("orphan_reference",) in reasons
+    finally:
+        con.close()
+
+
+def test_conflicting_duplicate_activity_is_quarantined_through_build(tmp_path: Path):
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [
+            {"activityCd": 7, "activityName": "Well", "totalCost": 100},
+            {"activityCd": 7, "activityName": "Road", "totalCost": 999},
+        ]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert result.counts["planned_activity"] == 1
+    assert result.quarantine_count == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        duplicates = con.execute(
+            "SELECT count(*) - count(DISTINCT activity_code) FROM planned_activity"
+        ).fetchone()[0]
+        assert duplicates == 0
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- explicit valid-empty datasets
+
+
+def test_kind_with_zero_records_is_explicit_empty_not_missing(tmp_path: Path):
+    """The run only has PL/AA payload files; TA/PP/RE still get an explicit,
+    schema-correct, zero-row canonical table (the normalizer's own contract),
+    and the warehouse must load them as present-but-empty, not fail."""
+
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    for table in ("technical_approval", "physical_progress", "recommended_expenditure"):
+        assert result.counts[table] == 0
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        for table in ("technical_approval", "physical_progress", "recommended_expenditure"):
+            # The table exists and is queryable -- not simply absent.
+            assert con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_empty_selection_still_publishes_a_valid_empty_warehouse(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    result = build(snapshot_ids=(), settings=settings, registry=registry())
+    assert result.target.exists()
+    assert all(count == 0 for count in result.counts.values())
+
+
+# --------------------------------------------------------------------- analytical grain
+
+
+def test_activity_fund_grain_allows_multiple_lines_per_activity(tmp_path: Path):
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert result.counts["activity_fund"] == 2  # two scheme lines for one activity
+
+
+def test_recommended_expenditure_identity_grain_through_build(tmp_path: Path):
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_RE.json": {
+            "data": [
+                {"activityCd": 7, "planCode": "P1", "sNo": 1, "totalExpenditure": 500},
+                {"activityCd": 7, "planCode": "P1", "sNo": 2, "totalExpenditure": 700},
+            ],
+        },
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert result.counts["recommended_expenditure"] == 2
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        s_nos = sorted(r[0] for r in con.execute("SELECT s_no FROM recommended_expenditure").fetchall())
+        assert s_nos == ["1", "2"]
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- scaling / chunk boundaries
+
+
+def test_insert_batching_is_exact_at_chunk_boundaries(tmp_path: Path):
+    """A table whose row count is not a multiple of the batch size, loaded
+    through the real build path with a tiny batch_size, must still load
+    every row exactly once -- no row dropped or duplicated at a boundary."""
+
+    activities = [{"activityCd": i, "totalCost": i} for i in range(1, 8)]  # 7 rows
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": activities},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry, batch_size=3)
+    assert result.counts["planned_activity"] == 7
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM planned_activity").fetchone()[0] == 7
+        assert con.execute("SELECT count(DISTINCT activity_code) FROM planned_activity").fetchone()[0] == 7
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- cross-source provenance
+
+
+def test_cross_source_facts_do_not_collide_and_gp_dimension_merges(tmp_path: Path):
+    """Two different source systems, same GP, disjoint activities: facts must
+    stay attributable to their own source and never collide on a bare code,
+    while the GP dimension conforms across both."""
+
+    settings = make_settings(tmp_path)
+    run = _pl_aa_run(tmp_path, "run-1", activity_code=7)
+    normalize(run, settings.canonical_root, chunk_size=100)
+
+    write_manual_snapshot(
+        settings.canonical_root, source="othersystem", run_id="run-9",
+        tables={
+            "pl": [{
+                "row_id": "o1", "source_system": "othersystem", "source_run_id": "run-9",
+                "business_id": "7",  # same bare code as the egramSwaraj activity, different system
+                "gp_code": "123", "gram_panchayat_name": "Test GP",
+                "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
+            }],
+        },
+    )
+
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("snap-2", "othersystem", "run-9"),
+    )
+    result = build(snapshot_ids=("snap-1", "snap-2"), settings=settings, registry=spec_registry)
+    assert result.counts["planned_activity"] == 2  # both kept: no bare-code collision
+    assert result.counts["gram_panchayat"] == 1    # same GP, conformed once
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT source_system, activity_code FROM planned_activity ORDER BY source_system"
+        ).fetchall()
+        assert rows == [("egramSwaraj", "7"), ("othersystem", "7")]
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- failure handling
+
+
+def test_failed_build_leaves_existing_database_untouched(tmp_path: Path, monkeypatch):
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    first = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    original_bytes = first.target.read_bytes()
+
+    import warehouse.build as build_module
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated mid-populate failure")
+    monkeypatch.setattr(build_module, "insert", boom)
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert first.target.read_bytes() == original_bytes
+    # No leftover staging directories beside the target.
+    leftovers = [p for p in first.target.parent.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_failed_validation_leaves_existing_database_untouched(tmp_path: Path, monkeypatch):
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    first = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    original_bytes = first.target.read_bytes()
+
+    import warehouse.build as build_module
+    from warehouse.validate import Check
+    def fail_checks(*args, **kwargs):
+        return [Check("synthetic failing check", False, "forced failure for the rollback test")]
+    monkeypatch.setattr(build_module, "run_checks", fail_checks)
+
+    with pytest.raises(ValidationFailed):
+        build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert first.target.read_bytes() == original_bytes
+    leftovers = [p for p in first.target.parent.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_manifest_hash_mismatch_stops_build_before_any_db_write(tmp_path: Path):
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    snapshot_root = settings.snapshot_root("egramSwaraj", "run-1")
+    part_files = list((snapshot_root / "pl").rglob("*.parquet"))
+    with part_files[0].open("r+b") as handle:
+        handle.write(b"\x00" * 8)
+
+    with pytest.raises(Exception):
+        build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert not settings.db_path.exists()
+
+
+# --------------------------------------------------------------------- AA scheme child discovery
+
+
+def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
+    """The scheme/fund array's own JSON key name is unverified (see
+    transform.py's module docstring); the loader discovers it by prefix
+    (``aa__*``) rather than assuming a specific key, so this fixture uses an
+    arbitrary plausible key to prove that discovery path end to end."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [
+                {"wrkSchmCd": "SC1", "wrkAdmApprFndSnctnGen": 100},
+                {"wrkSchmCd": "SC2", "fndAllctnSchmTot": 250},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    assert result.counts["admin_approval_scheme"] == 2
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT scheme_code, fund_sanctioned_general, fund_sanctioned_total "
+            "FROM admin_approval_scheme ORDER BY scheme_code"
+        ).fetchall()
+        assert rows == [
+            ("SC1", Decimal("100.00"), None),
+            ("SC2", None, Decimal("250.00")),  # fndAllctnSchmTot alias (PR #30) resolves too
+        ]
+    finally:
+        con.close()
+
+
+def test_unrecognized_child_table_is_tracked_not_silently_dropped(tmp_path: Path):
+    """A nested array the warehouse has no handler for (e.g. a grandchild
+    under fundList) must still be visible in the build result, never
+    silently ignored."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{
+            "activityCd": 7, "totalCost": 100,
+            "fundList": [{"schemeCode": "S1", "lineItems": [{"code": "a"}, {"code": "b"}]}],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+    unconsumed = result.unconsumed_tables["egramSwaraj/run-1"]
+    assert "pl__fundlist__lineitems" in unconsumed
