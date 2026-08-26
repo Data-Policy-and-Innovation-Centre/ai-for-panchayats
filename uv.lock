@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -13,7 +13,7 @@ resolution-markers = [
 [[package]]
 name = "ai-for-panchayats"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dpic" },
     { name = "dvc", extra = ["s3"] },
@@ -23,6 +23,7 @@ dependencies = [
     { name = "pandera" },
     { name = "polars" },
     { name = "pyarrow" },
+    { name = "pyyaml" },
     { name = "requests" },
 ]
 
@@ -45,6 +46,7 @@ requires-dist = [
     { name = "pandera", specifier = ">=0.31.1" },
     { name = "polars", specifier = ">=1.41.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
 
