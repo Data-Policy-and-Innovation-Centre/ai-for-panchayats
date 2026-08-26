@@ -9,6 +9,7 @@ import pytest
 from pipeline.manifest import RunPublisher
 from pipeline.normalize import (
     NormalizationError,
+    _normalise_year,
     normalize_egramswaraj,
     validate_canonical_manifest,
 )
@@ -132,6 +133,29 @@ def test_max_buffered_rows_reports_observed_peak_not_configured_chunk_size(tmp_p
     })
     result = normalize_egramswaraj(run, tmp_path / "canonical", chunk_size=999999)
     assert result.max_buffered_rows == 5
+
+
+@pytest.mark.parametrize(
+    "fiscal_year, expected",
+    [
+        ("1998-99", "1998-1999"),
+        ("2021-22", "2021-2022"),
+        ("1999-00", "1999-2000"),
+    ],
+)
+def test_two_digit_fiscal_year_century_rollover(fiscal_year: str, expected: str):
+    """The end year's century must be derived from the start year.
+
+    Previously any two-digit end was assumed to be in the 2000s, so
+    "1998-99" normalised to "1998-2099" instead of "1998-1999".
+    """
+    assert _normalise_year(fiscal_year) == expected
+
+
+def test_four_digit_and_bare_year_behaviour_is_unchanged():
+    assert _normalise_year("2021") == "2021-2022"
+    assert _normalise_year("1998-1999") == "1998-1999"
+    assert _normalise_year("2021-2045") == "2021-2045"
 
 
 def test_stale_outputs_are_removed_and_chunks_obey_boundary(tmp_path: Path):

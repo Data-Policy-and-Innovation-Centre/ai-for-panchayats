@@ -201,9 +201,17 @@ def _normalise_year(value: str | None) -> str | None:
     end = match.group(2)
     if end is None:
         return f"{start:04d}-{start + 1:04d}"
-    end_year = int(end) + (2000 if len(end) == 2 else 0)
-    if end_year < 1000:
-        end_year += 2000
+    if len(end) == 4:
+        end_year = int(end)
+    else:
+        # Derive the century from the start year rather than assuming the
+        # 2000s, so "1998-99" -> "1998-1999" instead of "1998-2099". A
+        # two-digit end that would fall before the start year rolls over
+        # into the next century, e.g. "1999-00" -> "1999-2000".
+        century = (start // 100) * 100
+        end_year = century + int(end)
+        if end_year < start:
+            end_year += 100
     return f"{start:04d}-{end_year:04d}"
 
 
