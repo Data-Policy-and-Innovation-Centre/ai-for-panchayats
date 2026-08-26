@@ -276,16 +276,15 @@ class RunPublisher:
         rel = _safe_relative(relative_path, staging / "payloads")
         target = staging / "payloads" / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        if hasattr(payload, "read"):
-            data = payload.read()
-        elif isinstance(payload, str):
-            data = payload.encode("utf-8")
-        else:
-            data = bytes(payload)
-        if isinstance(data, str):
-            data = data.encode("utf-8")
         with tempfile.NamedTemporaryFile("wb", dir=target.parent, delete=False) as handle:
-            handle.write(data)
+            if hasattr(payload, "read"):
+                while chunk := payload.read(1024 * 1024):
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    handle.write(chunk)
+            else:
+                data = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+                handle.write(data)
             temporary = Path(handle.name)
         os.replace(temporary, target)
         return target

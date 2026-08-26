@@ -17,6 +17,7 @@ class SnapshotRegistryError(ValueError):
 class SnapshotSpec:
     snapshot_id: str
     source: str
+    run_id: str
     schema_version: str
     status: str
     description: str = ""
@@ -58,7 +59,7 @@ def load_snapshot_registry(path: str | Path) -> SnapshotRegistry:
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
             raise SnapshotRegistryError(f"snapshots[{index}] must be a mapping")
-        required = {"id", "source", "schema_version", "status"}
+        required = {"id", "source", "run_id", "schema_version", "status"}
         missing = required - set(record)
         if missing:
             raise SnapshotRegistryError(f"snapshots[{index}] missing {sorted(missing)}")
@@ -69,6 +70,7 @@ def load_snapshot_registry(path: str | Path) -> SnapshotRegistry:
             SnapshotSpec(
                 snapshot_id=values["id"],
                 source=values["source"],
+                run_id=values["run_id"],
                 schema_version=values["schema_version"],
                 status=values["status"],
                 description=str(record.get("description", "")),

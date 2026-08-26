@@ -1,10 +1,5 @@
 version: 1
 
 # Only snapshots that have been explicitly reviewed for the pipeline contract
-# belong here.  Source adapters may add entries in later stages.
-snapshots:
-  - id: synthetic-v1
-    source: synthetic
-    schema_version: "1"
-    status: approved
-    description: Deterministic fixture used by foundation tests.
+# belong here. Source adapters or release tooling add exact immutable run IDs.
+snapshots: []

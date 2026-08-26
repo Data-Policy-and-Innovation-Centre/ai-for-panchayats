@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
@@ -73,12 +74,33 @@ def test_failed_terminal_run_is_integrity_valid_but_not_approvable(tmp_path: Pat
 
 
 def test_snapshot_registry_has_only_approved_entries():
-    registry = load_snapshot_registry(Path(__file__).parents[1] / "config" / "snapshots.yaml")
-    assert registry.get("synthetic-v1").status == "approved"
+    assert load_snapshot_registry(Path(__file__).parents[1] / "config" / "snapshots.yaml").snapshots == ()
+
+
+def test_file_like_payloads_are_streamed_in_bounded_chunks(tmp_path: Path):
+    class BoundedStream(io.BytesIO):
+        def read(self, size=-1):
+            assert size != -1
+            return super().read(size)
+
+    with RunPublisher(tmp_path / "raw", "synthetic", "stream") as publisher:
+        publisher.write_payload("stream.bin", BoundedStream(b"streamed"))
+        path = publisher.publish()
+    assert (path / "payloads" / "stream.bin").read_bytes() == b"streamed"
+
+
+def test_snapshot_registry_resolves_an_exact_run_id(tmp_path: Path):
+    registry_file = tmp_path / "snapshots.yaml"
+    registry_file.write_text(
+        "version: 1\nsnapshots:\n  - id: fixture\n    source: source\n"
+        "    run_id: run-2026-01\n    schema_version: '1'\n    status: approved\n",
+        encoding="utf-8",
+    )
+    assert load_snapshot_registry(registry_file).get("fixture").run_id == "run-2026-01"
 
 
 def test_later_stages_fail_clearly_and_ingest_uses_tmp_path(tmp_path: Path, capsys):
-    assert main(["normalize"]) == 2
+    assert main(["build"]) == 2
     assert "not implemented" in capsys.readouterr().err
 
     payload = tmp_path / "payload.txt"

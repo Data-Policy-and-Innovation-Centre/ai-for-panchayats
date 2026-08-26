@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .manifest import ManifestError, RunPublisher, validate_run
+from .normalize import normalize_egramswaraj
 
 
 class Stage(StrEnum):
@@ -64,7 +65,12 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("validate-run", help="verify a published raw run")
     verify.add_argument("run_path", type=Path)
 
-    for name in (Stage.NORMALIZE.value, Stage.BUILD.value, Stage.EXPORT_CSV.value):
+    normalize = commands.add_parser(Stage.NORMALIZE.value, help="normalize an eGramSwaraj raw run")
+    normalize.add_argument("--run-path", required=True, type=Path)
+    normalize.add_argument("--output-root", required=True, type=Path)
+    normalize.add_argument("--chunk-size", type=int, default=100_000)
+    normalize.add_argument("--kinds", default=",".join(sorted({"PL", "AA", "TA", "PP", "RE"})))
+    for name in (Stage.BUILD.value, Stage.EXPORT_CSV.value):
         commands.add_parser(name, help="reserved later pipeline stage")
     return parser
 
@@ -114,6 +120,18 @@ def _ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _normalize(args: argparse.Namespace) -> int:
+    result = normalize_egramswaraj(
+        args.run_path,
+        args.output_root,
+        chunk_size=args.chunk_size,
+        kinds=(kind.strip() for kind in args.kinds.split(",") if kind.strip()),
+    )
+    print(f"published {result.output_root} ({len(result.tables)} tables; "
+          f"{result.quarantine_count} quarantined)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -123,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
             report = validate_run(args.run_path)
             print(f"valid: {report.run_path} ({report.checked_files} files)")
             return 0
+        if args.command == Stage.NORMALIZE.value:
+            return _normalize(args)
         dispatch(Stage(args.command))
     except (ManifestError, StageNotImplemented, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
