@@ -85,8 +85,14 @@ TARGET_GP_IDS = frozenset(gp["gp_code"] for gp in TARGET_GPS)
 TARGET_GP_KEYS = frozenset(str(gp["gp_code"]).strip() for gp in TARGET_GPS)
 
 
-def _gp_key(gp_id) -> str:
-    """One comparable form for a GP id, whatever the portal sent."""
+def gp_key(gp_id) -> str:
+    """One comparable form for any hierarchy id, whatever the portal sent.
+
+    Public because every comparison of a portal id has to use it. The portal
+    serialises the same id as an int one year and a string the next, so scope
+    checks, hierarchy dedupe and per-GP dedupe each silently broke in turn
+    when they compared raw values. One normaliser, used everywhere.
+    """
     return str(gp_id).strip()
 
 
@@ -103,7 +109,7 @@ def in_scope(gp_id) -> bool:
     """
     if ALL_GPS:
         return True
-    return _gp_key(gp_id) in TARGET_GP_KEYS
+    return gp_key(gp_id) in TARGET_GP_KEYS
 
 
 SAVE_EVERY_GP = _cfg["save_every_gp"]
