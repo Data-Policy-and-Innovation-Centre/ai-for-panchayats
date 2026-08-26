@@ -9,6 +9,7 @@ one after an outage.
 from __future__ import annotations
 
 import logging
+import os
 
 import requests
 
@@ -210,14 +211,27 @@ def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) ->
     for path, writer in ((json_path, "json"), (csv_path, "csv")):
         if path is None:
             continue
-        target = _checkpoint_path(path) if checkpoint else path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if checkpoint:
+            target = _checkpoint_path(path)
+        else:
+            # Write somewhere else and rename in. A direct write to the
+            # canonical path truncates it the instant it opens, so an
+            # interrupt, a full disk, or a writer raising part-way leaves the
+            # previously valid output destroyed -- the data loss the
+            # checkpoint sidecar prevents mid-run, reintroduced at the final
+            # save. os.replace is atomic within a filesystem, so readers see
+            # either the old file or the new one.
+            target = path.with_suffix(path.suffix + ".tmp")
+
         if writer == "json":
             df.to_json(target, orient="records", indent=2, force_ascii=False)
         else:
             df.to_csv(target, index=False)
 
         if not checkpoint:
+            os.replace(target, path)
             stale = _checkpoint_path(path)
             if stale.exists():
                 stale.unlink()
