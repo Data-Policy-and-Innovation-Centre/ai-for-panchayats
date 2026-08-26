@@ -98,10 +98,33 @@ def _response_list(data: dict, url: str) -> list:
     return response
 
 
+def _checked_entries(items: list, key: str, url: str) -> list:
+    """Every hierarchy node is a mapping carrying its own identifier.
+
+    A scalar entry (`{"response": [null]}`) raises a raw AttributeError the
+    moment a caller does `item.get(...)`, and an object missing its id travels
+    downstream as a node with no identity, failing later with an untyped
+    KeyError far from the request that produced it. Both are schema drift, so
+    both take the same typed failure as a malformed envelope.
+
+    Shared by every hierarchy level. An earlier version validated inside
+    `_union_over_years` only, which left `get_zps` -- the one level that does
+    not go through it -- returning malformed districts as success.
+    """
+    for item in items:
+        if not isinstance(item, dict):
+            raise FetchError(
+                url, f"malformed entry: {type(item).__name__}, not an object")
+        if item.get(key) is None:
+            raise FetchError(url, f"malformed entry: no `{key}`")
+    return items
+
+
 def get_zps() -> list:
     """Districts. A hierarchy failure raises rather than yielding no districts."""
     url = f"{BASE_URL}/api/prd/master/v1/getZPList/{STATE_ID}"
-    return _response_list(fetch_json(url, build_headers("master")), url)
+    return _checked_entries(
+        _response_list(fetch_json(url, build_headers("master")), url), "zpId", url)
 
 
 def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
@@ -117,17 +140,8 @@ def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
     seen: dict = {}
     for year in years:
         url = build_url(hierarchy_year(year))
-        for item in _response_list(fetch_json(url, build_headers("master")), url):
-            # A scalar entry (`{"response": [null]}`) would raise a raw
-            # AttributeError here, and an object missing its id would be kept
-            # under the None key and then travel downstream as a hierarchy
-            # node with no identity. Both are schema drift, so both take the
-            # same typed failure as a malformed envelope.
-            if not isinstance(item, dict):
-                raise FetchError(
-                    url, f"malformed entry: {type(item).__name__}, not an object")
-            if item.get(key) is None:
-                raise FetchError(url, f"malformed entry: no `{key}`")
+        entries = _response_list(fetch_json(url, build_headers("master")), url)
+        for item in _checked_entries(entries, key, url):
             seen.setdefault(item[key], item)
     return list(seen.values())
 
