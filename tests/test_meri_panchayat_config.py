@@ -147,3 +147,21 @@ def test_output_paths_pair_csv_and_json():
 
 def test_get_output_path_uses_the_module_stem():
     assert config.get_output_path("beneficiaries.py").name == "beneficiaries.json"
+
+
+@pytest.mark.parametrize("gp_id", [116350, "116350", " 116350 "])
+def test_scope_matches_whatever_type_the_portal_sends(gp_id):
+    """The targets are YAML ints; the hierarchy may serialise gpId either way.
+
+    A raw `in` against a frozenset of ints matched nothing the moment the API
+    sent strings, and every adapter would then publish an empty output while
+    the pipeline reported success -- indistinguishable from a pilot with no
+    GPs in that block.
+    """
+    assert config.in_scope(gp_id) is True
+
+
+@pytest.mark.parametrize("gp_id", [999999, "999999", None])
+def test_out_of_scope_stays_out_whatever_the_type(gp_id):
+    assert config.in_scope(gp_id) is False
+
