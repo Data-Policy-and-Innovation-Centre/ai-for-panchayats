@@ -168,7 +168,7 @@ def main():
 
                 processed_gp_count += 1
                 if processed_gp_count % SAVE_EVERY_GP == 0 and rows:
-                    save_outputs(pd.DataFrame(rows), OUTPUT_FILE_JSON)
+                    save_outputs(pd.DataFrame(rows), OUTPUT_FILE_JSON, checkpoint=True)
                     print(f"Checkpoint saved after {processed_gp_count} GPs")
 
     df = pd.DataFrame(rows)

@@ -454,3 +454,53 @@ def test_a_reorganized_gp_is_scraped_once_where_rows_carry_no_block(
         "block re-scraped it"
     )
 
+
+def test_an_adapter_checkpoint_writes_beside_the_output_not_over_it(
+    monkeypatch, tmp_path
+):
+    """Drives a real adapter past SAVE_EVERY_GP.
+
+    The first version of this change passed `checkpoint=True` to
+    `pd.DataFrame` instead of `save_outputs`, which raises TypeError at the
+    first checkpoint -- and the whole suite still passed, because nothing
+    exercised an adapter's checkpoint branch. Testing `save_outputs` directly
+    is not enough; the call site has to run.
+    """
+    import pandas as pd
+
+    module = importlib.import_module("ingest.meri_panchayat.village_population")
+    final = tmp_path / "village_population.json"
+    monkeypatch.setattr(module, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "OUTPUT_FILE_JSON", final)
+    monkeypatch.setattr(module, "SAVE_EVERY_GP", 1)
+    monkeypatch.setattr(module.time, "sleep", lambda *a: None)
+
+    pd.DataFrame([{"gp_id": "previous complete run"}]).to_json(final, orient="records")
+
+    monkeypatch.setattr(module, "get_zps", lambda: [{"zpId": 321, "name": "Khordha"}])
+    monkeypatch.setattr(module, "get_blocks",
+                        lambda *a, **k: [{"bpId": 3823, "name": "Bhubaneswar"}])
+    # Two in-scope GPs: the first checkpoints, the second fails.
+    monkeypatch.setattr(module, "get_gps", lambda *a, **k: [
+        {"gpId": 116350, "name": "Hirlipali"},
+        {"gpId": 116397, "name": "Bandhpali"},
+    ])
+
+    calls = {"n": 0}
+
+    def villages(gp_id, *a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise FetchError("https://example.invalid/x", "HTTP 500", 500)
+        return [{"name": "Hirlipali", "population": 1200}]
+
+    monkeypatch.setattr(module, "get_villages", villages)
+
+    with pytest.raises((FetchError, IncompleteRun, SystemExit)):
+        module.main()
+
+    surviving = pd.read_json(final)
+    assert surviving.iloc[0]["gp_id"] == "previous complete run", (
+        "a mid-run checkpoint replaced the last complete output"
+    )
+
