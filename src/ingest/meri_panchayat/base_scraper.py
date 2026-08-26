@@ -146,6 +146,12 @@ def _checked_entries(items: list, key: str, url: str) -> list:
             # builds a URL with a hollow parent segment when it reaches
             # get_gps -- or, for a GP, quietly reads as out of scope.
             raise FetchError(url, f"malformed entry: `{key}` is empty")
+        if isinstance(identifier, str) and identifier != identifier.strip():
+            # Normalising only the dedupe key left the padded original in the
+            # node itself, and callers build URLs from that: `" 3823 "` becomes
+            # a path segment of encoded spaces rather than the block id. Fix
+            # the value, not just the key derived from it.
+            item[key] = identifier.strip()
     return items
 
 
