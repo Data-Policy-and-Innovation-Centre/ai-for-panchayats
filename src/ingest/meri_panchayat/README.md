@@ -28,8 +28,9 @@ ai-for-panchayats/
         └── meri_panchayat/          # 📂 All collected data saves here automatically!
 
 # Core & Setup Files
-- 1. config.yaml: 
-* The settings dashboard. This is where you change target states, add financial years, or swap secure API tokens without touching code. 
+- 1. `config.yaml`:
+* The settings dashboard. This is where you change target states, add financial years, or adjust the pilot scope without touching code.
+* **No credentials go in this file.** It is tracked in git, and this repository is public. Access keys and endpoint secrets are read from the environment by `_require_env`; putting them here would both fail with `MissingCredential` and risk committing live portal credentials. Copy `.env.example` to `.env` and fill in the variables listed there. See #12 for what that costs when it goes wrong.
 
 #### 2. `config.py`
 * The bridge. It automatically converts your YAML settings into active Python variables and creates data handshakes (headers) for the government servers.

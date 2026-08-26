@@ -280,3 +280,73 @@ def test_a_failed_rerun_still_writes_the_manifest(register, monkeypatch, tmp_pat
 
     assert manifest.exists(), "a failing run must still record its gaps"
 
+
+# --------------------------------------------------------------------------
+# Envelope validation: a 200 that says nothing is not an empty result
+# --------------------------------------------------------------------------
+
+
+def test_a_payment_error_envelope_is_not_an_empty_register(register, monkeypatch):
+    """epos=[]/count=0 from a missing `response` looked like a clean empty run.
+
+    That bypassed the retry and failure-manifest paths, overwrote an existing
+    register with nothing, and then let the stale-manifest cleanup report the
+    rerun as successful -- three silent failures from one default.
+    """
+    def fake_post(url, **kwargs):
+        page = {"status": "error", "message": "invalid key"}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(FetchError, match="no `response.epos`"):
+        register.get_epayment_orders(119598, "2024-2025")
+
+
+@pytest.fixture
+def activities(monkeypatch, tmp_path):
+    module = importlib.import_module("ingest.meri_panchayat.work_activities")
+    monkeypatch.setattr(module, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(module.time, "sleep", lambda *a: None)
+    return module
+
+
+def test_an_activity_error_envelope_raises(activities, monkeypatch):
+    def fake_get(url, **kwargs):
+        page = {"status": "error"}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with pytest.raises(FetchError, match="no `response.activities`"):
+        activities.get_activities(119598, "2024-2025")
+
+
+def test_activity_pagination_short_of_the_count_raises(activities, monkeypatch):
+    """The payment register's bug, in the sibling module that shared the shape."""
+    pages = [
+        {"response": {"activities": [{"id": i} for i in range(100)], "count": 150}},
+        {"response": {"activities": [], "count": 150}},
+    ]
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        page = pages[len(calls) - 1]
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with pytest.raises(FetchError, match="100 of 150"):
+        activities.get_activities(119598, "2024-2025")
+
+
+def test_an_activity_page_with_no_records_and_no_count_is_valid(activities, monkeypatch):
+    def fake_get(url, **kwargs):
+        page = {"response": {"activities": [], "count": 0}}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert activities.get_activities(119598, "2024-2025") == []
+

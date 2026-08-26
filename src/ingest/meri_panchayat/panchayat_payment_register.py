@@ -45,8 +45,18 @@ def get_epayment_orders(gp_id, fin_year):
         # whether to retry or record the gap.
         data = fetch_json_post(url, EPO_HEADERS, payload)
 
-        response = data.get("response", {})
-        epos = response.get("epos", [])
+        # Defaulting a missing `response` to {} turned a 200 error envelope
+        # into epos=[] count=0, which the loop below accepts as a legitimate
+        # empty register: no FetchError, so the retry and failure-manifest
+        # paths are skipped, an existing register is overwritten with nothing,
+        # and the stale-manifest cleanup then reports the run as clean.
+        response = data.get("response")
+        if not isinstance(response, dict) or "epos" not in response:
+            raise FetchError(
+                url,
+                f"malformed payment envelope for GP {gp_id} {fin_year}: "
+                "no `response.epos`")
+        epos = response["epos"]
         reported = response.get("count", 0)
 
         if not epos:

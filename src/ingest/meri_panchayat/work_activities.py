@@ -16,7 +16,8 @@ from .config import (
     REQUEST_DELAY, BASE_URL,
     build_headers, output_paths,
 )
-from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import (FetchError, get_zps, get_blocks, get_gps,
+                           fetch_json, save_outputs)
 
 OUTPUT_FILE_CSV, OUTPUT_FILE_JSON = output_paths("activities")
 ACTIVITY_HEADERS = build_headers("activities", lang="null-IN")
@@ -31,19 +32,35 @@ def get_activities(gp_id, fin_year):
     while True:
         url = f"{BASE_URL}/api/prd/gp/v1/activity/getactivitylist/{STATE_ID}/{gp_id}/3/F/0/{fin_year}?skip={skip}&limit={limit}"
         data = fetch_json(url, ACTIVITY_HEADERS)
-        if not data:
-            break
-            
-        activities = data.get("response", {}).get("activities", [])
+
+        response = data.get("response") if isinstance(data, dict) else None
+        if not isinstance(response, dict) or "activities" not in response:
+            raise FetchError(
+                url,
+                f"malformed activity envelope for GP {gp_id} {fin_year}: "
+                "no `response.activities`")
+
+        activities = response["activities"]
+        reported = response.get("count", 0)
+
         if not activities:
+            # Same failure as the payment register: an empty page before the
+            # reported total is pagination breaking, not the list ending, and
+            # returning here writes a truncated activities registry while the
+            # orchestrator exits successfully.
+            if reported and len(all_activities) < reported:
+                raise FetchError(
+                    url,
+                    f"pagination stopped at {len(all_activities)} of {reported} "
+                    f"reported activity/activities for GP {gp_id} {fin_year}")
             break
-            
+
         all_activities.extend(activities)
         skip += limit
-        
-        if len(all_activities) >= data.get("response", {}).get("count", 0):
+
+        if len(all_activities) >= reported:
             break
-            
+
     return all_activities
 
 
