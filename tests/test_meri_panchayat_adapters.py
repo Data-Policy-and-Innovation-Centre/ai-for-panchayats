@@ -174,6 +174,31 @@ def test_a_persistent_failure_is_recorded_and_fails_the_run(register,
     assert pd.read_json(manifest)["reason"].tolist() == ["HTTP 500"]
 
 
+def test_an_all_failed_run_preserves_the_last_complete_register(register,
+                                                                 monkeypatch):
+    previous = pd.DataFrame([{"epo_id": "previous-complete-run"}])
+    previous.to_json(register.OUTPUT_FILE_JSON, orient="records")
+    monkeypatch.setattr(register, "FIN_YEARS", ["2024-2025"])
+    monkeypatch.setattr(register, "get_zps",
+                        lambda: [{"zpId": 321, "name": "Khordha"}])
+    monkeypatch.setattr(register, "get_blocks",
+                        lambda *a, **k: [{"bpId": 3823, "name": "Bhubaneswar"}])
+    monkeypatch.setattr(register, "get_gps",
+                        lambda *a, **k: [{"gpId": 119598, "name": "Andhrua"}])
+
+    def always_fail(*args, **kwargs):
+        raise FetchError("https://example.invalid/x", "portal outage", 500)
+
+    monkeypatch.setattr(register, "get_epayment_orders", always_fail)
+
+    with pytest.raises(IncompleteRun):
+        register.main()
+
+    surviving = pd.read_json(register.OUTPUT_FILE_JSON)
+    assert surviving.iloc[0]["epo_id"] == "previous-complete-run"
+    assert register.OUTPUT_FILE_JSON.with_suffix(".json.partial").exists()
+
+
 def test_a_transient_failure_recovers_on_retry(register, monkeypatch, tmp_path):
     monkeypatch.setattr(register, "FIN_YEARS", ["2024-2025"])
     monkeypatch.setattr(register, "get_zps",
@@ -510,4 +535,3 @@ def test_an_adapter_checkpoint_writes_beside_the_output_not_over_it(
     assert surviving.iloc[0]["gp_id"] == "previous complete run", (
         "a mid-run checkpoint replaced the last complete output"
     )
-

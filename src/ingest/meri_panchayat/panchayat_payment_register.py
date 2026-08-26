@@ -172,7 +172,10 @@ def main():
                     print(f"Checkpoint saved after {processed_gp_count} GPs")
 
     df = pd.DataFrame(rows)
-    save_outputs(df, OUTPUT_FILE_JSON)
+    if failed_gp_years:
+        save_outputs(df, OUTPUT_FILE_JSON, checkpoint=True)
+    else:
+        save_outputs(df, OUTPUT_FILE_JSON)
 
     print(f"\n{'='*60}\nProcessed {processed_gp_count} GPs | Saved {len(df)} rows\n{'='*60}")
 
