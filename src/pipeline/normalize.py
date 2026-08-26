@@ -7,6 +7,7 @@ contract and currently implements the eGramSwaraj JSON shape only.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -15,7 +16,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,7 +24,9 @@ from .manifest import ManifestError, RunManifest, approve_run
 
 KNOWN_ENVELOPE_KEYS = frozenset({"data", "response", "result", "records", "rows"})
 SUPPORTED_KINDS = frozenset({"PL", "AA", "TA", "PP", "RE"})
-KIND_RE = re.compile(r"(?i)(?P<year>\d{4})[_-](?P<kind>PL|AA|TA|PP|RE)(?:$|[_-])")
+KIND_RE = re.compile(
+    r"(?i)(?P<year>\d{4}(?:-\d{2,4})?)[_-](?P<kind>PL|AA|TA|PP|RE)(?:$|[_-])"
+)
 GP_RE = re.compile(r"^LGD[_-]?(?P<code>\d+)[_-](?P<name>.+)$", re.IGNORECASE)
 ID_KEYS = ("activityCd", "activity_cd", "activityId", "activity_id", "id")
 PROVENANCE_COLUMNS = (
@@ -33,6 +35,10 @@ PROVENANCE_COLUMNS = (
     "gp_code", "gram_panchayat_name", "fiscal_year", "plan_year",
     "business_id", "mapping_status",
 )
+PROVENANCE_SCHEMA = {
+    column: pa.string() for column in PROVENANCE_COLUMNS
+}
+PROVENANCE_SCHEMA["pos"] = pa.int64()
 
 
 class NormalizationError(ManifestError):
@@ -67,10 +73,12 @@ class NormalizationResult:
     run_id: str
     tables: dict[str, tuple[Path, ...]] = field(default_factory=dict)
     quarantined: tuple[QuarantineRecord, ...] = ()
+    max_buffered_rows: int = 0
+    quarantine_count_value: int = 0
 
     @property
     def quarantine_count(self) -> int:
-        return len(self.quarantined)
+        return self.quarantine_count_value or len(self.quarantined)
 
 
 class AtomicParquetPublication:
@@ -80,6 +88,7 @@ class AtomicParquetPublication:
         self.output_root = Path(output_root).expanduser().resolve()
         self._staging: Path | None = None
         self._published = False
+        self._part_numbers: dict[str, int] = defaultdict(int)
 
     def __enter__(self) -> "AtomicParquetPublication":
         self.output_root.parent.mkdir(parents=True, exist_ok=True)
@@ -102,6 +111,7 @@ class AtomicParquetPublication:
         *,
         chunk_size: int,
         partition_by_fiscal_year: bool = True,
+        schema: pa.Schema | None = None,
     ) -> tuple[Path, ...]:
         if chunk_size <= 0:
             raise NormalizationError("chunk_size must be positive")
@@ -128,31 +138,49 @@ class AtomicParquetPublication:
             directory.mkdir(parents=True, exist_ok=True)
             for offset in range(0, len(grouped), chunk_size):
                 chunk = grouped[offset : offset + chunk_size]
-                table = pa.Table.from_pylist(_normalise_rows(chunk))
-                path = directory / f"part-{len(paths):05d}.parquet"
+                normalised = _normalise_rows(chunk)
+                if schema is not None:
+                    normalised = [_coerce_for_schema(row, schema) for row in normalised]
+                table = pa.Table.from_pylist(normalised, schema=schema)
+                part_number = self._part_numbers[safe_name]
+                self._part_numbers[safe_name] += 1
+                path = directory / f"part-{part_number:05d}.parquet"
                 pq.write_table(table, path, compression="zstd")
                 paths.append(path.relative_to(self.staging_root))
         return tuple(paths)
 
+    def write_empty(self, table_name: str, schema: pa.Schema) -> tuple[Path, ...]:
+        """Publish a schema-correct zero-row table for an explicitly requested kind."""
+
+        safe_name = re.sub(r"[^0-9A-Za-z_]+", "_", table_name).strip("_").lower()
+        directory = self.staging_root / safe_name
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "part-00000.parquet"
+        pq.write_table(pa.Table.from_pylist([], schema=schema), path, compression="zstd")
+        return (path.relative_to(self.staging_root),)
+
+    def write_canonical_manifest(self, value: Mapping[str, Any]) -> Path:
+        """Write and validate the publication manifest while still staged."""
+
+        target = self.staging_root / "canonical_manifest.json"
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.staging_root, delete=False
+        ) as handle:
+            json.dump(dict(value), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+        validate_canonical_manifest(self.staging_root)
+        return target
+
     def publish(self) -> Path:
         staging = self.staging_root
-        backup: Path | None = None
-        try:
-            if self.output_root.exists():
-                backup = self.output_root.parent / f".{self.output_root.name}.previous-{uuid4().hex}"
-                os.replace(self.output_root, backup)
-            os.replace(staging, self.output_root)
-            self._published = True
-            self._staging = None
-            if backup is not None:
-                shutil.rmtree(backup)
-            return self.output_root
-        except Exception:
-            if self.output_root.exists() and backup is not None:
-                shutil.rmtree(self.output_root, ignore_errors=True)
-            if backup is not None and backup.exists() and not self.output_root.exists():
-                os.replace(backup, self.output_root)
-            raise
+        if self.output_root.exists():
+            raise NormalizationError(f"canonical snapshot already exists and is immutable: {self.output_root}")
+        os.replace(staging, self.output_root)
+        self._published = True
+        self._staging = None
+        return self.output_root
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         if self._staging is not None:
@@ -161,6 +189,58 @@ class AtomicParquetPublication:
 
 def _safe_partition(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", value) or "unknown"
+
+
+def _normalise_year(value: str | None) -> str | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d{4})(?:-(\d{2}|\d{4}))?", value)
+    if not match:
+        return value
+    start = int(match.group(1))
+    end = match.group(2)
+    if end is None:
+        return f"{start:04d}-{start + 1:04d}"
+    end_year = int(end) + (2000 if len(end) == 2 else 0)
+    if end_year < 1000:
+        end_year += 2000
+    return f"{start:04d}-{end_year:04d}"
+
+
+def _value_type(value: Any) -> pa.DataType | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return pa.bool_()
+    if isinstance(value, int):
+        return pa.int64()
+    if isinstance(value, float):
+        return pa.float64()
+    return pa.string()
+
+
+def _merge_type(left: pa.DataType | None, right: pa.DataType | None) -> pa.DataType | None:
+    if left is None:
+        return right
+    if right is None or left == right:
+        return left
+    if {left, right} <= {pa.int64(), pa.float64()}:
+        return pa.float64()
+    return pa.string()
+
+
+def _schema_from_rows(rows: Iterable[Mapping[str, Any]]) -> dict[str, pa.DataType]:
+    result: dict[str, pa.DataType | None] = {}
+    for row in rows:
+        for column, value in row.items():
+            result[column] = _merge_type(result.get(column), _value_type(value))
+    return {column: value or pa.string() for column, value in result.items()}
+
+
+def _arrow_schema(types: Mapping[str, pa.DataType]) -> pa.Schema:
+    ordered = [column for column in PROVENANCE_COLUMNS if column in types]
+    ordered += [column for column in types if column not in ordered]
+    return pa.schema([pa.field(column, types[column]) for column in ordered])
 
 
 def _normalise_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -173,6 +253,23 @@ def _normalise_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 columns.append(column)
                 seen.add(column)
     return [{column: _scalar(row.get(column)) for column in columns} for row in rows]
+
+
+def _coerce_for_schema(row: Mapping[str, Any], schema: pa.Schema) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for schema_field in schema:
+        value = _scalar(row.get(schema_field.name))
+        if value is None:
+            result[schema_field.name] = None
+        elif pa.types.is_string(schema_field.type):
+            result[schema_field.name] = str(value)
+        elif pa.types.is_float64(schema_field.type):
+            result[schema_field.name] = float(value)
+        elif pa.types.is_int64(schema_field.type):
+            result[schema_field.name] = int(value)
+        else:
+            result[schema_field.name] = value
+    return result
 
 
 def _scalar(value: Any) -> Any:
@@ -197,10 +294,10 @@ def to_records(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
         return [], "malformed_root_array"
     if not isinstance(payload, Mapping):
         return [], "malformed_root_value"
-    named = [
-        key for key, value in payload.items()
-        if key in KNOWN_ENVELOPE_KEYS and isinstance(value, list)
-    ]
+    present = [key for key in payload if key in KNOWN_ENVELOPE_KEYS]
+    if any(not isinstance(payload[key], list) for key in present):
+        return [], "malformed_known_envelope"
+    named = present
     if len(named) == 1:
         values = payload[named[0]]
         if not values:
@@ -218,7 +315,7 @@ def _file_context(path: Path, payload_root: Path) -> tuple[str, str | None, str 
     match = KIND_RE.search(path.stem)
     if not match:
         return source_file, None, None
-    return source_file, match.group("kind").upper(), match.group("year")
+    return source_file, match.group("kind").upper(), _normalise_year(match.group("year"))
 
 
 def _gp_context(path: Path, payload_root: Path) -> tuple[str | None, str | None]:
@@ -284,7 +381,7 @@ def _provenance(
     }
 
 
-def _emit_record(
+def _record_rows(
     record: Mapping[str, Any],
     *,
     manifest: RunManifest,
@@ -295,12 +392,11 @@ def _emit_record(
     gp_name: str | None,
     root_pos: int,
     table_name: str,
-    tables: dict[str, list[dict[str, Any]]],
-) -> None:
+):
     root_key = "|".join(
-        (manifest.source, manifest.run_id, source_kind, source_file,
-         gp_code or "", year or "", str(root_pos))
+        (manifest.source, source_kind, source_file, gp_code or "", year or "", str(root_pos))
     )
+    root_key = hashlib.sha256(root_key.encode("utf-8")).hexdigest()
     business_id = _business_id(record)
     parent = _provenance(
         manifest=manifest, source_file=source_file, source_kind=source_kind,
@@ -308,16 +404,16 @@ def _emit_record(
         source_record_id=root_key, parent_row_id=None, pos=None, business_id=business_id,
     )
     parent.update(_flatten_scalars(record))
-    tables[table_name].append(parent)
-    _emit_children(
+    yield table_name, parent
+    yield from _child_rows(
         record, parent_row_id=root_key, source_record_id=root_key, row_id_prefix=root_key,
         manifest=manifest, source_file=source_file, source_kind=source_kind, year=year,
-        gp_code=gp_code, gp_name=gp_name, tables=tables, table_name=table_name,
+        gp_code=gp_code, gp_name=gp_name, table_name=table_name,
         inherited_business_id=business_id,
     )
 
 
-def _emit_children(
+def _child_rows(
     record: Mapping[str, Any],
     *,
     parent_row_id: str,
@@ -329,10 +425,9 @@ def _emit_children(
     year: str | None,
     gp_code: str | None,
     gp_name: str | None,
-    tables: dict[str, list[dict[str, Any]]],
     table_name: str,
     inherited_business_id: str | None,
-) -> None:
+):
     for key, value in record.items():
         if not isinstance(value, list):
             continue
@@ -350,21 +445,130 @@ def _emit_children(
             )
             if isinstance(element, Mapping):
                 row.update(_flatten_scalars(element))
-                tables[child_table].append(row)
-                _emit_children(
+                yield child_table, row
+                yield from _child_rows(
                     element, parent_row_id=row_id, source_record_id=source_record_id,
                     row_id_prefix=row_id, manifest=manifest, source_file=source_file,
                     source_kind=source_kind, year=year, gp_code=gp_code, gp_name=gp_name,
-                    tables=tables, table_name=child_table,
+                    table_name=child_table,
                     inherited_business_id=business_id,
                 )
             else:
                 row.update({"value": element, "value_kind": "scalar"})
-                tables[child_table].append(row)
+                yield child_table, row
 
 
 def _sanitize(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_").lower() or "unnamed"
+
+
+def _iter_run_items(
+    payload_root: Path,
+    manifest: RunManifest,
+    wanted: set[str],
+):
+    """Replay one raw run, yielding one row or quarantine record at a time."""
+
+    for path in sorted(payload_root.rglob("*.json")):
+        source_file, source_kind, year = _file_context(path, payload_root)
+        if source_kind not in wanted:
+            yield None, QuarantineRecord(
+                source_file, "unknown_source_kind", "filename does not identify a supported kind"
+            )
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            yield None, QuarantineRecord(source_file, "malformed_json", str(exc))
+            continue
+        records, reason = to_records(payload)
+        if reason is not None:
+            yield None, QuarantineRecord(source_file, reason, "payload shape is invalid")
+            continue
+        gp_code, gp_name = _gp_context(path, payload_root)
+        table_name = source_kind.lower()
+        for position, record in enumerate(records):
+            yield from _record_rows(
+                record, manifest=manifest, source_file=source_file, source_kind=source_kind,
+                year=year, gp_code=gp_code, gp_name=gp_name, root_pos=position,
+                table_name=table_name,
+            )
+
+
+def _merge_table_types(
+    target: dict[str, pa.DataType], rows: Iterable[Mapping[str, Any]]
+) -> None:
+    for column, value_type in _schema_from_rows(rows).items():
+        target[column] = _merge_type(target.get(column), value_type) or pa.string()
+
+
+def _canonical_file_record(root: Path, relative: Path) -> dict[str, Any]:
+    digest, byte_count = _file_sha256(root / relative)
+    return {"path": relative.as_posix(), "sha256": digest, "bytes": byte_count}
+
+
+def _file_sha256(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def validate_canonical_manifest(snapshot_root: str | Path) -> Mapping[str, Any]:
+    """Validate a staged or published canonical snapshot before consumption."""
+
+    root = Path(snapshot_root).resolve()
+    try:
+        value = json.loads((root / "canonical_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise NormalizationError(f"cannot read canonical manifest at {root}") from exc
+    required = {
+        "source", "run_id", "raw_manifest_sha256", "raw_manifest_identity",
+        "schema_version", "tables", "quarantine_count", "terminal_state",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise NormalizationError(f"canonical manifest missing fields: {', '.join(missing)}")
+    if value["terminal_state"] != "complete":
+        raise NormalizationError("canonical snapshot is not complete")
+    identity = value["raw_manifest_identity"]
+    if not isinstance(identity, Mapping) or identity.get("source") != value["source"] \
+            or identity.get("run_id") != value["run_id"]:
+        raise NormalizationError("canonical manifest raw identity does not match snapshot")
+    if not isinstance(value["raw_manifest_sha256"], str) or len(value["raw_manifest_sha256"]) != 64:
+        raise NormalizationError("canonical manifest has invalid raw manifest hash")
+    files: list[Mapping[str, Any]] = []
+    for table_name, table in value["tables"].items():
+        if not isinstance(table, Mapping) or not isinstance(table.get("row_count"), int):
+            raise NormalizationError(f"invalid canonical table metadata: {table_name}")
+        for record in table.get("files", []):
+            if not isinstance(record, Mapping) or not {"path", "sha256", "bytes"} <= set(record):
+                raise NormalizationError(f"invalid canonical file metadata: {table_name}")
+            files.append(record)
+    listed = set()
+    for record in files:
+        relative = Path(str(record["path"]))
+        if relative.is_absolute() or ".." in relative.parts or relative.name == "canonical_manifest.json":
+            raise NormalizationError(f"unsafe canonical file path: {relative}")
+        actual = root / relative
+        if not actual.is_file():
+            raise NormalizationError(f"canonical file missing: {relative}")
+        digest, byte_count = _file_sha256(actual)
+        if digest != record["sha256"] or byte_count != record["bytes"]:
+            raise NormalizationError(f"canonical file hash or byte count mismatch: {relative}")
+        listed.add(relative.as_posix())
+    actual_files = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.parquet")
+    }
+    if actual_files != listed:
+        raise NormalizationError("canonical manifest file inventory mismatch")
+    if not isinstance(value["quarantine_count"], int) or value["quarantine_count"] < 0:
+        raise NormalizationError("invalid quarantine count")
+    return value
 
 
 def normalize_egramswaraj(
@@ -378,55 +582,110 @@ def normalize_egramswaraj(
 
     report = approve_run(run_path)
     manifest = report.manifest
+    if manifest.source.casefold() not in {"egramswaraj", "egramswaraj_api"}:
+        raise NormalizationError(
+            f"no eGramSwaraj normalizer is registered for source {manifest.source!r}"
+        )
     wanted = {str(kind).upper() for kind in kinds}
     if not wanted <= SUPPORTED_KINDS:
         raise NormalizationError(f"unsupported eGramSwaraj kinds: {sorted(wanted - SUPPORTED_KINDS)}")
     payload_root = Path(run_path).resolve() / "payloads"
     if not payload_root.is_dir():
         raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
-    tables: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    quarantined: list[QuarantineRecord] = []
-    for path in sorted(payload_root.rglob("*.json")):
-        source_file, source_kind, year = _file_context(path, payload_root)
-        if source_kind not in wanted:
-            quarantined.append(QuarantineRecord(
-                source_file, "unknown_source_kind", "filename does not identify a supported kind"
-            ))
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    table_types: dict[str, dict[str, pa.DataType]] = {
+        kind.lower(): dict(PROVENANCE_SCHEMA) for kind in wanted
+    }
+    table_counts: dict[str, int] = {kind.lower(): 0 for kind in wanted}
+    quarantine_count = 0
+    for table_name, value in _iter_run_items(payload_root, manifest, wanted):
+        if table_name is None:
+            quarantine_count += 1
             continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            quarantined.append(QuarantineRecord(source_file, "malformed_json", str(exc)))
-            continue
-        records, reason = to_records(payload)
-        if reason is not None:
-            quarantined.append(QuarantineRecord(source_file, reason, "payload shape is invalid"))
-            continue
-        gp_code, gp_name = _gp_context(path, payload_root)
-        table_name = source_kind.lower()
-        for position, record in enumerate(records):
-            _emit_record(
-                record, manifest=manifest, source_file=source_file, source_kind=source_kind,
-                year=year, gp_code=gp_code, gp_name=gp_name, root_pos=position,
-                table_name=table_name, tables=tables,
-            )
-    staged_tables: dict[str, tuple[Path, ...]] = {}
-    with AtomicParquetPublication(output_root) as publication:
-        for table_name, rows in sorted(tables.items()):
-            staged_tables[table_name] = publication.write_rows(
-                table_name, rows, chunk_size=chunk_size,
-            )
-        if quarantined:
-            qrows = [record.as_row(manifest) for record in quarantined]
-            staged_tables["quarantine"] = publication.write_rows(
-                "quarantine", qrows, chunk_size=chunk_size, partition_by_fiscal_year=False,
-            )
-        destination = publication.publish()
+        table_counts[table_name] = table_counts.get(table_name, 0) + 1
+        _merge_table_types(table_types.setdefault(table_name, dict(PROVENANCE_SCHEMA)), [value])
+
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+    staged_tables: dict[str, list[Path]] = {}
+    with AtomicParquetPublication(destination) as publication:
+        for table_name in sorted(table_types):
+            schema = _arrow_schema(table_types[table_name])
+            paths: list[Path] = []
+            buffer: list[Mapping[str, Any]] = []
+            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
+                if item_name != table_name:
+                    continue
+                buffer.append(value)
+                if len(buffer) >= chunk_size:
+                    paths.extend(publication.write_rows(
+                        table_name, buffer, chunk_size=chunk_size, schema=schema,
+                    ))
+                    buffer.clear()
+            if buffer:
+                paths.extend(publication.write_rows(
+                    table_name, buffer, chunk_size=chunk_size, schema=schema,
+                ))
+                buffer.clear()
+            if not paths:
+                paths.extend(publication.write_empty(table_name, schema))
+            staged_tables[table_name] = paths
+        if quarantine_count:
+            qschema = _arrow_schema({
+                "source_system": pa.string(), "source_run_id": pa.string(),
+                "source_record_id": pa.string(), "schema_version": pa.string(),
+                "source_file": pa.string(), "source_kind": pa.string(),
+                "reason_code": pa.string(), "reason": pa.string(), "raw_value": pa.string(),
+            })
+            paths = []
+            buffer = []
+            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
+                if item_name is not None:
+                    continue
+                buffer.append(value.as_row(manifest))
+                if len(buffer) >= chunk_size:
+                    paths.extend(publication.write_rows(
+                        "quarantine", buffer, chunk_size=chunk_size,
+                        partition_by_fiscal_year=False, schema=qschema,
+                    ))
+                    buffer.clear()
+            if buffer:
+                paths.extend(publication.write_rows(
+                    "quarantine", buffer, chunk_size=chunk_size,
+                    partition_by_fiscal_year=False, schema=qschema,
+                ))
+            staged_tables["quarantine"] = paths
+        files = {
+            table_name: {
+                "row_count": table_counts.get(table_name, quarantine_count if table_name == "quarantine" else 0),
+                "files": [_canonical_file_record(publication.staging_root, path) for path in paths],
+            }
+            for table_name, paths in staged_tables.items()
+        }
+        canonical = {
+            "source": manifest.source,
+            "run_id": manifest.run_id,
+            "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+            "raw_manifest_identity": {
+                "source": manifest.source, "run_id": manifest.run_id,
+                "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+            },
+            "schema_version": manifest.schema_version,
+            "tables": files,
+            "quarantine_count": quarantine_count,
+            "terminal_state": "complete",
+        }
+        publication.write_canonical_manifest(canonical)
+        validate_canonical_manifest(publication.staging_root)
+        publication.publish()
     published_tables = {
         name: tuple(destination / relative_path for relative_path in paths)
         for name, paths in staged_tables.items()
     }
-    return NormalizationResult(destination, manifest.run_id, published_tables, tuple(quarantined))
+    # Quarantine rows are intentionally not retained in memory after staging.
+    return NormalizationResult(
+        destination, manifest.run_id, published_tables, (), chunk_size, quarantine_count
+    )
 
 
 def normalize_run(*args: Any, **kwargs: Any) -> NormalizationResult:
