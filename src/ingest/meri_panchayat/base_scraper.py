@@ -98,6 +98,35 @@ def _response_list(data: dict, url: str) -> list:
     return response
 
 
+def response_field(data, field: str, url: str, context: str = "") -> list:
+    """One named list out of a `response` envelope, or FetchError.
+
+    `data.get("response", {}).get(field, [])` reads a 200 error envelope as an
+    empty result, so an adapter publishes an empty dataset and the
+    orchestrator reports success -- the successful-empty-output failure this
+    client exists to prevent, reintroduced once per adapter.
+
+    Every adapter shares this instead of writing the defaulting chain again.
+    An explicit empty list still means the API said there are none.
+    """
+    where = f" for {context}" if context else ""
+    if not isinstance(data, dict):
+        raise FetchError(
+            url, f"malformed envelope{where}: body is {type(data).__name__}, not an object")
+    response = data.get("response")
+    if not isinstance(response, dict):
+        raise FetchError(url, f"malformed envelope{where}: no `response` object")
+    if field not in response:
+        raise FetchError(url, f"malformed envelope{where}: no `response.{field}`")
+    value = response[field]
+    if not isinstance(value, list):
+        raise FetchError(
+            url,
+            f"malformed envelope{where}: `response.{field}` is "
+            f"{type(value).__name__}, not a list")
+    return value
+
+
 def _checked_entries(items: list, key: str, url: str) -> list:
     """Every hierarchy node is a mapping carrying its own identifier.
 
