@@ -246,6 +246,14 @@ def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) ->
             # first; only then does anything move into place.
             promotions.append((target, path))
 
+    # Residual window, deliberately left open: POSIX can rename one path
+    # atomically, not two. If the process is killed between these calls, JSON
+    # and CSV can still come from different runs. Staging every format first
+    # shrinks that window from the whole serialisation -- seconds, and
+    # anything a writer can raise -- to the gap between two renames, which is
+    # as far as this can go without promoting a whole directory instead of
+    # individual files. Consumers that need the two formats to agree should
+    # read one of them, not both.
     for target, path in promotions:
         os.replace(target, path)
         stale = _checkpoint_path(path)
