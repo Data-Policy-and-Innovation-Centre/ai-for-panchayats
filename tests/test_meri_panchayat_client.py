@@ -244,3 +244,29 @@ def test_a_malformed_hierarchy_entry_raises(monkeypatch, entry, why):
     with pytest.raises(FetchError, match="malformed entry"):
         get_blocks(321, "2024-2025")
 
+
+@pytest.mark.parametrize("entry", [None, "zp", {"name": "Khordha"}])
+def test_a_malformed_district_entry_raises_too(monkeypatch, entry):
+    """get_zps does not go through _union_over_years, so it needs the same guard.
+
+    Validating inside the union helper alone left this one level returning
+    malformed districts as success, where every adapter's `zp.get("zpId")`
+    would then fail with an untyped error far from the request that caused it.
+    """
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [entry]}))
+
+    with pytest.raises(FetchError, match="malformed entry"):
+        get_zps()
+
+
+def test_every_hierarchy_level_shares_one_validation_path(monkeypatch):
+    """Districts, blocks and GPs must all reject the same malformed entry."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [None]}))
+
+    for call in (get_zps, lambda: get_blocks(321, "2024-2025"),
+                 lambda: get_gps(321, 3823, "2024-2025")):
+        with pytest.raises(FetchError, match="malformed entry"):
+            call()
+
