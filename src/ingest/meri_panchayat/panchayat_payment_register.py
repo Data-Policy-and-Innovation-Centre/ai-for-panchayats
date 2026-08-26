@@ -47,15 +47,28 @@ def get_epayment_orders(gp_id, fin_year):
 
         response = data.get("response", {})
         epos = response.get("epos", [])
+        reported = response.get("count", 0)
+
         if not epos:
+            # An empty page before the reported total is reached is pagination
+            # failing, not the register ending. Returning here would hand back
+            # a short register as a complete one: no FetchError, so the retry
+            # and failure-manifest paths never run and the stage exits green
+            # with payments missing. Only a page that completes the count, or
+            # a zero count, is a legitimate stop.
+            if reported and len(all_epos) < reported:
+                raise FetchError(
+                    url,
+                    f"pagination stopped at {len(all_epos)} of {reported} "
+                    f"reported payment(s) for GP {gp_id} {fin_year}")
             break
-            
+
         all_epos.extend(epos)
         skip += PAGE_LIMIT
-        
-        if len(all_epos) >= response.get("count", 0):
+
+        if len(all_epos) >= reported:
             break
-            
+
     return all_epos
 
 
@@ -149,12 +162,21 @@ def main():
 
     print(f"\n{'='*60}\nProcessed {processed_gp_count} GPs | Saved {len(df)} rows\n{'='*60}")
 
+    failed_path = os.path.join(
+        OUTPUT_DIR, "panchayat_payment_register_FAILED_gp_years.json")
+
+    if not failed_gp_years:
+        # A clean rerun must not leave the previous run's manifest sitting
+        # beside complete output: anyone auditing the latest extraction from
+        # these two files would read failures that no longer apply.
+        if os.path.exists(failed_path):
+            os.remove(failed_path)
+            print(f"Removed stale failure manifest from a previous run: {failed_path}")
+
     if failed_gp_years:
         # Write the manifest first: the collected rows are worth keeping, and
         # the gaps have to be inspectable. Then fail, so an incomplete
         # register is never reported as a successful extraction.
-        failed_path = os.path.join(
-            OUTPUT_DIR, "panchayat_payment_register_FAILED_gp_years.json")
         pd.DataFrame(failed_gp_years).to_json(
             failed_path, orient="records", indent=2, force_ascii=False)
         print(f"\n*** {len(failed_gp_years)} GP-year(s) incomplete. "

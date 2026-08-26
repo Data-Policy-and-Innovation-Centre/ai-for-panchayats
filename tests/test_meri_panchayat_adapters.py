@@ -86,6 +86,44 @@ def test_pagination_walks_until_the_reported_count(register, monkeypatch):
     assert calls == [0, 50]
 
 
+def test_an_empty_page_short_of_the_reported_count_raises(register, monkeypatch):
+    """An empty page before the count is reached is pagination failing.
+
+    Breaking out here returned the pages collected so far as a complete
+    register: no FetchError, so the retry and failure-manifest paths never
+    run, and the stage exits green with payments missing. The sibling test
+    above covers a page that errors; this covers one that succeeds and lies.
+    """
+    pages = [
+        {"response": {"epos": [{"id": i} for i in range(50)], "count": 60}},
+        {"response": {"epos": [], "count": 60}},
+    ]
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs["json"]["skip"])
+        page = pages[len(calls) - 1]
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(FetchError, match="50 of 60"):
+        register.get_epayment_orders(119598, "2024-2025")
+
+
+def test_an_empty_first_page_with_no_reported_count_is_a_valid_empty_register(
+    register, monkeypatch
+):
+    """A GP-year with no payments must still be allowed to return nothing."""
+    def fake_post(url, **kwargs):
+        page = {"response": {"epos": [], "count": 0}}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert register.get_epayment_orders(119598, "2024-2025") == []
+
+
 def test_a_failed_page_never_returns_a_partial_register(register, monkeypatch):
     """Returning page 1 when page 2 fails reports an incomplete run as complete."""
     state = {"n": 0}
@@ -209,3 +247,36 @@ def test_orchestrator_succeeds_when_every_stage_does(monkeypatch):
 
     assert orchestrator.main([]) == 0
     assert ran == orchestrator.STAGES
+
+
+def test_a_clean_rerun_removes_a_previous_run_s_failure_manifest(register, monkeypatch, tmp_path):
+    """A stale manifest beside complete output misreports the latest extraction."""
+    stale = tmp_path / "panchayat_payment_register_FAILED_gp_years.json"
+    stale.write_text('[{"gp_id": 119598, "fin_year": "2024-2025"}]')
+
+    monkeypatch.setattr(register, "get_zps", lambda: [])
+    register.main()
+
+    assert not stale.exists(), "the previous run's manifest survived a clean rerun"
+
+
+def test_a_failed_rerun_still_writes_the_manifest(register, monkeypatch, tmp_path):
+    """Removing the stale file must not disable the manifest itself."""
+    manifest = tmp_path / "panchayat_payment_register_FAILED_gp_years.json"
+
+    monkeypatch.setattr(register, "get_zps",
+                        lambda: [{"zpId": 321, "name": "Khordha"}])
+    monkeypatch.setattr(register, "get_blocks",
+                        lambda *a, **k: [{"bpId": 3823, "name": "Bhubaneswar"}])
+    monkeypatch.setattr(register, "get_gps",
+                        lambda *a, **k: [{"gpId": 119598, "name": "Andhrua"}])
+
+    def boom(*a, **k):
+        raise FetchError("https://example.invalid/x", "HTTP 500", 500)
+    monkeypatch.setattr(register, "get_epayment_orders", boom)
+
+    with pytest.raises(IncompleteRun):
+        register.main()
+
+    assert manifest.exists(), "a failing run must still record its gaps"
+
