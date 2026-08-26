@@ -1,0 +1,90 @@
+# overview
+# Meri Panchayat Data Extraction Pipeline 
+- This is a scrapping pileline and it collects information from the government's Meri Panchayat website. It gathers details about village funds, development plans, money spent on projects, and village populations.
+
+
+
+# 📂 Project Folder Structure
+
+ai-for-panchayats/
+├── scripts/
+│   └── main_meri_panchayat.py       # Master Orchestrator (The ONLY file you execute)
+│
+├── src/
+│   └── ingest/
+│       └── meri_panchayat/
+│           ├── config.yaml                   # Master settings dashboard (API keys, States, Years)
+│           ├── config.py                     # Converts settings into active Python code & headers
+│           ├── base_scraper.py               # Core connection engine (Fires network requests)
+│           ├── village_population.py         # Demographic data worker
+│           ├── panchayat_payment_register.py # Financial ledger transaction worker
+│           ├── action_plans.py               # Planned allocation worker
+│           ├── activity_summary.py           # Public infrastructure summary worker
+│           ├── beneficiaries.py              # Social scheme impact worker
+│           └── work_activities.py            # Deep nested project milestones worker
+│
+└── data/
+    └── raw/
+        └── meri_panchayat/          # 📂 All collected data saves here automatically!
+
+# Core & Setup Files
+- 1. `config.yaml`:
+* The settings dashboard. This is where you change target states, add financial years, or adjust the pilot scope without touching code.
+* **No credentials go in this file.** It is tracked in git, and this repository is public. Access keys and endpoint secrets are read from the environment by `_require_env`; putting them here would both fail with `MissingCredential` and risk committing live portal credentials. Copy `.env.example` to `.env` and fill in the variables listed there, then pass it on every run with `--env-file .env`. Nothing in this project loads dotenv files — `python-dotenv` is not a dependency and `uv run` only reads one when told to — so a plain `uv run` fails with `MissingCredential` even with a correctly filled `.env`. Exporting the variables into your shell works too. See #12 for what that costs when it goes wrong.
+
+#### 2. `config.py`
+* The bridge. It automatically converts your YAML settings into active Python variables and creates data handshakes (headers) for the government servers.
+
+#### 3. `base_scraper.py`
+* base_scraper.py: The internet connector. It processes all requests and map-queries (Districts, Blocks, Gram Panchayats) safely. If an API stumbles, this script prevents a total crash.
+
+#### 4. `main_meri_panchayat.py`
+* This is the only file you need to execute. It launches all individual scrapers back-to-back in the perfect sequence.
+* Run every stage:
+
+```bash
+uv run --env-file .env python scripts/main_meri_panchayat.py
+```
+
+* Run one stage:
+
+```bash
+uv run --env-file .env python scripts/main_meri_panchayat.py --stages action_plans
+```
+
+The adapters are package modules using relative imports, so executing one by
+file path (`python src/ingest/meri_panchayat/action_plans.py`) fails with
+`ImportError` before any extraction starts. Go through the orchestrator, or
+`uv run --env-file .env python -m ingest.meri_panchayat.action_plans` if you need the module
+directly.
+
+
+# Scrapers
+#### 5. `village_population.py`
+* village_population.py: Counts local populations and logs structural directory codes.
+
+#### 6. `panchayat_payment_register.py`
+* **What it does:** Tracks the money trail. It extracts ledger transaction details, tracking e-Payment Orders (EPOs), bank statuses, voucher dates, and payment modes.
+
+#### 7. `action_plans.py`
+* **What it does:** Captures future planning. It extracts development goals, planned budgets, actual funds received, and links to citizen-approved layout PDFs. 
+
+
+#### 8. `activity_summary.py`
+* **What it does:** Tallies local progress. It aggregates asset counts and categorizes public works to give a high-level summary of systemic structural infrastructure investments.
+
+#### 9. `beneficiaries.py`
+* **What it does:**  It records social numbers, tracking how many local citizens benefit from welfare programs. 
+
+#### 10. `work_activities.py`
+* **What it does:** The most detailed tracker. It unpacks deeply nested project metrics, breaking down expected vs. actual costs, completion statuses, unit metrics, and physical asset stages. 
+
+# How to run the full pipeline:
+
+```bash
+uv run --env-file .env python scripts/main_meri_panchayat.py
+```
+
+Without `uv run`, the system interpreter gets `scripts/` on its import path
+and not the src layout, so this fails immediately with `ModuleNotFoundError:
+ingest`. See the run instructions above for the per-stage form.

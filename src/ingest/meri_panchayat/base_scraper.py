@@ -20,6 +20,22 @@ from .config import (BASE_URL, FIN_YEARS, HIERARCHY_FIN_YEAR, REQUEST_TIMEOUT,
 logger = logging.getLogger(__name__)
 
 
+class IncompleteRun(RuntimeError):
+    """The run finished but could not retrieve everything it was asked for.
+
+    Raised after outputs and the failure manifest are written, so the data
+    collected is kept while the run is still reported as incomplete. A partial
+    extraction must never exit successfully.
+    """
+
+    def __init__(self, stage: str, failures: list) -> None:
+        super().__init__(
+            f"{stage}: {len(failures)} unit(s) could not be retrieved; "
+            f"see the failure manifest beside the output")
+        self.stage = stage
+        self.failures = failures
+
+
 class FetchError(RuntimeError):
     """A request failed: transport error, non-200 status, or unparseable body."""
 
