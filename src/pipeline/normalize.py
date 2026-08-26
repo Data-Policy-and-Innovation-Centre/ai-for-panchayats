@@ -541,13 +541,17 @@ def validate_canonical_manifest(snapshot_root: str | Path) -> Mapping[str, Any]:
     if not isinstance(value["raw_manifest_sha256"], str) or len(value["raw_manifest_sha256"]) != 64:
         raise NormalizationError("canonical manifest has invalid raw manifest hash")
     files: list[Mapping[str, Any]] = []
+    table_files: dict[str, list[Mapping[str, Any]]] = {}
     for table_name, table in value["tables"].items():
         if not isinstance(table, Mapping) or not isinstance(table.get("row_count"), int):
             raise NormalizationError(f"invalid canonical table metadata: {table_name}")
+        table_records: list[Mapping[str, Any]] = []
         for record in table.get("files", []):
             if not isinstance(record, Mapping) or not {"path", "sha256", "bytes"} <= set(record):
                 raise NormalizationError(f"invalid canonical file metadata: {table_name}")
             files.append(record)
+            table_records.append(record)
+        table_files[table_name] = table_records
     listed = set()
     for record in files:
         relative = Path(str(record["path"]))
@@ -560,6 +564,17 @@ def validate_canonical_manifest(snapshot_root: str | Path) -> Mapping[str, Any]:
         if digest != record["sha256"] or byte_count != record["bytes"]:
             raise NormalizationError(f"canonical file hash or byte count mismatch: {relative}")
         listed.add(relative.as_posix())
+    for table_name, table_records in table_files.items():
+        actual_row_count = sum(
+            pq.ParquetFile(root / Path(str(record["path"]))).metadata.num_rows
+            for record in table_records
+        )
+        declared_row_count = value["tables"][table_name]["row_count"]
+        if actual_row_count != declared_row_count:
+            raise NormalizationError(
+                f"canonical table row_count mismatch: {table_name} "
+                f"(declared {declared_row_count}, actual {actual_row_count})"
+            )
     actual_files = {
         path.relative_to(root).as_posix()
         for path in root.rglob("*.parquet")

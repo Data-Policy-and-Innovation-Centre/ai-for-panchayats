@@ -7,7 +7,11 @@ import pyarrow.parquet as pq
 import pytest
 
 from pipeline.manifest import RunPublisher
-from pipeline.normalize import NormalizationError, normalize_egramswaraj
+from pipeline.normalize import (
+    NormalizationError,
+    normalize_egramswaraj,
+    validate_canonical_manifest,
+)
 
 
 def make_run(tmp_path: Path, run_id: str, payloads: dict[str, object | bytes]) -> Path:
@@ -95,6 +99,25 @@ def test_empty_is_valid_and_malformed_is_reason_coded_quarantine(tmp_path: Path)
     canonical = json.loads((result.output_root / "canonical_manifest.json").read_text())
     assert canonical["tables"]["pl"]["row_count"] == 0
     assert canonical["quarantine_count"] == 2
+
+
+def test_forged_row_count_is_rejected(tmp_path: Path):
+    """A hand-edited manifest with a forged row_count must fail validation.
+
+    validate_canonical_manifest previously only type-checked row_count as an
+    int; it never cross-checked the declared count against the actual
+    Parquet footers, so a corrupted manifest with every file hash intact
+    would pass silently.
+    """
+    run = make_run(tmp_path, "run-forged", {"2021_PL.json": [{"id": "1"}, {"id": "2"}]})
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    manifest_path = result.output_root / "canonical_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["tables"]["pl"]["row_count"] == 2
+    manifest["tables"]["pl"]["row_count"] = 999999
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(NormalizationError, match="row_count|row count"):
+        validate_canonical_manifest(result.output_root)
 
 
 def test_stale_outputs_are_removed_and_chunks_obey_boundary(tmp_path: Path):
