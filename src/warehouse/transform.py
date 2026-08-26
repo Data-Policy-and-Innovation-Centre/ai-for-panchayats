@@ -18,7 +18,15 @@ say so explicitly). Two confidence tiers:
   export, never the JSON webservice the gated normalizer consumes), so
   ``RE_CANDIDATES`` lists several plausible spellings per field and resolves
   the first one present. This is stated plainly rather than guessed
-  silently: :mod:`warehouse.build` records which candidate matched.
+  silently: every field's resolution -- which candidate matched, or that
+  none did -- is recorded in a :class:`FieldResolutions` log and surfaced on
+  :class:`warehouse.build.BuildResult`. ``plan_code`` and ``s_no`` are part
+  of the documented ``recommended_expenditure`` identity
+  ``(gp_lgd_code, plan_code, activity_code, s_no)``, so if *no* candidate
+  spelling for either is present in the source frame, resolution raises
+  :class:`RequiredFieldUnresolved` rather than silently producing an
+  all-null identity column; every other RE field is genuinely optional and
+  is allowed to resolve to null, but that outcome is still recorded.
 
 Where the normalizer turns a JSON list into a child table (``pl__fundlist``,
 ``aa__...``), the corresponding table here is one-to-many, keyed by the
@@ -92,6 +100,67 @@ class Quarantine:
         )
 
 
+class RequiredFieldUnresolved(ValueError):
+    """A required canonical field matched none of its candidate spellings.
+
+    Raised instead of silently filling the field with nulls, which would
+    otherwise let a build succeed, pass validation, and publish a table
+    whose supposedly-required column is entirely empty.
+    """
+
+    def __init__(
+        self, *, table: str, field: str, candidates: tuple[str, ...], columns_present: list[str],
+    ) -> None:
+        self.table = table
+        self.field = field
+        self.candidates = candidates
+        self.columns_present = columns_present
+        super().__init__(
+            f"{table}: required field {field!r} matches none of the candidate source "
+            f"columns {candidates!r}; columns actually present in the source frame: "
+            f"{sorted(columns_present)!r}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FieldResolution:
+    """Record of how one canonical field was resolved for one source run."""
+
+    source_system: str
+    source_run_id: str
+    table: str
+    field: str
+    matched_candidate: str | None  # None means every candidate was absent (field is optional)
+
+
+@dataclass
+class FieldResolutions:
+    """Log of alias-resolution outcomes for fields resolved via a candidate list.
+
+    This is the safeguard the module docstring promises: rather than a
+    candidate match (or non-match) disappearing silently into a frame
+    assignment, every resolution is appended here so a build result can
+    report exactly which spelling was used -- or that none was found --
+    for every optional field.
+    """
+
+    records: list[FieldResolution] = field(default_factory=list)
+
+    def add(
+        self, table: str, field_name: str, matched_candidate: str | None,
+        *, source_system: str, source_run_id: str,
+    ) -> None:
+        self.records.append(FieldResolution(
+            source_system=source_system, source_run_id=source_run_id,
+            table=table, field=field_name, matched_candidate=matched_candidate,
+        ))
+
+    def unresolved(self) -> tuple[FieldResolution, ...]:
+        """Fields that resolved to null because no candidate was present."""
+
+        return tuple(r for r in self.records if r.matched_candidate is None)
+
+
 def _dedupe(frame: pd.DataFrame, keys: list[str], table: str, quarantine: Quarantine,
             *, source_system: str, source_run_id: str) -> pd.DataFrame:
     """Collapse to one row per composite key, quarantining genuine conflicts.
@@ -146,11 +215,25 @@ def _ensure_columns(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame
     return out
 
 
-def _first_present(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Series:
+def _first_present(
+    frame: pd.DataFrame, table: str, field_name: str, candidates: tuple[str, ...], *, required: bool,
+) -> tuple[pd.Series, str | None]:
+    """Resolve one canonical field to the first matching candidate column.
+
+    Returns the resolved series and the candidate that matched (``None`` if
+    none did). A required field with no match raises loudly rather than
+    handing back a silent all-null column -- see :class:`RequiredFieldUnresolved`.
+    """
+
     for candidate in candidates:
         if candidate in frame.columns:
-            return frame[candidate]
-    return pd.Series(pd.NA, index=frame.index, dtype="object")
+            return frame[candidate], candidate
+    if required:
+        raise RequiredFieldUnresolved(
+            table=table, field=field_name, candidates=candidates,
+            columns_present=list(frame.columns),
+        )
+    return pd.Series(pd.NA, index=frame.index, dtype="object"), None
 
 
 def _base_identity(frame: pd.DataFrame) -> pd.DataFrame:
@@ -711,18 +794,38 @@ RE_MONEY_COLUMNS = [
     "approved_cost_action_plan", "technical_approved_cost", "admin_approved_cost",
     "general", "sc", "st", "total_expenditure",
 ]
+# plan_code and s_no, together with gp_lgd_code and activity_code (both of
+# which come from base identity, not from RE_CANDIDATES), make up the
+# documented recommended_expenditure identity. An all-null identity
+# component is definitionally unusable, so these two are the only RE_CANDIDATES
+# fields required to resolve to a real column; every other field here is
+# descriptive/financial detail that a row can legitimately lack.
+RE_REQUIRED_FIELDS = frozenset({"plan_code", "s_no"})
 
 
-def recommended_expenditure(re: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
-                             *, source_system: str, source_run_id: str) -> pd.DataFrame:
+def recommended_expenditure(
+    re: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+    *, source_system: str, source_run_id: str,
+    resolutions: FieldResolutions | None = None,
+) -> pd.DataFrame:
     if re.empty:
         return pd.DataFrame(columns=RECOMMENDED_EXPENDITURE_COLUMNS)
+    if resolutions is None:
+        resolutions = FieldResolutions()
     identity = _base_identity(re)
     frame = pd.DataFrame({name: series for name, series in identity.items()
                           if name in ("source_system", "source_run_id", "gp_lgd_code",
                                       "activity_code", "fiscal_year")})
     for canonical, candidates in RE_CANDIDATES.items():
-        frame[canonical] = _first_present(re, candidates)
+        series, matched = _first_present(
+            re, "recommended_expenditure", canonical, candidates,
+            required=canonical in RE_REQUIRED_FIELDS,
+        )
+        frame[canonical] = series
+        resolutions.add(
+            "recommended_expenditure", canonical, matched,
+            source_system=source_system, source_run_id=source_run_id,
+        )
     frame = frame[RECOMMENDED_EXPENDITURE_COLUMNS]
     frame["plan_code"] = to_code(frame["plan_code"])
     frame["activity_code"] = to_code(frame["activity_code"])

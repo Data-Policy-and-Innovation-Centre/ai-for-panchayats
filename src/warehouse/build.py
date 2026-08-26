@@ -35,7 +35,7 @@ from .config import WarehouseSettings, load_settings
 from .load import DEFAULT_BATCH_SIZE, insert, read_table
 from .schema import CREATE_ORDER, DDL, RESET_ORDER
 from .select import SelectedSnapshot, resolve_snapshots
-from .transform import Quarantine
+from .transform import FieldResolution, FieldResolutions, Quarantine
 from .validate import Check, ValidationFailed, run_checks
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class BuildResult:
     checks: tuple[Check, ...]
     consumed_tables: dict[str, tuple[str, ...]]
     unconsumed_tables: dict[str, tuple[str, ...]]
+    field_resolutions: tuple[FieldResolution, ...]
 
 
 def create_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -119,10 +120,14 @@ def _merge_gram_panchayat(
 def populate(
     con: duckdb.DuckDBPyConnection, selected: tuple[SelectedSnapshot, ...],
     *, batch_size: int = DEFAULT_BATCH_SIZE,
-) -> tuple[dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+) -> tuple[
+    dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]],
+    FieldResolutions,
+]:
     """Shape and load every table inside the caller's transaction."""
 
     quarantine = Quarantine()
+    resolutions = FieldResolutions()
     counts: dict[str, int] = {}
     consumed: dict[str, tuple[str, ...]] = {}
     unconsumed: dict[str, tuple[str, ...]] = {}
@@ -228,6 +233,7 @@ def populate(
 
         add_count("recommended_expenditure", insert(con, "recommended_expenditure", transform.recommended_expenditure(
             re, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            resolutions=resolutions,
         ), batch_size=batch_size))
 
         consumed[f"{source_system}/{source_run_id}"] = tuple(sorted(used))
@@ -236,12 +242,15 @@ def populate(
             unconsumed[f"{source_system}/{source_run_id}"] = leftover
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
-    return counts, quarantine, consumed, unconsumed
+    return counts, quarantine, consumed, unconsumed, resolutions
 
 
 def build_into(
     path: Path, selected: tuple[SelectedSnapshot, ...], *, batch_size: int = DEFAULT_BATCH_SIZE,
-) -> tuple[dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+) -> tuple[
+    dict[str, int], Quarantine, dict[str, tuple[str, ...]], dict[str, tuple[str, ...]],
+    FieldResolutions,
+]:
     """Create and populate a database at ``path``, in one transaction."""
 
     con = duckdb.connect(str(path))
@@ -283,12 +292,18 @@ def build(
     staging_dir = Path(tempfile.mkdtemp(dir=target.parent, prefix=f".{target.stem}-build-"))
     staging = staging_dir / target.name
     try:
-        counts, quarantine, consumed, unconsumed = build_into(staging, selected, batch_size=batch_size)
+        counts, quarantine, consumed, unconsumed, resolutions = build_into(staging, selected, batch_size=batch_size)
         logger.info("Loaded %d table(s): %s", len(counts), ", ".join(f"{t}={n}" for t, n in counts.items()))
         if quarantine.total():
             logger.warning("Quarantined %d row(s); see the quarantine table", quarantine.total())
         if unconsumed:
             logger.warning("Declared but unconsumed canonical tables: %s", unconsumed)
+        unresolved = resolutions.unresolved()
+        if unresolved:
+            logger.warning(
+                "Optional field(s) resolved to null (no candidate column present): %s",
+                ", ".join(f"{r.table}.{r.field}" for r in unresolved),
+            )
 
         results: tuple[Check, ...] = ()
         if validate:
@@ -303,6 +318,9 @@ def build(
 
         os.replace(staging, target)
         logger.info("Published %s", target)
-        return BuildResult(target, counts, quarantine.total(), results, consumed, unconsumed)
+        return BuildResult(
+            target, counts, quarantine.total(), results, consumed, unconsumed,
+            tuple(resolutions.records),
+        )
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)

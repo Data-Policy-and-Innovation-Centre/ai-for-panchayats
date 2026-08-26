@@ -12,6 +12,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pandas as pd
+import pytest
 
 from warehouse import transform as t
 from warehouse.clean import to_decimal_money
@@ -173,6 +174,69 @@ def test_recommended_expenditure_conflicting_serial_number_is_quarantined():
     out = t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     assert len(out) == 1
     assert quarantine.records[-1]["reason_code"] == "conflicting_duplicate_key"
+
+
+# ------------------------------------------------------ RE field alias resolution
+
+
+def test_recommended_expenditure_raises_when_required_field_has_no_candidate():
+    """s_no is part of the documented identity; if the source frame has none
+    of its candidate spellings, ``_first_present`` used to hand back a
+    silent all-null column. It must now fail loudly and name the field, the
+    candidates tried, and the columns actually present."""
+
+    re_frame = pd.DataFrame([_row(row_id="r0", planCode="P1", totalExpenditure=500)])  # no sNo/s_no/etc.
+    quarantine = t.Quarantine()
+    with pytest.raises(t.RequiredFieldUnresolved) as excinfo:
+        t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    message = str(excinfo.value)
+    assert "s_no" in message
+    assert "sNo" in message  # a candidate that was tried
+    assert "planCode" in message  # a column that was actually present
+
+
+def test_recommended_expenditure_raises_when_plan_code_has_no_candidate():
+    re_frame = pd.DataFrame([_row(row_id="r0", sNo=1, totalExpenditure=500)])  # no planCode/plan_code
+    quarantine = t.Quarantine()
+    with pytest.raises(t.RequiredFieldUnresolved) as excinfo:
+        t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    assert "plan_code" in str(excinfo.value)
+
+
+def test_recommended_expenditure_optional_field_with_no_candidate_resolves_null_and_is_recorded():
+    """approved_cost_action_plan is genuinely optional: a missing alias must
+    not raise, but the null resolution must be recorded rather than merely
+    commented, per the module docstring's promise."""
+
+    re_frame = pd.DataFrame([_row(row_id="r0", planCode="P1", sNo=1, totalExpenditure=500)])
+    quarantine = t.Quarantine()
+    resolutions = t.FieldResolutions()
+    out = t.recommended_expenditure(
+        re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+        resolutions=resolutions,
+    )
+    assert out["approved_cost_action_plan"].isna().all()
+    unresolved_fields = {r.field for r in resolutions.unresolved()}
+    assert "approved_cost_action_plan" in unresolved_fields
+    assert all(r.matched_candidate is None for r in resolutions.unresolved())
+
+
+def test_recommended_expenditure_non_first_candidate_resolves_and_is_recorded():
+    """A later-listed spelling (not the first candidate) must still resolve
+    correctly, and the specific candidate that matched must be recorded."""
+
+    re_frame = pd.DataFrame([_row(row_id="r0", plan_code="P1", sno=1, totalExpenditure=500)])
+    quarantine = t.Quarantine()
+    resolutions = t.FieldResolutions()
+    out = t.recommended_expenditure(
+        re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+        resolutions=resolutions,
+    )
+    assert list(out["plan_code"]) == ["P1"]
+    assert list(out["s_no"]) == ["1"]
+    matched = {r.field: r.matched_candidate for r in resolutions.records}
+    assert matched["plan_code"] == "plan_code"
+    assert matched["s_no"] == "sno"
 
 
 # --------------------------------------------------------------------- gram_panchayat

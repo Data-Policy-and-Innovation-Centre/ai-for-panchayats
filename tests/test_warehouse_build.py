@@ -16,6 +16,7 @@ import duckdb
 import pytest
 
 from warehouse.build import BuildResult, build
+from warehouse.transform import RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
 from _warehouse_helpers import approved, make_settings, normalize, publish_raw_run, registry, write_manual_snapshot
@@ -190,6 +191,53 @@ def test_recommended_expenditure_identity_grain_through_build(tmp_path: Path):
         assert s_nos == ["1", "2"]
     finally:
         con.close()
+
+
+def test_recommended_expenditure_missing_required_alias_fails_build_and_does_not_publish(tmp_path: Path):
+    """If the real RE payload uses a spelling for a required identity field
+    (here, s_no) that isn't in RE_CANDIDATES, the build must fail loudly
+    instead of silently publishing a recommended_expenditure table with an
+    all-null identity column."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_RE.json": {
+            "data": [{"activityCd": 7, "planCode": "P1", "totalExpenditure": 500}],  # no sNo/s_no spelling
+        },
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+
+    target = tmp_path / "would-be-published" / "panchayat.duckdb"
+    with pytest.raises(RequiredFieldUnresolved) as excinfo:
+        build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry, target=target)
+    assert "s_no" in str(excinfo.value)
+    assert not target.exists()
+
+
+def test_build_result_records_re_field_resolutions(tmp_path: Path):
+    """Every RE_CANDIDATES field's resolution outcome -- which candidate
+    matched, or that none did -- must be surfaced on BuildResult, not just
+    claimed in a docstring."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_RE.json": {
+            "data": [{"activityCd": 7, "planCode": "P1", "sNo": 1, "totalExpenditure": 500}],
+        },
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    re_resolutions = {r.field: r.matched_candidate for r in result.field_resolutions if r.table == "recommended_expenditure"}
+    assert re_resolutions["plan_code"] == "planCode"
+    assert re_resolutions["s_no"] == "sNo"
+    # scheme_name has no candidate in this payload -- optional, so it is
+    # recorded as unresolved rather than raising.
+    assert re_resolutions["scheme_name"] is None
 
 
 # --------------------------------------------------------------------- scaling / chunk boundaries
