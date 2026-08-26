@@ -211,6 +211,9 @@ def test_save_outputs_accepts_json_positionally(tmp_path):
         ({}, "no `response` key at all"),
         ({"response": None}, "`response` present but null"),
         ({"response": "oops"}, "`response` present but not a list"),
+        (None, "a body of literal JSON `null`"),
+        (5, "a bare JSON number"),
+        ("text", "a bare JSON string"),
     ],
 )
 def test_a_malformed_envelope_raises_instead_of_reporting_no_districts(

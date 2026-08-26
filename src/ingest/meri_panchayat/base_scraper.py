@@ -82,6 +82,13 @@ def _response_list(data: dict, url: str) -> list:
     to prevent: a scrape would "succeed" with no districts and truncate the
     saved data. `[]` now means only that the API sent an explicit empty list.
     """
+    if not isinstance(data, dict):
+        # A body of literal `null`, or any JSON scalar, parses fine and then
+        # fails the membership test below with a raw TypeError -- escaping the
+        # FetchError contract this function exists to uphold, and bypassing
+        # every caller's failure handling. Check the container first.
+        raise FetchError(
+            url, f"malformed envelope: body is {type(data).__name__}, not an object")
     if "response" not in data:
         raise FetchError(url, "malformed envelope: no `response` key")
     response = data["response"]
