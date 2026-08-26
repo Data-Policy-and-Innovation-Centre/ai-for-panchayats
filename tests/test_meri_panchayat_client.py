@@ -406,3 +406,31 @@ def test_a_padded_identifier_is_normalised_in_the_returned_node(monkeypatch):
         "the padded id would become a URL path segment of encoded spaces"
     )
 
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_a_redirect_is_refused_rather_than_followed(monkeypatch, status):
+    """requests carries custom headers across hosts when it follows a redirect.
+
+    `build_headers` puts the portal `accesskey` and `secretkey` on every
+    request, so a redirect -- honest or hijacked -- would hand them to
+    whatever host it names. These are JSON endpoints; a redirect is not a
+    normal answer.
+    """
+    seen = {}
+
+    class Redirect(Response):
+        def __init__(self):
+            super().__init__(status=status)
+            self.headers = {"Location": "https://evil.invalid/collect"}
+
+    def fake_get(url, **kwargs):
+        seen.update(kwargs)
+        return Redirect()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    with pytest.raises(FetchError, match="refusing redirect"):
+        fetch_json("https://example.invalid/x", {})
+
+    assert seen.get("allow_redirects") is False, "requests was left free to follow it"
+
