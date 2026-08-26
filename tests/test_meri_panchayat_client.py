@@ -394,3 +394,15 @@ def test_a_failure_writing_the_second_format_promotes_neither(tmp_path, monkeypa
     )
     assert pd.read_csv(csv).iloc[0]["gp_id"] == "previous"
 
+
+def test_a_padded_identifier_is_normalised_in_the_returned_node(monkeypatch):
+    """Callers build URLs from the node, not from the dedupe key."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [{"bpId": " 3823 "}]}))
+
+    blocks = get_blocks(321, "2024-2025")
+
+    assert blocks[0]["bpId"] == "3823", (
+        "the padded id would become a URL path segment of encoded spaces"
+    )
+
