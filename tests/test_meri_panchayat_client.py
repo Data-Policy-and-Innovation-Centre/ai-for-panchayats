@@ -395,6 +395,33 @@ def test_a_failure_writing_the_second_format_promotes_neither(tmp_path, monkeypa
     assert pd.read_csv(csv).iloc[0]["gp_id"] == "previous"
 
 
+def test_checkpoint_cleanup_failure_cannot_split_promoted_formats(tmp_path,
+                                                                  monkeypatch):
+    """Cleanup starts only after every staged format has been promoted."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    js, csv = tmp_path / "a.json", tmp_path / "a.csv"
+    save_outputs(pd.DataFrame([{"gp_id": "previous"}]), json_path=js, csv_path=csv)
+    stale = js.with_suffix(js.suffix + ".partial")
+    stale.write_text("checkpoint", encoding="utf-8")
+
+    real_exists = Path.exists
+
+    def fail_for_stale(path):
+        if path == stale:
+            raise OSError("checkpoint cannot be inspected")
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", fail_for_stale)
+
+    save_outputs(pd.DataFrame([{"gp_id": "new"}]), json_path=js, csv_path=csv)
+
+    assert pd.read_json(js).iloc[0]["gp_id"] == "new"
+    assert pd.read_csv(csv).iloc[0]["gp_id"] == "new"
+
+
 def test_a_padded_identifier_is_normalised_in_the_returned_node(monkeypatch):
     """Callers build URLs from the node, not from the dedupe key."""
     monkeypatch.setattr(requests, "get",
@@ -433,4 +460,3 @@ def test_a_redirect_is_refused_rather_than_followed(monkeypatch, status):
         fetch_json("https://example.invalid/x", {})
 
     assert seen.get("allow_redirects") is False, "requests was left free to follow it"
-
