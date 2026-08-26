@@ -34,6 +34,7 @@ def get_beneficiaries(gp_id, fin_year):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rows, processed_gp_count = [], 0
+    seen_gps: set = set()
 
     zps = get_zps()
     print(f"Total Districts (ZPs) fetched: {len(zps)}")
@@ -51,6 +52,18 @@ def main():
 
                 if not in_scope(gp_id):
                     continue
+                # A GP that moved between blocks during FIN_YEARS is
+                # returned by get_gps under both its old and new block, so the
+                # traversal reaches it twice. This adapter's rows carry no
+                # block identifier, so those duplicates are byte-identical and
+                # silently double every fund total downstream. Process each GP
+                # once. Adapters that do record bp_id have distinguishable
+                # duplicates and a live question about which parent is
+                # authoritative -- see #42.
+                if gp_id in seen_gps:
+                    continue
+                seen_gps.add(gp_id)
+
                 print(f"    GP {processed_gp_count + 1}: {gp_name}")
 
                 for fin_year in FIN_YEARS:

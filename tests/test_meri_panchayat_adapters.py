@@ -412,3 +412,45 @@ def test_no_adapter_defaults_a_missing_response_to_empty():
         "use base_scraper.response_field so drift raises FetchError"
     )
 
+
+@pytest.mark.parametrize("module_name", ["panchayat_funds", "beneficiaries"])
+def test_a_reorganized_gp_is_scraped_once_where_rows_carry_no_block(
+    module_name, monkeypatch, tmp_path
+):
+    """A GP under two blocks must not double a fund or beneficiary total.
+
+    get_gps unions across years per block, so a GP that changed block appears
+    under both. These two adapters record no bp_id, so the duplicate rows are
+    byte-identical and there is no way to tell them apart downstream. The
+    adapters that do record bp_id have a live question about which parent is
+    authoritative, tracked in #42; here there is no question to ask.
+    """
+    module = importlib.import_module(f"ingest.meri_panchayat.{module_name}")
+    monkeypatch.setattr(module, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(module.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(module, "get_zps", lambda: [{"zpId": 321, "name": "Khordha"}])
+    monkeypatch.setattr(module, "get_blocks", lambda *a, **k: [
+        {"bpId": 3823, "name": "Old Block"},
+        {"bpId": 3824, "name": "New Block"},
+    ])
+    # The same in-scope GP is returned under both blocks.
+    monkeypatch.setattr(module, "get_gps",
+                        lambda *a, **k: [{"gpId": 119598, "name": "Andhrua"}])
+
+    fetched = []
+    fetcher = "get_funds" if module_name == "panchayat_funds" else "get_beneficiaries"
+
+    def record(gp_id, *args, **kwargs):
+        fetched.append((gp_id, args))
+        return []
+
+    monkeypatch.setattr(module, fetcher, record)
+    module.main()
+
+    gp_ids = [gp for gp, _ in fetched]
+    assert gp_ids.count(119598) == len(set(a for _, a in fetched)), (
+        f"GP 119598 was fetched {gp_ids.count(119598)} times across "
+        f"{len(set(a for _, a in fetched))} distinct year(s) -- the second "
+        "block re-scraped it"
+    )
+
