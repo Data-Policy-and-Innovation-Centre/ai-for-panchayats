@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from pipeline.normalize import NormalizationError, validate_canonical_manifest
-from pipeline.snapshots import SnapshotRegistry, SnapshotSpec, load_snapshot_registry
+from src.pipeline.normalize import NormalizationError, validate_canonical_manifest
+from src.pipeline.snapshots import SnapshotRegistry, SnapshotSpec, load_snapshot_registry
 
 from .config import WarehouseSettings
 from .load import discover_tables

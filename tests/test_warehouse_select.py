@@ -31,7 +31,7 @@ def test_unapproved_snapshot_cannot_even_enter_the_registry(tmp_path: Path):
     outside that registry; this test documents why it is normally unreachable.
     """
 
-    from pipeline.snapshots import SnapshotRegistry, SnapshotRegistryError, SnapshotSpec
+    from src.pipeline.snapshots import SnapshotRegistry, SnapshotRegistryError, SnapshotSpec
     with pytest.raises(SnapshotRegistryError, match="only approved"):
         SnapshotRegistry((SnapshotSpec("snap-1", "egramSwaraj", "run-1", "1", "pending"),))
 
@@ -41,7 +41,7 @@ def test_resolve_snapshots_still_checks_status_defensively(tmp_path: Path, monke
     future registry implementation stops enforcing "approved-only" itself.
     """
 
-    from pipeline.snapshots import SnapshotSpec
+    from src.pipeline.snapshots import SnapshotSpec
     settings = _minimal_pl_run(tmp_path)
     spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
     monkeypatch.setattr(

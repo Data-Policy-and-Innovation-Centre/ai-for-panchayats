@@ -17,9 +17,9 @@ from typing import Mapping
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from pipeline.manifest import RunPublisher
-from pipeline.normalize import normalize_egramswaraj
-from pipeline.snapshots import SnapshotRegistry, SnapshotSpec
+from src.pipeline.manifest import RunPublisher
+from src.pipeline.normalize import normalize_egramswaraj
+from src.pipeline.snapshots import SnapshotRegistry, SnapshotSpec
 from warehouse.config import WarehouseSettings, load_settings
 
 
