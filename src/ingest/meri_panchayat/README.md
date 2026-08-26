@@ -30,7 +30,7 @@ ai-for-panchayats/
 # Core & Setup Files
 - 1. `config.yaml`:
 * The settings dashboard. This is where you change target states, add financial years, or adjust the pilot scope without touching code.
-* **No credentials go in this file.** It is tracked in git, and this repository is public. Access keys and endpoint secrets are read from the environment by `_require_env`; putting them here would both fail with `MissingCredential` and risk committing live portal credentials. Copy `.env.example` to `.env` and fill in the variables listed there. See #12 for what that costs when it goes wrong.
+* **No credentials go in this file.** It is tracked in git, and this repository is public. Access keys and endpoint secrets are read from the environment by `_require_env`; putting them here would both fail with `MissingCredential` and risk committing live portal credentials. Copy `.env.example` to `.env` and fill in the variables listed there, then pass it on every run with `--env-file .env`. Nothing in this project loads dotenv files — `python-dotenv` is not a dependency and `uv run` only reads one when told to — so a plain `uv run` fails with `MissingCredential` even with a correctly filled `.env`. Exporting the variables into your shell works too. See #12 for what that costs when it goes wrong.
 
 #### 2. `config.py`
 * The bridge. It automatically converts your YAML settings into active Python variables and creates data handshakes (headers) for the government servers.
@@ -43,19 +43,19 @@ ai-for-panchayats/
 * Run every stage:
 
 ```bash
-uv run python scripts/main_meri_panchayat.py
+uv run --env-file .env python scripts/main_meri_panchayat.py
 ```
 
 * Run one stage:
 
 ```bash
-uv run python scripts/main_meri_panchayat.py --stages action_plans
+uv run --env-file .env python scripts/main_meri_panchayat.py --stages action_plans
 ```
 
 The adapters are package modules using relative imports, so executing one by
 file path (`python src/ingest/meri_panchayat/action_plans.py`) fails with
 `ImportError` before any extraction starts. Go through the orchestrator, or
-`uv run python -m ingest.meri_panchayat.action_plans` if you need the module
+`uv run --env-file .env python -m ingest.meri_panchayat.action_plans` if you need the module
 directly.
 
 
@@ -82,7 +82,7 @@ directly.
 # How to run the full pipeline:
 
 ```bash
-uv run python scripts/main_meri_panchayat.py
+uv run --env-file .env python scripts/main_meri_panchayat.py
 ```
 
 Without `uv run`, the system interpreter gets `scripts/` on its import path
