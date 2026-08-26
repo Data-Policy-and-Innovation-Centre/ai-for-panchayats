@@ -186,7 +186,12 @@ def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
         url = build_url(hierarchy_year(year))
         entries = _response_list(fetch_json(url, build_headers("master")), url)
         for item in _checked_entries(entries, key, url):
-            seen.setdefault(item[key], item)
+            # `_checked_entries` deliberately accepts an id as int or str,
+            # because the portal is not consistent between years. Keying the
+            # union on the raw value therefore lets 3823 and "3823" survive as
+            # two entries and returns the same panchayat twice. Same
+            # normalisation as config.in_scope, for the same reason.
+            seen.setdefault(str(item[key]).strip(), item)
     return list(seen.values())
 
 
@@ -224,6 +229,8 @@ def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) ->
     complete one, which is the failure this client exists to prevent. The
     final, unflagged save promotes the run and clears any stale partial.
     """
+    promotions = []
+
     for path, writer in ((json_path, "json"), (csv_path, "csv")):
         if path is None:
             continue
@@ -247,7 +254,15 @@ def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) ->
             df.to_csv(target, index=False)
 
         if not checkpoint:
-            os.replace(target, path)
-            stale = _checkpoint_path(path)
-            if stale.exists():
-                stale.unlink()
+            # Collected, not promoted yet. Promoting each format as it is
+            # written meant a CSV failure after a successful JSON left the two
+            # canonical files representing different runs -- a partial replace
+            # of a previously consistent output set. Every format is written
+            # first; only then does anything move into place.
+            promotions.append((target, path))
+
+    for target, path in promotions:
+        os.replace(target, path)
+        stale = _checkpoint_path(path)
+        if stale.exists():
+            stale.unlink()

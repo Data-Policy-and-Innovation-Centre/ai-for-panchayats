@@ -353,3 +353,44 @@ def test_the_final_save_leaves_no_temporary_behind(tmp_path):
     assert final.exists()
     assert not (tmp_path / "activities.json.tmp").exists()
 
+
+def test_an_id_sent_as_int_then_string_is_one_panchayat(monkeypatch):
+    """The portal is not consistent between years; the union must be."""
+    pages = [
+        {"response": [{"bpId": 3823, "name": "Bhubaneswar"}]},
+        {"response": [{"bpId": "3823", "name": "Bhubaneswar"}]},
+    ]
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        page = pages[0] if len(calls) == 1 else pages[1]
+        return Response(payload=page)
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(base_scraper, "FIN_YEARS", ["2023-2024", "2024-2025"])
+    monkeypatch.setattr(base_scraper, "HIERARCHY_FIN_YEAR", None)
+
+    assert len(get_blocks(321)) == 1, "the same block survived as two entries"
+
+
+def test_a_failure_writing_the_second_format_promotes_neither(tmp_path, monkeypatch):
+    """The two canonical files must never represent different runs."""
+    import pandas as pd
+
+    js, csv = tmp_path / "a.json", tmp_path / "a.csv"
+    save_outputs(pd.DataFrame([{"gp_id": "previous"}]), json_path=js, csv_path=csv)
+
+    def boom(self, *a, **k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", boom)
+
+    with pytest.raises(OSError):
+        save_outputs(pd.DataFrame([{"gp_id": "new"}]), json_path=js, csv_path=csv)
+
+    assert pd.read_json(js).iloc[0]["gp_id"] == "previous", (
+        "JSON was promoted while CSV still holds the previous run"
+    )
+    assert pd.read_csv(csv).iloc[0]["gp_id"] == "previous"
+
