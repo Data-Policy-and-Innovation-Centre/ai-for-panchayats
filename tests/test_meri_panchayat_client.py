@@ -270,3 +270,13 @@ def test_every_hierarchy_level_shares_one_validation_path(monkeypatch):
         with pytest.raises(FetchError, match="malformed entry"):
             call()
 
+
+@pytest.mark.parametrize("bad_id", [[], {}, ["3823"]])
+def test_a_non_scalar_identifier_raises(monkeypatch, bad_id):
+    """`{"bpId": []}` cleared the None check and died as an unhashable key."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [{"bpId": bad_id}]}))
+
+    with pytest.raises(FetchError, match="not a scalar"):
+        get_blocks(321, "2024-2025")
+

@@ -144,8 +144,17 @@ def _checked_entries(items: list, key: str, url: str) -> list:
         if not isinstance(item, dict):
             raise FetchError(
                 url, f"malformed entry: {type(item).__name__}, not an object")
-        if item.get(key) is None:
+        identifier = item.get(key)
+        if identifier is None:
             raise FetchError(url, f"malformed entry: no `{key}`")
+        if not isinstance(identifier, (str, int)) or isinstance(identifier, bool):
+            # `{"bpId": []}` clears the None check and then fails as an
+            # unhashable `seen` key with an untyped TypeError; an equally
+            # malformed `zpId` would travel downstream unchecked, since
+            # get_zps does not dedupe. An identifier has to be a scalar.
+            raise FetchError(
+                url,
+                f"malformed entry: `{key}` is {type(identifier).__name__}, not a scalar")
     return items
 
 
