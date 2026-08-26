@@ -289,8 +289,17 @@ def save_outputs(df, json_path=None, csv_path=None, checkpoint: bool = False) ->
     # as far as this can go without promoting a whole directory instead of
     # individual files. Consumers that need the two formats to agree should
     # read one of them, not both.
+    # Finish every canonical promotion before touching checkpoint sidecars.
+    # Cleanup can fail for reasons unrelated to the staged outputs (for
+    # example an undeletable or malformed partial path); interleaving it with
+    # promotion would leave JSON from the new run beside CSV from the old one.
     for target, path in promotions:
         os.replace(target, path)
+
+    for _, path in promotions:
         stale = _checkpoint_path(path)
-        if stale.exists():
-            stale.unlink()
+        try:
+            if stale.exists():
+                stale.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove stale checkpoint %s: %s", stale, exc)

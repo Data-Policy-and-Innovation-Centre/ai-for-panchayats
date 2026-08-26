@@ -80,7 +80,28 @@ def _strict_bool(value, key: str) -> bool:
 
 
 ALL_GPS = _strict_bool(_cfg.get("all_gps", False), "all_gps")
-TARGET_GPS = _cfg.get("target_gps") or []
+
+
+def _validated_targets(value, *, all_gps: bool) -> list:
+    """Return the configured pilot targets, rejecting an empty closed scope.
+
+    An empty target list is meaningful only for a deliberate statewide run.
+    In pilot mode it would make every adapter skip every GP and then publish an
+    empty dataset as a successful extraction.
+    """
+    targets = value or []
+    if not isinstance(targets, list):
+        raise ConfigError(
+            f"target_gps must be a YAML list, got {type(targets).__name__}"
+        )
+    if not all_gps and not targets:
+        raise ConfigError(
+            "target_gps must contain at least one GP when all_gps is false"
+        )
+    return targets
+
+
+TARGET_GPS = _validated_targets(_cfg.get("target_gps"), all_gps=ALL_GPS)
 TARGET_GP_IDS = frozenset(gp["gp_code"] for gp in TARGET_GPS)
 TARGET_GP_KEYS = frozenset(str(gp["gp_code"]).strip() for gp in TARGET_GPS)
 

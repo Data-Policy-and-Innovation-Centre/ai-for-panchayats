@@ -80,6 +80,21 @@ def test_all_gps_flag_opens_the_scope(monkeypatch):
     assert config.in_scope(999999)
 
 
+@pytest.mark.parametrize("targets", [None, []])
+def test_pilot_scope_rejects_an_empty_target_list(targets):
+    with pytest.raises(config.ConfigError, match="at least one GP"):
+        config._validated_targets(targets, all_gps=False)
+
+
+def test_statewide_scope_allows_an_empty_target_list():
+    assert config._validated_targets([], all_gps=True) == []
+
+
+def test_target_gps_must_be_a_list():
+    with pytest.raises(config.ConfigError, match="YAML list"):
+        config._validated_targets({"gp_code": 119598}, all_gps=False)
+
+
 # ---------------------------------------------------------------- hierarchy
 
 
@@ -164,4 +179,3 @@ def test_scope_matches_whatever_type_the_portal_sends(gp_id):
 @pytest.mark.parametrize("gp_id", [999999, "999999", None])
 def test_out_of_scope_stays_out_whatever_the_type(gp_id):
     assert config.in_scope(gp_id) is False
-
