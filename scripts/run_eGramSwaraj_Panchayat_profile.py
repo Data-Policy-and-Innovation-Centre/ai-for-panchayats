@@ -8,8 +8,8 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root / "src"))
 
-from eGramSwaraj_panchayat_profile.scrapper import scrape_panchayat_info
-from eGramSwaraj_panchayat_profile.config import OUTPUT_DIR
+from eGramSwaraj_panchayat_profile.scrapper import scrape_panchayat_info  # noqa: E402
+from eGramSwaraj_panchayat_profile.config import OUTPUT_DIR  # noqa: E402
 
 def load_panchayat_parameters(filepath=None):
     """
