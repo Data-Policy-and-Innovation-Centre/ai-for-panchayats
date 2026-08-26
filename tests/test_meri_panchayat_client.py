@@ -280,3 +280,13 @@ def test_a_non_scalar_identifier_raises(monkeypatch, bad_id):
     with pytest.raises(FetchError, match="not a scalar"):
         get_blocks(321, "2024-2025")
 
+
+@pytest.mark.parametrize("empty_id", ["", "   "])
+def test_an_empty_identifier_raises(monkeypatch, empty_id):
+    """An empty id is a scalar; it builds a URL with a hollow parent segment."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: Response(payload={"response": [{"bpId": empty_id}]}))
+
+    with pytest.raises(FetchError, match="is empty"):
+        get_blocks(321, "2024-2025")
+

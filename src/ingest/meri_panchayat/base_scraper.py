@@ -155,6 +155,11 @@ def _checked_entries(items: list, key: str, url: str) -> list:
             raise FetchError(
                 url,
                 f"malformed entry: `{key}` is {type(identifier).__name__}, not a scalar")
+        if isinstance(identifier, str) and not identifier.strip():
+            # An empty id is a scalar and passes every check above, then
+            # builds a URL with a hollow parent segment when it reaches
+            # get_gps -- or, for a GP, quietly reads as out of scope.
+            raise FetchError(url, f"malformed entry: `{key}` is empty")
     return items
 
 
