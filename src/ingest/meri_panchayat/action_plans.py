@@ -15,7 +15,7 @@ from .config import (
     OUTPUT_DIR, SAVE_EVERY_GP, REQUEST_DELAY, BASE_URL,
     build_headers, get_output_path
 )
-from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import response_field, get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
 ACTION_PLAN_BASE_HEADERS = build_headers("action_plans", lang="en-IN")
@@ -35,10 +35,8 @@ def get_action_plans(gp_id, fin_year):
     })
 
     data = fetch_json(url, headers=request_headers)
-    if not data:
-        return "0", []
-    response = data.get("response", {})
-    return response.get("allotmentAmount", "0"), response.get("plans", [])
+    plans = response_field(data, "plans", url, f"GP {gp_id} {fin_year}")
+    return data["response"].get("allotmentAmount", "0"), plans
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)

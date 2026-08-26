@@ -16,7 +16,7 @@ from .config import (
     REQUEST_DELAY, BASE_URL,
     build_headers, get_output_path,
 )
-from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import response_field, get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
 PROFILE_HEADERS = build_headers("gp_profile", lang="null-IN")
@@ -31,7 +31,7 @@ PROFILE_QUERY_FIN_YEAR = FIN_YEARS[-1]
 def get_villages(gp_id):
     url = f"{BASE_URL}/api/prd/gp/v1/profile/getGPDetailsWithYr/{STATE_ID}/{gp_id}/3?fYear={PROFILE_QUERY_FIN_YEAR}"
     data = fetch_json(url, PROFILE_HEADERS)
-    return data.get("response", {}).get("villages", []) if data else []
+    return response_field(data, "villages", url, f"GP {gp_id}")
 
 
 def main():

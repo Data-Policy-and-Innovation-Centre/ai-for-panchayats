@@ -16,7 +16,7 @@ from .config import (
     REQUEST_DELAY, BASE_URL,
     build_headers, get_output_path,
 )
-from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import response_field, get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
 ACTIVITY_HEADERS = build_headers("activity_summary", lang="null-IN")
@@ -28,7 +28,7 @@ ACTIVITY_HEADERS = build_headers("activity_summary", lang="null-IN")
 def get_activity_summary(gp_id, fin_year):
     url = f"{BASE_URL}/api/prd/gp/v1/activity/getactivitysummary/{STATE_ID}/{gp_id}/3/{fin_year}"
     data = fetch_json(url, ACTIVITY_HEADERS)
-    return data.get("response", {}).get("works", []) if data else []
+    return response_field(data, "works", url, f"GP {gp_id} {fin_year}")
 
 
 def main():

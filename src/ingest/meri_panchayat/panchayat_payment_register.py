@@ -17,6 +17,7 @@ from .config import (
     build_headers, get_output_path,
 )
 from .base_scraper import (FetchError, IncompleteRun, fetch_json_post,
+                           response_field,
                            get_blocks, get_gps, get_zps, save_outputs)
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
@@ -50,14 +51,17 @@ def get_epayment_orders(gp_id, fin_year):
         # empty register: no FetchError, so the retry and failure-manifest
         # paths are skipped, an existing register is overwritten with nothing,
         # and the stale-manifest cleanup then reports the run as clean.
-        response = data.get("response")
-        if not isinstance(response, dict) or "epos" not in response:
+        epos = response_field(data, "epos", url, f"GP {gp_id} {fin_year}")
+        reported = data["response"].get("count")
+        if not isinstance(reported, int) or isinstance(reported, bool):
+            # Defaulting a missing count to 0 satisfies the stop condition
+            # below after the very first page, silently capping the register
+            # at one page however many payments exist. The count is what
+            # makes pagination verifiable, so its absence is schema drift.
             raise FetchError(
                 url,
                 f"malformed payment envelope for GP {gp_id} {fin_year}: "
-                "no `response.epos`")
-        epos = response["epos"]
-        reported = response.get("count", 0)
+                f"`response.count` is {type(reported).__name__}, not an integer")
 
         if not epos:
             # An empty page before the reported total is reached is pagination

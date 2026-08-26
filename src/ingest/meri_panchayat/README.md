@@ -40,9 +40,23 @@ ai-for-panchayats/
 
 #### 4. `main_meri_panchayat.py`
 * This is the only file you need to execute. It launches all individual scrapers back-to-back in the perfect sequence.
-* use this code to execute all the files : 
-# python scripts/main_meri_panchayat.py
-# python src/ingest/meri_panchayat/action_plans.py
+* Run every stage:
+
+```bash
+uv run python scripts/main_meri_panchayat.py
+```
+
+* Run one stage:
+
+```bash
+uv run python scripts/main_meri_panchayat.py --stages action_plans
+```
+
+The adapters are package modules using relative imports, so executing one by
+file path (`python src/ingest/meri_panchayat/action_plans.py`) fails with
+`ImportError` before any extraction starts. Go through the orchestrator, or
+`uv run python -m ingest.meri_panchayat.action_plans` if you need the module
+directly.
 
 
 # Scrapers

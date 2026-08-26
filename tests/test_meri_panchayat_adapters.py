@@ -299,7 +299,31 @@ def test_a_payment_error_envelope_is_not_an_empty_register(register, monkeypatch
                               "json": lambda self, p=page: p})()
 
     monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(FetchError, match="malformed envelope"):
+        register.get_epayment_orders(119598, "2024-2025")
+
+
+def test_a_payment_envelope_missing_only_epos_also_raises(register, monkeypatch):
+    """`response` present but without its list is drift too, not an empty run."""
+    def fake_post(url, **kwargs):
+        page = {"response": {"count": 10}}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "post", fake_post)
     with pytest.raises(FetchError, match="no `response.epos`"):
+        register.get_epayment_orders(119598, "2024-2025")
+
+
+def test_a_payment_page_without_a_count_raises(register, monkeypatch):
+    """Defaulting a missing count to 0 capped the register at one page."""
+    def fake_post(url, **kwargs):
+        page = {"response": {"epos": [{"id": i} for i in range(50)]}}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(FetchError, match="`response.count`"):
         register.get_epayment_orders(119598, "2024-2025")
 
 
@@ -318,7 +342,18 @@ def test_an_activity_error_envelope_raises(activities, monkeypatch):
                               "json": lambda self, p=page: p})()
 
     monkeypatch.setattr(requests, "get", fake_get)
-    with pytest.raises(FetchError, match="no `response.activities`"):
+    with pytest.raises(FetchError, match="malformed envelope"):
+        activities.get_activities(119598, "2024-2025")
+
+
+def test_an_activity_page_without_a_count_raises(activities, monkeypatch):
+    def fake_get(url, **kwargs):
+        page = {"response": {"activities": [{"id": i} for i in range(100)]}}
+        return type("R", (), {"status_code": 200, "text": "",
+                              "json": lambda self, p=page: p})()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with pytest.raises(FetchError, match="`response.count`"):
         activities.get_activities(119598, "2024-2025")
 
 
@@ -349,4 +384,31 @@ def test_an_activity_page_with_no_records_and_no_count_is_valid(activities, monk
 
     monkeypatch.setattr(requests, "get", fake_get)
     assert activities.get_activities(119598, "2024-2025") == []
+
+
+def test_no_adapter_defaults_a_missing_response_to_empty():
+    """The defect that survived three review rounds in three different files.
+
+    `data.get("response", {}).get(field, [])` reads a 200 error envelope as an
+    empty result, so the adapter publishes an empty dataset and the
+    orchestrator reports success. It was fixed one file at a time, and each
+    time a sibling still had it. This asserts the pattern is gone everywhere
+    and cannot come back in adapter number six.
+    """
+    import re
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parents[1] / "src" / "ingest" / "meri_panchayat"
+    pattern = re.compile(r'get\(\s*["\']response["\']\s*,\s*\{\}\s*\)')
+    offenders = [
+        path.name for path in sorted(pkg.glob("*.py"))
+        # base_scraper quotes the pattern in `response_field`'s docstring to
+        # say what it replaces, which is the one place it should appear.
+        if path.name != "base_scraper.py" and pattern.search(path.read_text())
+    ]
+
+    assert not offenders, (
+        f"{offenders} default a missing `response` to empty; "
+        "use base_scraper.response_field so drift raises FetchError"
+    )
 

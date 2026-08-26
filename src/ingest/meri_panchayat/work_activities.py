@@ -17,7 +17,7 @@ from .config import (
     build_headers, output_paths,
 )
 from .base_scraper import (FetchError, get_zps, get_blocks, get_gps,
-                           fetch_json, save_outputs)
+                           fetch_json, response_field, save_outputs)
 
 OUTPUT_FILE_CSV, OUTPUT_FILE_JSON = output_paths("activities")
 ACTIVITY_HEADERS = build_headers("activities", lang="null-IN")
@@ -33,15 +33,13 @@ def get_activities(gp_id, fin_year):
         url = f"{BASE_URL}/api/prd/gp/v1/activity/getactivitylist/{STATE_ID}/{gp_id}/3/F/0/{fin_year}?skip={skip}&limit={limit}"
         data = fetch_json(url, ACTIVITY_HEADERS)
 
-        response = data.get("response") if isinstance(data, dict) else None
-        if not isinstance(response, dict) or "activities" not in response:
+        activities = response_field(data, "activities", url, f"GP {gp_id} {fin_year}")
+        reported = data["response"].get("count")
+        if not isinstance(reported, int) or isinstance(reported, bool):
             raise FetchError(
                 url,
                 f"malformed activity envelope for GP {gp_id} {fin_year}: "
-                "no `response.activities`")
-
-        activities = response["activities"]
-        reported = response.get("count", 0)
+                f"`response.count` is {type(reported).__name__}, not an integer")
 
         if not activities:
             # Same failure as the payment register: an empty page before the

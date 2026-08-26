@@ -13,7 +13,7 @@ from .config import (
     REQUEST_DELAY, BASE_URL,
     build_headers, get_output_path
 )
-from .base_scraper import get_zps, get_blocks, get_gps, fetch_json, save_outputs
+from .base_scraper import response_field, get_zps, get_blocks, get_gps, fetch_json, save_outputs
 
 OUTPUT_FILE_JSON = get_output_path(os.path.basename(__file__))
 HEADERS = build_headers("funds", lang="en-IN")
@@ -43,7 +43,7 @@ def get_funds(gp_id, fin_year):
     data = fetch_json(url, headers=HEADERS)
     if not data:
         return []
-    return data.get("response", {}).get("funds", [])
+    return response_field(data, "funds", url, f"GP {gp_id} {fin_year}")
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
