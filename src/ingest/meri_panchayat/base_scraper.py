@@ -47,6 +47,18 @@ class FetchError(RuntimeError):
 
 
 def _parse(response: requests.Response, url: str) -> dict:
+    if 300 <= response.status_code < 400:
+        # requests follows redirects by default and carries custom headers
+        # across hosts, so a portal redirect -- or a hijacked one -- would
+        # forward `accesskey` and `secretkey` to wherever it points. These are
+        # JSON endpoints; a redirect is not a normal answer, so refuse it
+        # rather than deciding at runtime which hosts are safe.
+        raise FetchError(
+            url,
+            f"refusing redirect (HTTP {response.status_code} -> "
+            f"{response.headers.get('Location', 'unknown')}): "
+            "portal credentials must not follow it",
+            response.status_code)
     if response.status_code != 200:
         raise FetchError(url, f"HTTP {response.status_code}", response.status_code)
     try:
@@ -58,7 +70,8 @@ def _parse(response: requests.Response, url: str) -> dict:
 def fetch_json(url: str, headers: dict) -> dict:
     """GET one endpoint. Raises FetchError; never returns None."""
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT,
+                                allow_redirects=False)
     except requests.RequestException as exc:
         raise FetchError(url, f"request failed ({exc})") from exc
     return _parse(response, url)
@@ -68,7 +81,7 @@ def fetch_json_post(url: str, headers: dict, payload: dict) -> dict:
     """POST one endpoint. Raises FetchError; never returns None."""
     try:
         response = requests.post(url, headers=headers, json=payload,
-                                 timeout=REQUEST_TIMEOUT)
+                                 timeout=REQUEST_TIMEOUT, allow_redirects=False)
     except requests.RequestException as exc:
         raise FetchError(url, f"request failed ({exc})") from exc
     return _parse(response, url)
