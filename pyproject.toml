@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dpic",
+    "duckdb>=1.5.5",
     "dvc[s3]>=3.67.1",
     "indic-transliteration>=2.3.82",
     "loguru>=0.7.3",
