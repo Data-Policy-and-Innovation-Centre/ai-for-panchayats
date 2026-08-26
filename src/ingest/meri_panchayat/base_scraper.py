@@ -14,6 +14,7 @@ import os
 import requests
 
 from .config import (BASE_URL, FIN_YEARS, HIERARCHY_FIN_YEAR, REQUEST_TIMEOUT,
+                     gp_key,
                      STATE_ID, build_headers, hierarchy_year)
 
 logger = logging.getLogger(__name__)
@@ -175,7 +176,7 @@ def _union_over_years(build_url, key: str, fin_year: str | None) -> list:
             # union on the raw value therefore lets 3823 and "3823" survive as
             # two entries and returns the same panchayat twice. Same
             # normalisation as config.in_scope, for the same reason.
-            seen.setdefault(str(item[key]).strip(), item)
+            seen.setdefault(gp_key(item[key]), item)
     return list(seen.values())
 
 
