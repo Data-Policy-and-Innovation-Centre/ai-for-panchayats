@@ -41,8 +41,6 @@ def get_funds(gp_id, fin_year):
     )
     
     data = fetch_json(url, headers=HEADERS)
-    if not data:
-        return []
     return response_field(data, "funds", url, f"GP {gp_id} {fin_year}")
 
 def main():

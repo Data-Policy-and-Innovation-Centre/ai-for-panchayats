@@ -80,4 +80,11 @@ directly.
 * **What it does:** The most detailed tracker. It unpacks deeply nested project metrics, breaking down expected vs. actual costs, completion statuses, unit metrics, and physical asset stages. 
 
 # How to run the full pipeline:
-* python scripts/main_meri_panchayat.py
+
+```bash
+uv run python scripts/main_meri_panchayat.py
+```
+
+Without `uv run`, the system interpreter gets `scripts/` on its import path
+and not the src layout, so this fails immediately with `ModuleNotFoundError:
+ingest`. See the run instructions above for the per-stage form.

@@ -27,8 +27,6 @@ def get_beneficiaries(gp_id, fin_year):
         "localBodyCode":     gp_id,
     }
     data = fetch_json_post(url, headers=HEADERS, payload=payload)
-    if not data:
-        return []
     return response_field(data, "schms", url, f"GP {gp_id} {fin_year}")
 
 def main():
