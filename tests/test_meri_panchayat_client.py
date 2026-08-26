@@ -290,3 +290,33 @@ def test_an_empty_identifier_raises(monkeypatch, empty_id):
     with pytest.raises(FetchError, match="is empty"):
         get_blocks(321, "2024-2025")
 
+
+def test_a_checkpoint_does_not_overwrite_the_canonical_output(tmp_path):
+    """A stage that fails after checkpointing must not leave a partial artifact
+    under the name everything downstream reads."""
+    import pandas as pd
+
+    final = tmp_path / "activities.json"
+    save_outputs(pd.DataFrame([{"gp_id": 1}, {"gp_id": 2}]), json_path=final)
+    assert len(pd.read_json(final)) == 2
+
+    save_outputs(pd.DataFrame([{"gp_id": 9}]), json_path=final, checkpoint=True)
+
+    assert len(pd.read_json(final)) == 2, "the checkpoint replaced the real output"
+    assert (tmp_path / "activities.json.partial").exists()
+
+
+def test_a_final_save_promotes_the_run_and_clears_the_partial(tmp_path):
+    import pandas as pd
+
+    final = tmp_path / "activities.json"
+    partial = tmp_path / "activities.json.partial"
+
+    save_outputs(pd.DataFrame([{"gp_id": 1}]), json_path=final, checkpoint=True)
+    assert partial.exists()
+
+    save_outputs(pd.DataFrame([{"gp_id": 1}, {"gp_id": 2}]), json_path=final)
+
+    assert len(pd.read_json(final)) == 2
+    assert not partial.exists(), "a completed run left its partial behind"
+
