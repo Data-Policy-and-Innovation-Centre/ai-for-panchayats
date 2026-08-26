@@ -320,3 +320,36 @@ def test_a_final_save_promotes_the_run_and_clears_the_partial(tmp_path):
     assert len(pd.read_json(final)) == 2
     assert not partial.exists(), "a completed run left its partial behind"
 
+
+def test_a_failing_final_save_leaves_the_previous_output_intact(tmp_path, monkeypatch):
+    """A direct write truncates the canonical file the instant it opens.
+
+    The checkpoint sidecar protects mid-run saves; without an atomic promote
+    the final save reintroduced the same data loss, so an interrupt or a full
+    disk destroyed the last good output.
+    """
+    import pandas as pd
+
+    final = tmp_path / "activities.json"
+    save_outputs(pd.DataFrame([{"gp_id": "previous complete run"}]), json_path=final)
+
+    def boom(self, *a, **k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(pd.DataFrame, "to_json", boom)
+
+    with pytest.raises(OSError):
+        save_outputs(pd.DataFrame([{"gp_id": "new run"}]), json_path=final)
+
+    assert pd.read_json(final).iloc[0]["gp_id"] == "previous complete run"
+
+
+def test_the_final_save_leaves_no_temporary_behind(tmp_path):
+    import pandas as pd
+
+    final = tmp_path / "activities.json"
+    save_outputs(pd.DataFrame([{"gp_id": 1}]), json_path=final)
+
+    assert final.exists()
+    assert not (tmp_path / "activities.json.tmp").exists()
+

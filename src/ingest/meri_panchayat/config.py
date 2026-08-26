@@ -82,13 +82,28 @@ def _strict_bool(value, key: str) -> bool:
 ALL_GPS = _strict_bool(_cfg.get("all_gps", False), "all_gps")
 TARGET_GPS = _cfg.get("target_gps") or []
 TARGET_GP_IDS = frozenset(gp["gp_code"] for gp in TARGET_GPS)
+TARGET_GP_KEYS = frozenset(str(gp["gp_code"]).strip() for gp in TARGET_GPS)
+
+
+def _gp_key(gp_id) -> str:
+    """One comparable form for a GP id, whatever the portal sent."""
+    return str(gp_id).strip()
 
 
 def in_scope(gp_id) -> bool:
-    """True when this GP should be scraped under the configured pilot scope."""
+    """True when this GP should be scraped under the configured pilot scope.
+
+    The comparison is on normalised ids because the two sides come from
+    different places: the targets are YAML integers, while the hierarchy
+    endpoint may serialise `gpId` either way and has no obligation to be
+    consistent about it. A raw `in` against a frozenset of ints silently
+    matched nothing the moment the API sent strings, and "nothing is in scope"
+    is indistinguishable from "the pilot has no GPs here" -- every adapter
+    would publish an empty output and the pipeline would report success.
+    """
     if ALL_GPS:
         return True
-    return gp_id in TARGET_GP_IDS
+    return _gp_key(gp_id) in TARGET_GP_KEYS
 
 
 SAVE_EVERY_GP = _cfg["save_every_gp"]
