@@ -97,8 +97,10 @@ else
   printf '%s\n' "$sse_out" >&2
   exit 1
 fi
-if [ "$current_sse" = "aws:kms" ]; then
-  echo "keeping existing SSE-KMS encryption (stronger than this baseline)"
+# aws:kms:dsse is dual-layer KMS; an exact match on aws:kms alone would replace
+# it with AES256 and strip both the CMK controls and the second layer.
+if [ "$current_sse" = "aws:kms" ] || [ "$current_sse" = "aws:kms:dsse" ]; then
+  echo "keeping existing $current_sse encryption (stronger than this baseline)"
 else
   aws_s3 put-bucket-encryption --bucket "$BUCKET" \
     --server-side-encryption-configuration \
@@ -122,26 +124,64 @@ fi
 
 # 6. A Sid substring match would accept a statement whose effect was flipped or
 #    whose condition was dropped, then report the bucket as TLS-only.
-if printf '%s' "$current_policy" | python3 -c '
-import json, sys
+if printf '%s' "$current_policy" | BUCKET="$BUCKET" python3 -c '
+import json, os, sys
+
+# Accepts any policy that genuinely denies plaintext access to the whole
+# bucket, including legal encodings other than the one this script writes:
+# a list-valued condition, Action "*", and the bucket and object ARNs split
+# across separate Deny statements. Rejecting those would block the bootstrap
+# permanently on a correctly configured bucket.
+bucket = os.environ["BUCKET"]
+required = {f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"}
+
+
+def listify(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
 try:
     doc = json.load(sys.stdin)
 except ValueError:
     sys.exit(1)
+
+covered = set()
 for st in doc.get("Statement", []):
-    if (
-        st.get("Effect") == "Deny"
-        and st.get("Condition", {}).get("Bool", {}).get("aws:SecureTransport") in ("false", False)
-        and "s3:*" in (st.get("Action") if isinstance(st.get("Action"), list) else [st.get("Action")])
-    ):
-        sys.exit(0)
-sys.exit(1)
+    if st.get("Effect") != "Deny" or "NotPrincipal" in st or "NotAction" in st:
+        continue
+    actions = set(listify(st.get("Action")))
+    if not ({"s3:*", "*"} & actions):
+        continue
+    # A deny scoped to one principal leaves every other caller free to use
+    # plain HTTP, so only the universal principal counts.
+    principal = st.get("Principal")
+    universal = principal == "*" or (
+        isinstance(principal, dict) and "*" in listify(principal.get("AWS"))
+    )
+    if not universal:
+        continue
+    # Any condition beyond the transport test narrows when the deny applies.
+    condition = st.get("Condition", {})
+    if set(condition) != {"Bool"} or set(condition["Bool"]) != {"aws:SecureTransport"}:
+        continue
+    values = {str(v).lower() for v in listify(condition["Bool"]["aws:SecureTransport"])}
+    if values != {"false"}:
+        continue
+    covered |= set(listify(st.get("Resource")))
+
+sys.exit(0 if required.issubset(covered) else 1)
 '; then
   echo "keeping existing bucket policy (already denies insecure transport)"
 elif [ -n "$current_policy" ]; then
-  echo "WARNING: s3://$BUCKET has a bucket policy without DenyInsecureTransport." >&2
-  echo "Refusing to replace it. Add the statement manually, then re-run." >&2
-  exit 1
+  echo "WARNING: s3://$BUCKET has a bucket policy this script cannot confirm denies" >&2
+  echo "plaintext access to the whole bucket. It will not be replaced -- it may carry" >&2
+  echo "statements this script knows nothing about." >&2
+  echo "Add an equivalent DenyInsecureTransport statement, or set" >&2
+  echo "TF_STATE_ACCEPT_POLICY=1 to proceed once you have confirmed it yourself." >&2
+  [ "${TF_STATE_ACCEPT_POLICY:-0}" = "1" ] || exit 1
+  echo "TF_STATE_ACCEPT_POLICY=1 set; continuing with the existing policy." >&2
 else
   aws_s3 put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
 {
