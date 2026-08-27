@@ -78,10 +78,15 @@ resource "aws_cloudfront_distribution" "app" {
       origin_protocol_policy = "http-only"
       origin_ssl_protocols   = ["TLSv1.2"]
 
-      # 60s is the default per-origin quota ceiling. A language-model call
-      # slower than this returns 504 at the edge; #72 should measure the
-      # tail and request a quota increase if it lands near the limit.
-      origin_read_timeout      = 60
+      # 60s is the default per-origin quota ceiling, and the binding one: the
+      # load balancer's idle_timeout is set to 120 so this is the only limit
+      # a slow language-model answer can hit. #72 should measure the tail and
+      # request a quota increase if it lands near 60s -- raising the quota
+      # alone would not have helped while idle_timeout was also 60.
+      origin_read_timeout = 60
+
+      # Strictly below the load balancer's idle_timeout, so CloudFront always
+      # retires a pooled connection first rather than racing it.
       origin_keepalive_timeout = 60
     }
 

@@ -107,6 +107,13 @@ resource "aws_lb" "main" {
   subnets            = aws_subnet.public[*].id
 
   drop_invalid_header_fields = true
+
+  # Two reasons this is not the 60s default. It must exceed CloudFront's
+  # origin_keepalive_timeout, or both ends can close a pooled connection in
+  # the same instant and the viewer gets an intermittent 502. And it is a
+  # response ceiling in its own right: at 60s it would cut off a slow
+  # language-model answer even if CloudFront's own read timeout were raised.
+  idle_timeout = 120
 }
 
 resource "aws_lb_target_group" "app" {
