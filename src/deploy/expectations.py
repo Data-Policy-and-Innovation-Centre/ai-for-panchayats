@@ -40,11 +40,16 @@ class KnownAnswerQuery:
         if not isinstance(self.sql, str) or not self.sql.strip():
             raise SnapshotManifestError(f"known-answer query {self.name!r} needs SQL")
         if self.tolerance is not None:
-            if isinstance(self.tolerance, bool) or not isinstance(self.tolerance, (int, float)):
+            # Decimal is included because loads() parses JSON numbers with
+            # parse_float=Decimal; omitting it rejects every fractional
+            # tolerance at startup.
+            if isinstance(self.tolerance, bool) or not isinstance(
+                self.tolerance, (int, float, Decimal)
+            ):
                 raise SnapshotManifestError(
                     f"known-answer query {self.name!r} tolerance must be a number or null"
                 )
-            if self.tolerance < 0 or not math.isfinite(self.tolerance):
+            if self.tolerance < 0 or not _finite(self.tolerance):
                 raise SnapshotManifestError(
                     f"known-answer query {self.name!r} tolerance must be finite and non-negative"
                 )
@@ -121,16 +126,17 @@ def loads(text: str) -> Expectations:
     return from_mapping(payload)
 
 
-def _exact(value: Any) -> Decimal | int | None:
-    """Return `value` as an exact number, or None if it is not numeric.
+def _actual_number(value: Any) -> Decimal | int | None:
+    """Return a query result as an exact number, or None if it is not numeric.
 
     Never routes through `float`. DuckDB hands back `Decimal` for a DECIMAL
     aggregate, and `float(Decimal(...))` would discard exactly the precision the
     DECIMAL cast exists to preserve -- 9007199254740993 and 9007199254740992
     collapse to the same binary64 value and would compare equal.
 
-    A JSON string is accepted so an expectations file can carry a value that
-    JSON's own number syntax cannot represent exactly.
+    A `str` result is deliberately *not* numeric here. Identifiers in this
+    warehouse are VARCHAR with meaningful leading zeros, so parsing them would
+    make "001" and "1" compare equal and let a wrong code pass the gate.
     """
     if isinstance(value, bool) or value is None:
         return None
@@ -138,6 +144,19 @@ def _exact(value: Any) -> Decimal | int | None:
         return value
     if isinstance(value, float):
         return Decimal(repr(value))
+    return None
+
+
+def _expected_number(value: Any) -> Decimal | int | None:
+    """Same as :func:`_actual_number`, but a decimal string is allowed.
+
+    Only ever applied when the query actually returned a number, so this
+    cannot turn a textual comparison into a numeric one. It exists because
+    JSON's number syntax cannot carry an exact high-precision decimal.
+    """
+    number = _actual_number(value)
+    if number is not None:
+        return number
     if isinstance(value, str):
         try:
             return Decimal(value)
@@ -146,8 +165,21 @@ def _exact(value: Any) -> Decimal | int | None:
     return None
 
 
-def _is_finite(value: Decimal | int) -> bool:
-    return not isinstance(value, Decimal) or value.is_finite()
+def _as_decimal(value: Decimal | int | float) -> Decimal:
+    """Exact Decimal for arithmetic. repr() on a Decimal is not parseable."""
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    return Decimal(repr(value))
+
+
+def _finite(value: Any) -> bool:
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return True
 
 
 def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str | None:
@@ -159,16 +191,22 @@ def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str
         if len(got_row) != len(want_row):
             return f"row {row_index} has {len(got_row)} columns, expected {len(want_row)}"
         for col_index, (got, want) in enumerate(zip(got_row, want_row)):
-            got_num, want_num = _exact(got), _exact(want)
-            if got_num is None or want_num is None:
+            got_num = _actual_number(got)
+            if got_num is None:
+                # Not a number from the database: compare exactly as returned,
+                # so textual codes keep their leading zeros and formatting.
                 if got != want:
                     return f"row {row_index} column {col_index}: {got!r} != {want!r}"
                 continue
 
+            want_num = _expected_number(want)
+            if want_num is None:
+                return f"row {row_index} column {col_index}: {got!r} != {want!r}"
+
             # NaN fails every comparison, so `abs(NaN - x) > tolerance` is
             # False and a non-finite aggregate would sail through a tolerant
             # check. Reject it before comparing rather than after.
-            if not _is_finite(got_num) or not _is_finite(want_num):
+            if not _finite(got_num) or not _finite(want_num):
                 return (
                     f"row {row_index} column {col_index}: non-finite value "
                     f"{got_num} (expected {want_num})"
@@ -177,7 +215,7 @@ def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str
             if query.tolerance is None:
                 if got_num != want_num:
                     return f"row {row_index} column {col_index}: {got_num} != {want_num} (exact)"
-            elif abs(Decimal(got_num) - Decimal(want_num)) > Decimal(repr(query.tolerance)):
+            elif abs(_as_decimal(got_num) - _as_decimal(want_num)) > _as_decimal(query.tolerance):
                 return (
                     f"row {row_index} column {col_index}: |{got_num} - {want_num}| "
                     f"> {query.tolerance}"

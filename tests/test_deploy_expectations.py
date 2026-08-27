@@ -98,3 +98,41 @@ def test_tolerance_must_be_finite_and_non_negative():
     for bad in (-1, float("nan"), float("inf")):
         with pytest.raises(SnapshotManifestError, match="finite and non-negative"):
             KnownAnswerQuery(name="p", sql="SELECT 1", expected=((1,),), tolerance=bad)
+
+
+def test_a_fractional_tolerance_survives_json_loading():
+    """parse_float=Decimal yields a Decimal tolerance; it must be accepted."""
+    payload = (
+        '{"schema_version": 1, "relation_row_counts": {}, "known_answer_queries": '
+        '[{"name": "t", "sql": "SELECT 1", "expected": [[1.0]], "tolerance": 0.1}]}'
+    )
+    query = loads(payload).queries[0]
+
+    assert isinstance(query.tolerance, Decimal)
+    assert query.tolerance == Decimal("0.1")
+
+    # And it still bounds drift once loaded.
+    _check([(1.05,)], ((1.0,),), tolerance=query.tolerance)
+    with pytest.raises(KnownAnswerError):
+        _check([(1.5,)], ((1.0,),), tolerance=query.tolerance)
+
+
+def test_textual_results_keep_leading_zeros():
+    """Identifiers here are VARCHAR with meaningful leading zeros."""
+    with pytest.raises(KnownAnswerError, match="probe"):
+        _check([("001",)], (("1",),))
+
+    _check([("001",)], (("001",),))
+
+
+def test_a_numeric_result_still_accepts_an_exact_decimal_string():
+    """The string form exists because JSON cannot carry this exactly."""
+    _check([(Decimal("455046197982.4700"),)], (("455046197982.47",),))
+
+    with pytest.raises(KnownAnswerError, match="probe"):
+        _check([(Decimal("455046197982.4700"),)], (("455046197982.48",),))
+
+
+def test_a_numeric_result_against_non_numeric_text_is_a_mismatch():
+    with pytest.raises(KnownAnswerError, match="probe"):
+        _check([(Decimal("1"),)], (("not-a-number",),))
