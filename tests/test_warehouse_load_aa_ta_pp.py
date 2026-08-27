@@ -260,6 +260,31 @@ def test_child_orphan_parent_is_typed_and_can_be_quarantined(tmp_path: Path):
     )
     assert frame.empty
     assert audit.quarantined[0].reason_code == "orphan_parent_row_id"
+    quarantine = audit.quarantine_frame(
+        source_system="egramswaraj", source_run_id="synthetic-run-1"
+    )
+    assert list(quarantine.columns) == [
+        "source_system",
+        "source_run_id",
+        "table_name",
+        "reason_code",
+        "reason",
+        "key_column",
+        "key_value",
+        "row_count",
+    ]
+    assert quarantine.to_dict("records") == [
+        {
+            "source_system": "egramswaraj",
+            "source_run_id": "synthetic-run-1",
+            "table_name": "admin_approval_scheme",
+            "reason_code": "orphan_parent_row_id",
+            "reason": "parent_row_id does not resolve to admin_approval",
+            "key_column": "parent_row_id",
+            "key_value": "missing-parent",
+            "row_count": 1,
+        }
+    ]
 
 
 def test_child_parent_activity_mismatch_is_typed(tmp_path: Path):

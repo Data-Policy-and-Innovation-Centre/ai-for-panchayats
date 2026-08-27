@@ -16,11 +16,11 @@ an unrelated hash.  ``source_record_id`` records the root source identity
 source/run/schema fields come from :class:`warehouse.load_common.ProvenanceSpec`.
 
 ``iter_*`` functions are the production interface.  They materialise one
-pandas frame per requested chunk and retain only bounded validation state
-(seen identifiers and reference indexes).  ``load_*`` functions are small
-convenience wrappers for tests and pilot-scale callers that explicitly want
-one concatenated frame.  No function discovers files or auto-detects a CSV
-schema.
+pandas frame per requested chunk and retain source-payload-free validation
+state (seen identifiers and reference indexes); those indexes grow with the
+number of unique keys.  ``load_*`` functions are small convenience wrappers
+for tests and pilot-scale callers that explicitly want one concatenated frame.
+No function discovers files or auto-detects a CSV schema.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 import pandas as pd
 
@@ -242,6 +242,7 @@ class QuarantineRecord:
 
     table: str
     reason_code: str
+    reason: str
     key_column: str
     key_value: str
     row_count: int = 1
@@ -249,7 +250,19 @@ class QuarantineRecord:
 
 @dataclass
 class LoaderAudit:
-    """Bounded counters, indexes, and typed quarantine records for one stream."""
+    """Counters and identity/reference indexes for one stream.
+
+    The indexes intentionally grow with the number of unique keys so
+    cross-chunk validation remains fail-closed, but they retain no raw source
+    payload rows.
+    """
+
+    _REASONS: ClassVar[dict[str, str]] = {
+        "duplicate_row_id": "row_id is duplicated or collides with a parent identity",
+        "orphan_activity": "activity_code does not resolve to planned_activity",
+        "orphan_parent_row_id": "parent_row_id does not resolve to admin_approval",
+        "parent_activity_mismatch": "activity_code does not match the parent activity",
+    }
 
     rows_read: int = 0
     rows_loaded: int = 0
@@ -261,6 +274,7 @@ class LoaderAudit:
     def add_quarantine(
         self, *, table: str, reason_code: str, key_column: str, key_value: object
     ) -> None:
+        reason = self._REASONS.get(reason_code, "row rejected by source validation")
         rendered = "<null>" if key_value is None else str(key_value)
         for index, record in enumerate(self.quarantined):
             if (
@@ -272,13 +286,20 @@ class LoaderAudit:
                 self.quarantined[index] = QuarantineRecord(
                     table=record.table,
                     reason_code=record.reason_code,
+                    reason=record.reason,
                     key_column=record.key_column,
                     key_value=record.key_value,
                     row_count=record.row_count + 1,
                 )
                 return
         self.quarantined.append(
-            QuarantineRecord(table, reason_code, key_column, rendered)
+            QuarantineRecord(
+                table=table,
+                reason_code=reason_code,
+                reason=reason,
+                key_column=key_column,
+                key_value=rendered,
+            )
         )
 
     def quarantine_frame(
@@ -289,6 +310,7 @@ class LoaderAudit:
             "source_run_id",
             "table_name",
             "reason_code",
+            "reason",
             "key_column",
             "key_value",
             "row_count",
@@ -299,6 +321,7 @@ class LoaderAudit:
                 "source_run_id": source_run_id,
                 "table_name": record.table,
                 "reason_code": record.reason_code,
+                "reason": record.reason,
                 "key_column": record.key_column,
                 "key_value": record.key_value,
                 "row_count": record.row_count,
@@ -1196,8 +1219,9 @@ def load_aa_ta_pp(
 
     This convenience function materialises frames.  A production build that
     writes batches should call the four ``iter_*`` functions instead, first
-    exhausting AA into a bounded :class:`ApprovalParentIndex`, then streaming
-    the child and the two activity-referencing sources.
+    exhausting AA into a source-payload-free :class:`ApprovalParentIndex`,
+    then streaming the child and the two activity-referencing sources.  The
+    parent index grows with the number of unique parent keys.
     """
 
     allowed = _ensure_activity_set(activity_codes)
