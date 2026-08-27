@@ -9,8 +9,15 @@
 # DynamoDB table on Terraform >= 1.10.
 set -euo pipefail
 
-BUCKET="${TF_STATE_BUCKET:-dpic-prdw-tfstate}"
-REGION="${AWS_REGION:-ap-south-1}"
+# These defaults must match the backend block in snapshot/versions.tf. A
+# Terraform backend cannot read variables, so an override here cannot reach it
+# automatically -- the script prints the required init flags instead of
+# reporting success against a bucket Terraform will never use.
+DEFAULT_BUCKET="dpic-prdw-tfstate"
+DEFAULT_REGION="ap-south-1"
+
+BUCKET="${TF_STATE_BUCKET:-$DEFAULT_BUCKET}"
+REGION="${AWS_REGION:-$DEFAULT_REGION}"
 
 if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
   echo "bucket $BUCKET already exists"
@@ -56,3 +63,17 @@ POLICY
 )"
 
 echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted, TLS-only)"
+
+if [ "$BUCKET" != "$DEFAULT_BUCKET" ] || [ "$REGION" != "$DEFAULT_REGION" ]; then
+  cat <<NOTE
+
+WARNING: you overrode the defaults, but snapshot/versions.tf hard-codes
+  bucket = "$DEFAULT_BUCKET"
+  region = "$DEFAULT_REGION"
+A backend block cannot read variables, so \`terraform init\` would target those
+and ignore the bucket this script just prepared. Initialise with:
+
+  terraform -chdir=snapshot init -reconfigure -backend-config="bucket=$BUCKET" -backend-config="region=$REGION"
+
+NOTE
+fi

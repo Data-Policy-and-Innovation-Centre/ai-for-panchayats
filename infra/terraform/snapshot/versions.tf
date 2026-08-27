@@ -9,7 +9,11 @@ terraform {
   }
 
   # State locking uses S3 conditional writes, so no DynamoDB table is needed.
-  # The bucket itself is created by ../bootstrap_state_bucket.sh.
+  # The bucket itself is created by ../bootstrap_state_bucket.sh, whose
+  # DEFAULT_BUCKET and DEFAULT_REGION must match the two values below. A
+  # backend block cannot read variables, so overriding TF_STATE_BUCKET or
+  # AWS_REGION there requires matching -backend-config flags at init; the
+  # script prints the exact command when it detects an override.
   backend "s3" {
     bucket       = "dpic-prdw-tfstate"
     key          = "prdw/snapshot/terraform.tfstate"
