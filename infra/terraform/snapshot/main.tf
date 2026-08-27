@@ -9,12 +9,18 @@
 # version; rollback selects a prior version. Versioning is therefore load
 # bearing, not merely a safety net.
 
-data "aws_caller_identity" "current" {}
-
 resource "aws_kms_key" "snapshots" {
   description             = "Encrypts Odisha PR&DW deployable DuckDB snapshots"
   enable_key_rotation     = true
   deletion_window_in_days = 30
+
+  # Destroying the key schedules its deletion while the encrypted objects
+  # survive, so the entire 180-day rollback window below becomes permanently
+  # undecryptable once the window elapses. Removing the snapshots has to be a
+  # deliberate two-step act, not a side effect of `terraform destroy`.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_kms_alias" "snapshots" {
@@ -24,6 +30,12 @@ resource "aws_kms_alias" "snapshots" {
 
 resource "aws_s3_bucket" "snapshots" {
   bucket = var.snapshot_bucket_name
+
+  # Holds the only deployable copy of the ~1 GB artifact and every rollback
+  # target; recreating it would not bring those versions back.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "snapshots" {
