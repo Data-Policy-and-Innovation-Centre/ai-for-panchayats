@@ -16,6 +16,21 @@ in a private S3 object beside the artifact, named by the manifest's
 `expectations_key`, and are fetched at startup. `fetch_snapshot` applies them
 with the same fail-closed semantics as the hash check.
 
+## Uploading
+
+The bucket policy denies any upload that does not name the snapshot CMK
+explicitly, so a bare `aws s3 cp` fails with `AccessDenied`. Pass the key:
+
+```bash
+aws s3 cp "$ARTIFACT" s3://dpic-prdw-snapshots/duckdb/<name>.duckdb \
+  --region ap-south-1 --sse aws:kms --sse-kms-key-id alias/dpic-prdw-snapshots
+```
+
+Then record the returned `VersionId` in a manifest. The expectations object is
+uploaded the same way and its own `VersionId` is pinned as
+`expectations_version_id`, so a manifest describes its gate exactly and a
+rollback cannot be validated against a newer contract.
+
 ## Republishing
 
 Snapshot objects are never mutated in place. A new artifact means a new object
