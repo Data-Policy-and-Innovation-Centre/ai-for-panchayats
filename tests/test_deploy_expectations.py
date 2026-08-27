@@ -84,7 +84,7 @@ def test_non_finite_results_are_rejected_even_with_a_tolerance(bad):
 
 def test_a_tolerance_still_bounds_drift():
     _check([(5.05,)], ((5.0,),), tolerance=0.1)
-    with pytest.raises(KnownAnswerError, match=r"> 0.01"):
+    with pytest.raises(KnownAnswerError, match="tolerance"):
         _check([(5.05,)], ((5.0,),), tolerance=0.01)
 
 
@@ -180,3 +180,26 @@ def test_a_nan_tolerance_raises_a_typed_error():
     """Ordering a Decimal NaN raises InvalidOperation unless finiteness wins."""
     with pytest.raises(SnapshotManifestError, match="finite and non-negative"):
         KnownAnswerQuery(name="p", sql="SELECT 1", expected=((1,),), tolerance=Decimal("NaN"))
+
+
+def test_failure_messages_never_echo_values():
+    """Expected values are protected aggregates; actuals come from the warehouse.
+
+    Neither may reach a task log, which `scripts/fetch_snapshot.py` prints to.
+    """
+    secret_expected = 455046197982
+    secret_actual = 78053445024
+
+    with pytest.raises(KnownAnswerError) as exc:
+        _check([(secret_actual,)], ((secret_expected,),))
+    message = str(exc.value)
+    assert str(secret_expected) not in message
+    assert str(secret_actual) not in message
+    assert "probe" in message  # the check is still identifiable
+
+    with pytest.raises(KnownAnswerError) as exc:
+        verify(FakeConn([(secret_actual,)]), Expectations(relation_row_counts={"voucher": 12}))
+    message = str(exc.value)
+    assert str(secret_actual) not in message
+    assert "12" not in message
+    assert "voucher" in message

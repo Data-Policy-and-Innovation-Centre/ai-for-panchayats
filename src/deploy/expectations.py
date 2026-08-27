@@ -214,40 +214,37 @@ def _finite(value: Any) -> bool:
 def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str | None:
     """Return a human-readable mismatch, or None when the rows agree."""
     if len(actual) != len(query.expected):
-        return f"returned {len(actual)} rows, expected {len(query.expected)}"
+        return "returned a different number of rows than expected"
 
     for row_index, (got_row, want_row) in enumerate(zip(actual, query.expected)):
         if len(got_row) != len(want_row):
-            return f"row {row_index} has {len(got_row)} columns, expected {len(want_row)}"
+            return f"row {row_index} has a different number of columns than expected"
         for col_index, (got, want) in enumerate(zip(got_row, want_row)):
             got_num = _actual_number(got)
             if got_num is None:
                 # Not a number from the database: compare exactly as returned,
                 # so textual codes keep their leading zeros and formatting.
                 if got != want:
-                    return f"row {row_index} column {col_index}: {got!r} != {want!r}"
+                    return f"row {row_index} column {col_index} does not match"
                 continue
 
             want_num = _expected_number(want)
             if want_num is None:
-                return f"row {row_index} column {col_index}: {got!r} != {want!r}"
+                return f"row {row_index} column {col_index} does not match (expected a number)"
 
             # NaN fails every comparison, so `abs(NaN - x) > tolerance` is
             # False and a non-finite aggregate would sail through a tolerant
             # check. Reject it before comparing rather than after.
             if not _finite(got_num) or not _finite(want_num):
-                return (
-                    f"row {row_index} column {col_index}: non-finite value "
-                    f"{got_num} (expected {want_num})"
-                )
+                return f"row {row_index} column {col_index} is non-finite"
 
             if query.tolerance is None:
                 if got_num != want_num:
-                    return f"row {row_index} column {col_index}: {got_num} != {want_num} (exact)"
+                    return f"row {row_index} column {col_index} does not match exactly"
             elif abs(_as_decimal(got_num) - _as_decimal(want_num)) > _as_decimal(query.tolerance):
                 return (
-                    f"row {row_index} column {col_index}: |{got_num} - {want_num}| "
-                    f"> {query.tolerance}"
+                    f"row {row_index} column {col_index} differs by more than the "
+                    "stated tolerance"
                 )
     return None
 
@@ -257,15 +254,17 @@ def verify(conn: Any, expectations: Expectations, *, catalog: str = "snap") -> N
 
     `conn` is an open DuckDB connection with the snapshot attached read-only as
     `catalog`. Raises :class:`KnownAnswerError` on the first failure, naming the
-    check but never echoing source rows.
+    check and the coordinates of the mismatch but never the values.
+
+    The expected values are derived from protected source data and the actual
+    ones come from the warehouse, so neither may reach a task log. An operator
+    who needs the numbers can read the private expectations object directly.
     """
     for relation, expected_count in sorted(expectations.relation_row_counts.items()):
         quoted = relation.replace('"', '""')
         actual = conn.execute(f'SELECT count(*) FROM "{catalog}"."{quoted}"').fetchone()[0]
         if int(actual) != expected_count:
-            raise KnownAnswerError(
-                f"{relation} has {actual} rows, expected {expected_count}"
-            )
+            raise KnownAnswerError(f"{relation} row count does not match the expectations object")
 
     for query in expectations.queries:
         rows = conn.execute(query.sql).fetchall()

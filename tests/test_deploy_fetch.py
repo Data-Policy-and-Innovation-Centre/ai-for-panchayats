@@ -209,7 +209,7 @@ def test_row_count_expectations_gate_publication(deployment):
     manifest, s3, destination = deployment
     wrong = Expectations(relation_row_counts={"gram_panchayat": 999})
 
-    with pytest.raises(KnownAnswerError, match="gram_panchayat has 3 rows, expected 999"):
+    with pytest.raises(KnownAnswerError, match="gram_panchayat row count does not match"):
         fetch_snapshot(manifest, destination, s3_client=s3, expectations=wrong)
 
     assert not destination.exists()
@@ -241,7 +241,7 @@ def test_known_answer_money_totals_honour_the_stated_contract(deployment):
             ),
         ),
     )
-    with pytest.raises(KnownAnswerError, match=r"plan_total.*> 0.01"):
+    with pytest.raises(KnownAnswerError, match=r"plan_total.*tolerance"):
         fetch_snapshot(manifest, destination, s3_client=s3, expectations=too_tight)
     assert not destination.exists()
 
@@ -413,3 +413,49 @@ def test_snapshot_identity_defaults_to_the_conservative_reading():
     )
     assert identity.aggregates_verified is False
     assert "aggregates=SKIPPED" in identity.describe()
+
+
+def test_a_broken_gate_query_does_not_leak_its_sql(deployment):
+    """The gate SQL lives in the private expectations object; logs are public."""
+    manifest, s3, destination = deployment
+    secret_sql = "SELECT secret_column FROM snap.no_such_table"
+    broken = Expectations(
+        relation_row_counts={},
+        queries=(KnownAnswerQuery(name="probe", sql=secret_sql, expected=((1,),)),),
+    )
+
+    with pytest.raises(KnownAnswerError) as exc:
+        fetch_snapshot(manifest, destination, s3_client=s3, expectations=broken)
+
+    assert "secret_column" not in str(exc.value)
+    assert "no_such_table" not in str(exc.value)
+    assert not destination.exists()
+
+
+def test_non_utf8_expectations_raise_a_typed_error(deployment):
+    from src.deploy.errors import SnapshotManifestError
+
+    manifest, s3, _destination = deployment
+    key = "duckdb/bad.json"
+    s3.put(BUCKET, key, "v1", b"\xff\xfe not utf-8")
+    pinned = replace(manifest, expectations_key=key, expectations_version_id="v1")
+
+    with pytest.raises(SnapshotManifestError, match="not UTF-8"):
+        load_expectations(s3, pinned)
+
+
+def test_a_local_write_failure_is_a_storage_error_not_an_s3_outage(deployment, monkeypatch):
+    """Otherwise a full task volume sends an operator to IAM and bucket policy."""
+    manifest, s3, destination = deployment
+    real_open = open
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if "w" in mode:
+            raise OSError(28, "No space left on device")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("src.deploy.fetch.open", failing_open, raising=False)
+    with pytest.raises(SnapshotStorageError, match="cannot write the snapshot"):
+        fetch_snapshot(manifest, destination, s3_client=s3)
+
+    assert not destination.exists()

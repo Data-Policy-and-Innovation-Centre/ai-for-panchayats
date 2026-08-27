@@ -45,11 +45,17 @@ DEFAULT_STORAGE_HEADROOM = 2.2
 
 
 def _s3_error_types() -> tuple[type[BaseException], ...]:
+    """Errors that genuinely mean "S3 could not serve this".
+
+    OSError is excluded on purpose: a full or read-only task volume reported as
+    SnapshotUnavailableError sends an operator to bucket policy and IAM for a
+    local storage problem.
+    """
     try:
         from botocore.exceptions import BotoCoreError, ClientError
     except ImportError:  # pragma: no cover - boto3 is a declared dependency
-        return (OSError,)
-    return (BotoCoreError, ClientError, OSError)
+        return ()
+    return (BotoCoreError, ClientError)
 
 
 _S3_ERRORS = _s3_error_types()
@@ -127,6 +133,10 @@ def _download(s3_client: Any, manifest: SnapshotManifest, target: Path) -> None:
         raise SnapshotUnavailableError(
             f"download of {manifest.identity} failed: {exc}"
         ) from exc
+    except OSError as exc:
+        raise SnapshotStorageError(
+            f"cannot write the snapshot to {target}: {exc}"
+        ) from exc
 
 
 def _verify_contents(
@@ -171,8 +181,11 @@ def _run_expectations(conn: Any, expectations: Expectations) -> None:
     except SnapshotError:
         raise
     except Exception as exc:
+        # Deliberately no exception text: DuckDB quotes the failing statement
+        # in full, and the gate SQL lives in the private expectations object.
         raise KnownAnswerError(
-            f"expectations could not be evaluated against the snapshot: {exc}"
+            "expectations could not be evaluated against the snapshot; the gate SQL "
+            "is not valid for this artifact"
         ) from exc
 
 
@@ -193,7 +206,14 @@ def load_expectations(s3_client: Any, manifest: SnapshotManifest) -> Expectation
         raise SnapshotUnavailableError(
             f"cannot read expectations at s3://{manifest.bucket}/{manifest.expectations_key}: {exc}"
         ) from exc
-    return expectations_module.loads(body.decode("utf-8"))
+
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SnapshotManifestError(
+            f"expectations at s3://{manifest.bucket}/{manifest.expectations_key} are not UTF-8"
+        ) from exc
+    return expectations_module.loads(text)
 
 
 def fetch_snapshot(
