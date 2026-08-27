@@ -224,6 +224,20 @@ def _is_blank(value: object) -> bool:
     return False
 
 
+def _is_bool_scalar(value: object) -> bool:
+    """Return whether *value* is a Python or NumPy boolean scalar.
+
+    ``numpy.bool_`` is deliberately not a ``bool`` subclass and is not part
+    of ``numbers.Number``.  Pandas exposes the scalar predicate we need while
+    allowing this module to avoid a direct NumPy dependency.
+    """
+
+    try:
+        return bool(pd.api.types.is_bool(value))
+    except (TypeError, ValueError):
+        return isinstance(value, bool)
+
+
 def _source_blank_mask(series: pd.Series) -> pd.Series:
     """Mask null/empty/whitespace-only values in a source column."""
 
@@ -309,6 +323,56 @@ def _csv_dtype(
     return {name: dtype.get(name, "string") for name in header}
 
 
+def _validate_csv_field_counts(
+    path: Path,
+    *,
+    expected_field_count: int,
+    encoding: str,
+    delimiter: str,
+) -> None:
+    """Validate every CSV record has the header's field count.
+
+    Pandas' C engine can infer a leading field as an index when the first
+    data record has too many fields.  In chunked mode that turns
+    ``id,value`` plus ``0123,a,EXTRA`` into ``id=a, value=EXTRA`` instead of
+    raising, while later malformed records may raise normally.  A streaming
+    ``csv.reader`` pass makes that inference impossible: each record is
+    checked before pandas is allowed to materialise any chunk.  The reader
+    retains only the current CSV record, so validation remains bounded by the
+    largest record (including a quoted embedded-newline record), not the file
+    size.
+
+    A physically blank line is retained by the pandas call below because
+    ``skip_blank_lines=False`` is part of this loader's contract.  The CSV
+    reader represents it as an empty record, which pandas expands to empty
+    fields, so it is the one intentional exception to exact field counting.
+    """
+
+    try:
+        with path.open("r", encoding=encoding, newline="") as handle:
+            reader = csv.reader(handle, delimiter=delimiter, strict=True)
+            header = next(reader, None)
+            if header is None:
+                raise CsvSchemaError(f"CSV has no header: {path}")
+            if len(header) != expected_field_count:
+                raise CsvSchemaError(
+                    f"{path}: header has {len(header)} fields; "
+                    f"expected {expected_field_count}"
+                )
+            for record_number, row in enumerate(reader, start=2):
+                if not row:
+                    continue
+                if len(row) != expected_field_count:
+                    raise CsvSchemaError(
+                        f"{path}: row {record_number} has {len(row)} fields; "
+                        f"expected {expected_field_count}"
+                    )
+    except CsvSchemaError:
+        raise
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise CsvSchemaError(f"cannot validate CSV field counts in {path}: {exc}") from exc
+
+
 def read_csv_chunks(
     path: str | Path,
     *,
@@ -348,6 +412,12 @@ def read_csv_chunks(
         expected=expected_columns,
         source=str(csv_path),
     )
+    _validate_csv_field_counts(
+        csv_path,
+        expected_field_count=len(header),
+        encoding=encoding,
+        delimiter=delimiter,
+    )
     read_dtype = _csv_dtype(header, dtype)
     try:
         reader = pd.read_csv(
@@ -361,6 +431,11 @@ def read_csv_chunks(
             skip_blank_lines=False,
             engine="c",
             on_bad_lines="error",
+            # Keep pandas from treating an over-wide first row as an implicit
+            # index.  The streaming field-count pass above rejects that row;
+            # this option preserves the same positional semantics for valid
+            # rows and makes the invariant explicit to future maintainers.
+            index_col=False,
         )
     except (OSError, UnicodeError, ValueError, pd.errors.ParserError) as exc:
         raise CsvSchemaError(f"cannot open CSV {csv_path}: {exc}") from exc
@@ -555,7 +630,7 @@ def _decimal_from_value(
             row=row,
             detail="is blank but null is not allowed",
         )
-    if isinstance(value, bool):
+    if _is_bool_scalar(value):
         raise MoneyParseError(
             column=column, value=value, row=row, detail="boolean values are not money"
         )
@@ -734,7 +809,7 @@ def clean_identifier(
         if allow_null:
             return None
         raise IdentifierError(f"{column!r} at row {row!r}: identifier is blank")
-    if isinstance(value, bool):
+    if _is_bool_scalar(value):
         raise IdentifierError(
             f"{column!r} at row {row!r}: boolean is not an identifier"
         )

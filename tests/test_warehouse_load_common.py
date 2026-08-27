@@ -54,6 +54,48 @@ def test_csv_is_read_in_explicit_bounded_chunks(tmp_path: Path):
     assert [value for chunk in chunks for value in chunk["id"]] == ["1", "2", "3"]
 
 
+@pytest.mark.parametrize(
+    ("name", "records", "bad_record_number"),
+    [
+        (
+            "first-data-row",
+            ["0123,a,EXTRA", "1,b"],
+            2,
+        ),
+        (
+            "first-row-of-next-chunk",
+            ["1,a", "2,b", "0123,a,EXTRA", "3,c"],
+            4,
+        ),
+    ],
+)
+def test_csv_rejects_extra_fields_before_any_chunk_is_yielded(
+    tmp_path: Path, name: str, records: list[str], bad_record_number: int
+):
+    path = tmp_path / f"{name}.csv"
+    path.write_text("id,value\n" + "\n".join(records) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        CsvSchemaError,
+        match=rf"row {bad_record_number} has 3 fields; expected 2",
+    ):
+        list(read_csv_chunks(path, chunksize=2))
+
+
+def test_csv_chunking_preserves_quoted_embedded_newlines(tmp_path: Path):
+    path = tmp_path / "quoted-newline-chunks.csv"
+    path.write_text(
+        'id,value\n0123,"first\nrecord"\n0124,second\n', encoding="utf-8"
+    )
+
+    chunks = list(read_csv_chunks(path, chunksize=1))
+
+    assert [row for chunk in chunks for row in chunk.to_dict("records")] == [
+        {"id": "0123", "value": "first\nrecord"},
+        {"id": "0124", "value": "second"},
+    ]
+
+
 def test_missing_and_duplicate_schema_columns_fail_before_loading(tmp_path: Path):
     missing = tmp_path / "missing.csv"
     missing.write_text("gp_code,name\n0123,Test\n", encoding="utf-8")
@@ -185,6 +227,12 @@ def test_identifier_missing_sentinels_normalize_to_none(value):
 )
 def test_nonfinite_numeric_identifier_raises_typed_error(value):
     with pytest.raises(IdentifierError):
+        clean_identifier(value)
+
+
+@pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
+def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value):
+    with pytest.raises(IdentifierError, match="boolean"):
         clean_identifier(value)
 
 
