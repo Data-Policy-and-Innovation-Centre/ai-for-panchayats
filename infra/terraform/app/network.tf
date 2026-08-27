@@ -139,7 +139,9 @@ resource "terraform_data" "public_http_acknowledged" {
     # nobody reaches it directly, so a narrowed list would be silently
     # inoperative while reading as though access were restricted.
     precondition {
-      condition     = !var.enable_cdn || var.ingress_cidrs == ["0.0.0.0/0"]
+      # toset on both sides: a bare ["0.0.0.0/0"] literal is a tuple, and a
+      # tuple never compares equal to the list(string) the variable holds.
+      condition     = !var.enable_cdn || toset(var.ingress_cidrs) == toset(["0.0.0.0/0"])
       error_message = "ingress_cidrs cannot restrict access while enable_cdn is true: viewers arrive at CloudFront, not the load balancer, so the list would do nothing. Restrict at CloudFront with a WAF IP set, or set enable_cdn=false to put the load balancer back in front."
     }
 

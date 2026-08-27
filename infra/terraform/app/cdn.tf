@@ -24,29 +24,15 @@ data "aws_cloudfront_origin_request_policy" "all_viewer" {
   name = "Managed-AllViewer"
 }
 
-# Managed-CachingDisabled also disables compression negotiation, and CloudFront
-# compresses only when the cache policy enables it -- so the managed policy
-# would ship every query response uncompressed. This is the same "cache
-# nothing" behaviour with Gzip and Brotli switched back on.
-resource "aws_cloudfront_cache_policy" "no_store_compressed" {
-  count = var.enable_cdn ? 1 : 0
-
-  name        = "${var.name}-no-store-compressed"
-  comment     = "No caching, compression enabled"
-  min_ttl     = 0
-  default_ttl = 0
-  max_ttl     = 0
-
-  parameters_in_cache_key_and_forwarded_to_origin {
-    enable_accept_encoding_gzip   = true
-    enable_accept_encoding_brotli = true
-
-    # The cache key is irrelevant at zero TTL; the origin request policy above
-    # is what decides what actually reaches the application.
-    cookies_config { cookie_behavior = "none" }
-    headers_config { header_behavior = "none" }
-    query_strings_config { query_string_behavior = "none" }
-  }
+# Managed-CachingDisabled also disables compression negotiation, so everything
+# on the default behavior is served uncompressed. That is not fixable here:
+# CloudFront rejects a cache policy that enables Gzip or Brotli while caching
+# is disabled ("The parameter EnableAcceptEncodingGzip is invalid for policy
+# with caching disabled"), and this origin is an API whose /query answers
+# depend on session state, so caching them is not an option. The one large
+# payload, the ~1 MB JS bundle, is compressed by the /assets/* behavior below.
+data "aws_cloudfront_cache_policy" "disabled" {
+  name = "Managed-CachingDisabled"
 }
 
 # The load balancer keeps a public DNS name, so restricting its security group
@@ -113,9 +99,8 @@ resource "aws_cloudfront_distribution" "app" {
     viewer_protocol_policy = "redirect-to-https"
     allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods         = ["GET", "HEAD"]
-    compress               = true
 
-    cache_policy_id          = aws_cloudfront_cache_policy.no_store_compressed[0].id
+    cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
     origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer.id
   }
 
