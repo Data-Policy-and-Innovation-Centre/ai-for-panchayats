@@ -51,6 +51,7 @@ class FakeS3:
         self._objects: dict[tuple[str, str, str], bytes] = {}
         self.head_calls: list[tuple[str, str, str]] = []
         self.download_calls: list[tuple[str, str, str]] = []
+        self.get_calls: list[tuple[str, str, str]] = []
         # Test hooks.
         self.head_content_length: int | None = None
         self.head_version_override: str | None = None
@@ -120,10 +121,7 @@ class FakeS3:
         fileobj.write(body)
         fileobj.flush()
 
-    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
-        for (bucket, key, _version), body in self._objects.items():
-            if bucket == Bucket and key == Key:
-                return {"Body": io.BytesIO(body)}
-        raise ClientError(
-            {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
-        )
+    def get_object(self, *, Bucket: str, Key: str, VersionId: str) -> dict[str, Any]:
+        self.get_calls.append((Bucket, Key, VersionId))
+        body = self._lookup(Bucket, Key, VersionId)
+        return {"Body": io.BytesIO(body), "VersionId": VersionId}

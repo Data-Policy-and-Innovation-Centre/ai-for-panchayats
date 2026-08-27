@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 from .errors import KnownAnswerError, SnapshotManifestError
@@ -113,18 +113,41 @@ def from_mapping(payload: Mapping[str, Any]) -> Expectations:
 
 def loads(text: str) -> Expectations:
     try:
-        payload = json.loads(text)
+        # parse_float=Decimal keeps a hand-written JSON number exact instead of
+        # rounding it to binary64 before it is ever compared.
+        payload = json.loads(text, parse_float=Decimal)
     except json.JSONDecodeError as exc:
         raise SnapshotManifestError("expectations object is not valid JSON") from exc
     return from_mapping(payload)
 
 
-def _numeric(value: Any) -> float | None:
+def _exact(value: Any) -> Decimal | int | None:
+    """Return `value` as an exact number, or None if it is not numeric.
+
+    Never routes through `float`. DuckDB hands back `Decimal` for a DECIMAL
+    aggregate, and `float(Decimal(...))` would discard exactly the precision the
+    DECIMAL cast exists to preserve -- 9007199254740993 and 9007199254740992
+    collapse to the same binary64 value and would compare equal.
+
+    A JSON string is accepted so an expectations file can carry a value that
+    JSON's own number syntax cannot represent exactly.
+    """
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float, Decimal)):
-        return float(value)
+    if isinstance(value, int) or isinstance(value, Decimal):
+        return value
+    if isinstance(value, float):
+        return Decimal(repr(value))
+    if isinstance(value, str):
+        try:
+            return Decimal(value)
+        except InvalidOperation:
+            return None
     return None
+
+
+def _is_finite(value: Decimal | int) -> bool:
+    return not isinstance(value, Decimal) or value.is_finite()
 
 
 def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str | None:
@@ -136,18 +159,29 @@ def _rows_match(actual: Sequence[Sequence[Any]], query: KnownAnswerQuery) -> str
         if len(got_row) != len(want_row):
             return f"row {row_index} has {len(got_row)} columns, expected {len(want_row)}"
         for col_index, (got, want) in enumerate(zip(got_row, want_row)):
-            got_num, want_num = _numeric(got), _numeric(want)
-            if got_num is not None and want_num is not None:
-                if query.tolerance is None:
-                    if got_num != want_num:
-                        return f"row {row_index} column {col_index}: {got_num} != {want_num} (exact)"
-                elif abs(got_num - want_num) > query.tolerance:
-                    return (
-                        f"row {row_index} column {col_index}: |{got_num} - {want_num}| "
-                        f"> {query.tolerance}"
-                    )
-            elif got != want:
-                return f"row {row_index} column {col_index}: {got!r} != {want!r}"
+            got_num, want_num = _exact(got), _exact(want)
+            if got_num is None or want_num is None:
+                if got != want:
+                    return f"row {row_index} column {col_index}: {got!r} != {want!r}"
+                continue
+
+            # NaN fails every comparison, so `abs(NaN - x) > tolerance` is
+            # False and a non-finite aggregate would sail through a tolerant
+            # check. Reject it before comparing rather than after.
+            if not _is_finite(got_num) or not _is_finite(want_num):
+                return (
+                    f"row {row_index} column {col_index}: non-finite value "
+                    f"{got_num} (expected {want_num})"
+                )
+
+            if query.tolerance is None:
+                if got_num != want_num:
+                    return f"row {row_index} column {col_index}: {got_num} != {want_num} (exact)"
+            elif abs(Decimal(got_num) - Decimal(want_num)) > Decimal(repr(query.tolerance)):
+                return (
+                    f"row {row_index} column {col_index}: |{got_num} - {want_num}| "
+                    f"> {query.tolerance}"
+                )
     return None
 
 

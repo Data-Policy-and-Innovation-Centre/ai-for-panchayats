@@ -39,6 +39,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label", default=PROVISIONAL_LABEL)
     parser.add_argument("--expectations-key", default=None, help="S3 key of the private aggregates")
     parser.add_argument(
+        "--expectations-version-id",
+        default=None,
+        help="S3 object version of the aggregates; required with --expectations-key",
+    )
+    parser.add_argument(
         "--known-exception",
         action="append",
         dest="known_exceptions",
@@ -58,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             version_id=args.version_id,
             label=args.label,
             expectations_key=args.expectations_key,
+            expectations_version_id=args.expectations_version_id,
             known_exceptions=tuple(args.known_exceptions or DEFAULT_EXCEPTIONS),
         )
     except SnapshotError as exc:

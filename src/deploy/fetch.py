@@ -143,7 +143,13 @@ def load_expectations(s3_client: Any, manifest: SnapshotManifest) -> Expectation
     if manifest.expectations_key is None:
         return None
     try:
-        response = s3_client.get_object(Bucket=manifest.bucket, Key=manifest.expectations_key)
+        # Pinned by version: the manifest must describe its own gate exactly,
+        # or a rollback would validate an old snapshot against a newer contract.
+        response = s3_client.get_object(
+            Bucket=manifest.bucket,
+            Key=manifest.expectations_key,
+            VersionId=manifest.expectations_version_id,
+        )
         body = response["Body"].read()
     except _S3_ERRORS as exc:
         raise SnapshotUnavailableError(

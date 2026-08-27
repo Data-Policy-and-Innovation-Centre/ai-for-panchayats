@@ -111,6 +111,7 @@ def test_manifest_json_carries_no_row_counts(snapshot):
         "duckdb_library_version",
         "created_at",
         "expectations_key",
+        "expectations_version_id",
         "known_exceptions",
     }
     assert all(isinstance(name, str) for name in payload["relations"])

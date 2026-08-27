@@ -278,13 +278,49 @@ def test_expectations_are_loaded_from_private_s3_not_the_manifest(deployment):
         "exp-v1",
         b'{"schema_version": 1, "relation_row_counts": {"plan": 3}}',
     )
-    pinned = replace(manifest, expectations_key=expectations_key)
+    pinned = replace(
+        manifest, expectations_key=expectations_key, expectations_version_id="exp-v1"
+    )
 
     loaded = load_expectations(s3, pinned)
 
     assert loaded is not None
     assert loaded.relation_row_counts == {"plan": 3}
     assert "relation_row_counts" not in pinned.to_json()
+
+
+def test_expectations_are_read_at_the_pinned_version(deployment):
+    """A republished contract must not silently rebind an older manifest."""
+    manifest, s3, _destination = deployment
+    key = "duckdb/database_allgps.expectations.json"
+    s3.put(BUCKET, key, "exp-v1", b'{"schema_version": 1, "relation_row_counts": {"plan": 3}}')
+    s3.put(BUCKET, key, "exp-v2", b'{"schema_version": 1, "relation_row_counts": {"plan": 999}}')
+
+    old = replace(manifest, expectations_key=key, expectations_version_id="exp-v1")
+    assert load_expectations(s3, old).relation_row_counts == {"plan": 3}
+    assert s3.get_calls[-1] == (BUCKET, key, "exp-v1")
+
+    new = replace(manifest, expectations_key=key, expectations_version_id="exp-v2")
+    assert load_expectations(s3, new).relation_row_counts == {"plan": 999}
+
+
+def test_a_deleted_expectations_version_fails_closed(deployment):
+    manifest, s3, _destination = deployment
+    key = "duckdb/database_allgps.expectations.json"
+    s3.put(BUCKET, key, "exp-v1", b'{"schema_version": 1, "relation_row_counts": {}}')
+    pinned = replace(manifest, expectations_key=key, expectations_version_id="exp-gone")
+
+    with pytest.raises(SnapshotUnavailableError, match="cannot read expectations"):
+        load_expectations(s3, pinned)
+
+
+def test_an_unpinned_expectations_key_is_rejected(deployment):
+    """An unversioned gate makes the manifest non-deterministic."""
+    from src.deploy.errors import SnapshotManifestError
+
+    manifest, _s3, _destination = deployment
+    with pytest.raises(SnapshotManifestError, match="requires expectations_version_id"):
+        replace(manifest, expectations_key="duckdb/x.json")
 
 
 def test_a_manifest_without_expectations_loads_none(deployment):

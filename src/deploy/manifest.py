@@ -65,6 +65,7 @@ class SnapshotManifest:
     duckdb_library_version: str
     created_at: str
     expectations_key: str | None = None
+    expectations_version_id: str | None = None
     known_exceptions: tuple[str, ...] = ()
     schema_version: int = SCHEMA_VERSION
 
@@ -92,6 +93,19 @@ class SnapshotManifest:
 
         if self.expectations_key is not None:
             _require_text(self.expectations_key, "expectations_key")
+            # Without a pinned version the gate is whatever happens to be
+            # current, so an old manifest could be validated against a newer
+            # contract -- or fail against it during a rollback.
+            if self.expectations_version_id is None:
+                raise SnapshotManifestError(
+                    "expectations_key requires expectations_version_id: an unpinned "
+                    "expectations object makes the manifest non-deterministic"
+                )
+            _require_text(self.expectations_version_id, "expectations_version_id")
+        elif self.expectations_version_id is not None:
+            raise SnapshotManifestError(
+                "expectations_version_id without expectations_key"
+            )
         for note in self.known_exceptions:
             _require_text(note, "known_exceptions entry")
 
@@ -118,6 +132,7 @@ class SnapshotManifest:
             "duckdb_library_version": self.duckdb_library_version,
             "created_at": self.created_at,
             "expectations_key": self.expectations_key,
+            "expectations_version_id": self.expectations_version_id,
             "known_exceptions": list(self.known_exceptions),
         }
 
@@ -150,13 +165,15 @@ def from_mapping(payload: Mapping[str, Any]) -> SnapshotManifest:
         "duckdb_library_version",
         "created_at",
         "expectations_key",
+        "expectations_version_id",
         "known_exceptions",
     }
     unexpected = sorted(set(payload) - known)
     if unexpected:
         raise SnapshotManifestError(f"manifest has unexpected fields: {', '.join(unexpected)}")
 
-    missing = sorted(known - {"expectations_key", "known_exceptions", "schema_version"} - set(payload))
+    optional = {"expectations_key", "expectations_version_id", "known_exceptions", "schema_version"}
+    missing = sorted(known - optional - set(payload))
     if missing:
         raise SnapshotManifestError(f"manifest is missing fields: {', '.join(missing)}")
 
@@ -179,6 +196,7 @@ def from_mapping(payload: Mapping[str, Any]) -> SnapshotManifest:
         duckdb_library_version=payload["duckdb_library_version"],
         created_at=payload["created_at"],
         expectations_key=payload.get("expectations_key"),
+        expectations_version_id=payload.get("expectations_version_id"),
         known_exceptions=tuple(exceptions),
     )
 
@@ -254,6 +272,7 @@ def build_manifest(
     version_id: str,
     label: str = PROVISIONAL_LABEL,
     expectations_key: str | None = None,
+    expectations_version_id: str | None = None,
     known_exceptions: tuple[str, ...] = (),
     created_at: str | None = None,
 ) -> SnapshotManifest:
@@ -282,5 +301,6 @@ def build_manifest(
         duckdb_library_version=duckdb.__version__,
         created_at=created_at or utc_now(),
         expectations_key=expectations_key,
+        expectations_version_id=expectations_version_id,
         known_exceptions=known_exceptions,
     )
