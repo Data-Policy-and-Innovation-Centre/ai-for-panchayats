@@ -85,18 +85,24 @@ aws_s3 put-public-access-block --bucket "$BUCKET" \
 # AES256 is the baseline, not a target. Replacing an existing SSE-KMS
 # configuration with it would be a silent downgrade on a documented-idempotent
 # re-run.
-if sse_out="$(aws_s3 get-bucket-encryption --bucket "$BUCKET" \
+# stderr goes to a separate file, not into the value: merging them means any
+# CLI warning on the success path reads as "not KMS" and triggers the very
+# downgrade this block exists to prevent.
+sse_err="$(mktemp)"
+if current_sse="$(aws_s3 get-bucket-encryption --bucket "$BUCKET" \
     --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
-    --output text 2>&1)"; then
-  current_sse="$sse_out"
-elif printf '%s' "$sse_out" | grep -q "ServerSideEncryptionConfigurationNotFoundError"; then
+    --output text 2>"$sse_err")"; then
+  :
+elif grep -q "ServerSideEncryptionConfigurationNotFoundError" "$sse_err"; then
   current_sse="none"
 else
   # Anything else -- AccessDenied, throttling -- must not be read as "unencrypted".
   echo "cannot read the encryption configuration of s3://$BUCKET:" >&2
-  printf '%s\n' "$sse_out" >&2
+  cat "$sse_err" >&2
+  rm -f "$sse_err"
   exit 1
 fi
+rm -f "$sse_err"
 # aws:kms:dsse is dual-layer KMS; an exact match on aws:kms alone would replace
 # it with AES256 and strip both the CMK controls and the second layer.
 if [ "$current_sse" = "aws:kms" ] || [ "$current_sse" = "aws:kms:dsse" ]; then
@@ -182,6 +188,7 @@ elif [ -n "$current_policy" ]; then
   echo "TF_STATE_ACCEPT_POLICY=1 to proceed once you have confirmed it yourself." >&2
   [ "${TF_STATE_ACCEPT_POLICY:-0}" = "1" ] || exit 1
   echo "TF_STATE_ACCEPT_POLICY=1 set; continuing with the existing policy." >&2
+  policy_unverified=1
 else
   aws_s3 put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
 {
@@ -201,7 +208,11 @@ POLICY
 )"
 fi
 
-echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted, TLS-only)"
+if [ "${policy_unverified:-0}" = "1" ]; then
+  echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted; TLS deny NOT verified)"
+else
+  echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted, TLS-only)"
+fi
 
 if [ "$BUCKET" != "$DEFAULT_BUCKET" ] || [ "$REGION" != "$DEFAULT_REGION" ]; then
   cat <<NOTE
