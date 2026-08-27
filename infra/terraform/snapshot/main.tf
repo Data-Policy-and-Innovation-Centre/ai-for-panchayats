@@ -130,4 +130,29 @@ data "aws_iam_policy_document" "snapshots" {
       values   = ["aws:kms"]
     }
   }
+
+  # Checking the algorithm alone is not enough: `aws:kms` is satisfied by any
+  # KMS key. An object written under a different CMK would bypass this key
+  # entirely and be unreadable by the #56 task role, which is granted
+  # kms:Decrypt only on this one. Negated operators also match when the header
+  # is absent, so this additionally forces the key to be stated explicitly
+  # rather than inherited from bucket default encryption.
+  statement {
+    sid    = "DenyUploadsUnderAnotherKmsKey"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.snapshots.arn}/*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "s3:x-amz-server-side-encryption-aws-kms-key-id"
+      values   = [aws_kms_key.snapshots.arn]
+    }
+  }
 }
