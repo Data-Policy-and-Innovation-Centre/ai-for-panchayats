@@ -35,4 +35,24 @@ aws s3api put-bucket-encryption \
   --server-side-encryption-configuration \
     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
 
-echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted)"
+# Terraform state records resource metadata and can carry sensitive values, so
+# refuse to move it over a plaintext connection. Blocking public access alone
+# does not stop an authenticated caller configured with an HTTP S3 endpoint.
+aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::$BUCKET", "arn:aws:s3:::$BUCKET/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+POLICY
+)"
+
+echo "state bucket ready: s3://$BUCKET (versioned, private, encrypted, TLS-only)"

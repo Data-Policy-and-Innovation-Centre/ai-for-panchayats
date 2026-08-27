@@ -7,5 +7,10 @@
 *.tfstate.*
 *.tfplan
 *.tfvars
+# Terraform also auto-loads the JSON forms; without these an operator's
+# environment values could be committed as trackable files.
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
 !example.tfvars
 crash.log
