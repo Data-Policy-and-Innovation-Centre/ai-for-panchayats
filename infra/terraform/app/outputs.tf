@@ -1,6 +1,13 @@
 output "url" {
-  description = "Where testers reach the chatbot."
-  value       = var.certificate_arn == "" ? "http://${aws_lb.main.dns_name}" : "https://${aws_lb.main.dns_name}"
+  description = <<-EOT
+    Where testers reach the chatbot, and what the frontend must be built
+    against: the bundle hardcodes its API base at build time.
+  EOT
+  value = (
+    var.enable_cdn ? "https://${aws_cloudfront_distribution.app[0].domain_name}" :
+    var.certificate_arn == "" ? "http://${aws_lb.main.dns_name}" :
+    "https://${aws_lb.main.dns_name}"
+  )
 }
 
 output "ecr_repository_url" {

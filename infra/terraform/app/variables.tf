@@ -65,11 +65,29 @@ variable "ingress_cidrs" {
 
 variable "allow_public_http" {
   description = <<-EOT
-    Acknowledges serving over plain HTTP without a certificate. #59 does not
-    accept this for release; it exists so a bounded pre-cutover test is
-    possible. Without it, a certificate_arn is required, so the default apply
-    cannot quietly publish an unauthenticated chatbot to the internet.
+    Acknowledges serving VIEWERS over plain HTTP. #59 does not accept this for
+    release; it exists so a bounded pre-cutover test is possible. It is only
+    consulted when neither enable_cdn nor certificate_arn provides TLS.
+
+    Note what this does NOT gate: the chatbot is published to the internet
+    without authentication in every configuration here. That is a separate
+    exposure, tracked on #59, and no variable in this module withholds it.
   EOT
   type        = bool
   default     = false
+}
+
+variable "enable_cdn" {
+  description = <<-EOT
+    Put CloudFront in front of the load balancer, which gives viewers HTTPS on
+    an AWS-issued *.cloudfront.net certificate without a registered domain.
+    This is on by default because the dashboard calls crypto.randomUUID()
+    during mount: outside a secure context that throws and the page renders
+    blank, so plain HTTP does not merely leak traffic, it breaks the app.
+
+    Mutually exclusive with certificate_arn -- with a real certificate,
+    terminate TLS at the load balancer and turn this off.
+  EOT
+  type        = bool
+  default     = true
 }

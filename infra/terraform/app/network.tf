@@ -63,14 +63,27 @@ resource "aws_security_group" "alb" {
   }
 }
 
+# Behind CloudFront the load balancer is not a public entrance, so it accepts
+# nothing from arbitrary addresses -- only CloudFront's published origin-facing
+# ranges, and then only with the shared header the listener rule requires.
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   security_group_id = aws_security_group.alb.id
-  for_each          = toset(var.ingress_cidrs)
+  for_each          = var.enable_cdn ? toset([]) : toset(var.ingress_cidrs)
   cidr_ipv4         = each.value
   from_port         = 80
   to_port           = 80
   ip_protocol       = "tcp"
   description       = "HTTP: redirected to HTTPS once a certificate exists"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alb_from_cloudfront" {
+  count             = var.enable_cdn ? 1 : 0
+  security_group_id = aws_security_group.alb.id
+  prefix_list_id    = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing[0].id
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+  description       = "CloudFront edge locations only"
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {
@@ -118,8 +131,23 @@ resource "terraform_data" "public_http_acknowledged" {
 
   lifecycle {
     precondition {
-      condition     = var.certificate_arn != "" || var.allow_public_http
-      error_message = "No certificate_arn: set allow_public_http=true to accept plain HTTP for a bounded test (#59), or supply a certificate."
+      condition     = var.certificate_arn != "" || var.enable_cdn || var.allow_public_http
+      error_message = "Viewers would get plain HTTP: keep enable_cdn=true, supply a certificate_arn, or set allow_public_http=true to accept it for a bounded test (#59)."
+    }
+
+    # ingress_cidrs governs who may reach the LOAD BALANCER. Behind CloudFront
+    # nobody reaches it directly, so a narrowed list would be silently
+    # inoperative while reading as though access were restricted.
+    precondition {
+      condition     = !var.enable_cdn || var.ingress_cidrs == ["0.0.0.0/0"]
+      error_message = "ingress_cidrs cannot restrict access while enable_cdn is true: viewers arrive at CloudFront, not the load balancer, so the list would do nothing. Restrict at CloudFront with a WAF IP set, or set enable_cdn=false to put the load balancer back in front."
+    }
+
+    # Two TLS terminators fronting one service is never what someone meant,
+    # and the combination silently changes which hostname viewers must use.
+    precondition {
+      condition     = !(var.enable_cdn && var.certificate_arn != "")
+      error_message = "enable_cdn and certificate_arn are mutually exclusive: CloudFront terminates TLS on its own name, so set enable_cdn=false to terminate at the load balancer instead."
     }
   }
 }

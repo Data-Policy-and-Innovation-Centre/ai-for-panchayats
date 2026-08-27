@@ -139,10 +139,27 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   dynamic "default_action" {
-    for_each = var.certificate_arn == "" ? [1] : []
+    for_each = var.certificate_arn == "" && !var.enable_cdn ? [1] : []
     content {
       type             = "forward"
       target_group_arn = aws_lb_target_group.app.arn
+    }
+  }
+
+  # Behind CloudFront the default is a refusal. Anything reaching the load
+  # balancer without the shared header did not come through our distribution,
+  # so it gets nothing -- see aws_lb_listener_rule.from_cdn below. Target
+  # health checks originate inside the load balancer and never pass through
+  # listener rules, so this does not affect them.
+  dynamic "default_action" {
+    for_each = var.enable_cdn ? [1] : []
+    content {
+      type = "fixed-response"
+      fixed_response {
+        content_type = "text/plain"
+        message_body = "Direct access is not permitted."
+        status_code  = "403"
+      }
     }
   }
 
@@ -155,6 +172,24 @@ resource "aws_lb_listener" "http" {
         protocol    = "HTTPS"
         status_code = "HTTP_301"
       }
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "from_cdn" {
+  count        = var.enable_cdn ? 1 : 0
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 1
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+
+  condition {
+    http_header {
+      http_header_name = "X-Origin-Verify"
+      values           = [random_password.origin_verify[0].result]
     }
   }
 }
