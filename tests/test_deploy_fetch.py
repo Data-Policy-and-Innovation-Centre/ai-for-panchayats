@@ -7,6 +7,7 @@ in-memory S3 fake only — no AWS call, no protected data.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from dataclasses import replace
 
@@ -326,3 +327,89 @@ def test_an_unpinned_expectations_key_is_rejected(deployment):
 def test_a_manifest_without_expectations_loads_none(deployment):
     manifest, s3, _destination = deployment
     assert load_expectations(s3, manifest) is None
+
+
+def test_a_pinned_gate_cannot_be_skipped_by_omission(deployment):
+    """A manifest that names expectations must not publish without them."""
+    from src.deploy.errors import SnapshotManifestError
+
+    manifest, s3, destination = deployment
+    key = "duckdb/database_allgps.expectations.json"
+    s3.put(BUCKET, key, "exp-v1", b'{"schema_version": 1, "relation_row_counts": {"plan": 3}}')
+    pinned = replace(manifest, expectations_key=key, expectations_version_id="exp-v1")
+
+    with pytest.raises(SnapshotManifestError, match="but none were supplied"):
+        fetch_snapshot(pinned, destination, s3_client=s3)
+
+    assert not destination.exists()
+    assert s3.download_calls == []
+
+    # Skipping stays possible, but only as a deliberate act.
+    fetch_snapshot(pinned, destination, s3_client=s3, allow_missing_expectations=True)
+    assert destination.is_file()
+
+
+def test_a_file_that_is_not_a_duckdb_database_fails_as_an_integrity_error(deployment, tmp_path):
+    """Not an unhandled duckdb exception escaping the SnapshotError hierarchy."""
+    manifest, s3, destination = deployment
+    junk = tmp_path / "junk.duckdb"
+    payload = b"this is not a database" * 100
+    junk.write_bytes(payload)
+    s3.put_file(BUCKET, KEY, VERSION, junk)
+
+    # Byte identity holds; only the contents are wrong.
+    tampered = replace(
+        manifest, byte_size=len(payload), sha256=hashlib.sha256(payload).hexdigest()
+    )
+    with pytest.raises(SnapshotIntegrityError, match="could not be opened as a DuckDB database"):
+        fetch_snapshot(tampered, destination, s3_client=s3, allow_missing_expectations=True)
+
+    assert not destination.exists()
+
+
+def test_an_ungated_publish_is_distinguishable_from_a_verified_one(deployment):
+    """Otherwise a skipped gate reports the same identity as a full check."""
+    manifest, s3, destination = deployment
+
+    ungated = fetch_snapshot(manifest, destination, s3_client=s3)
+    assert ungated.aggregates_verified is False
+    assert "aggregates=SKIPPED" in ungated.describe()
+
+    gated = fetch_snapshot(
+        manifest,
+        destination,
+        s3_client=s3,
+        expectations=Expectations(relation_row_counts={"plan": 3}),
+    )
+    assert gated.aggregates_verified is True
+    assert "aggregates=verified" in gated.describe()
+
+
+def test_a_broken_expectations_query_is_not_reported_as_substitution(deployment):
+    """A contract typo must not read as evidence the artifact was swapped."""
+    manifest, s3, destination = deployment
+    broken = Expectations(
+        relation_row_counts={},
+        queries=(
+            KnownAnswerQuery(
+                name="typo", sql="SELECT * FROM snap.no_such_table", expected=((1,),)
+            ),
+        ),
+    )
+
+    with pytest.raises(KnownAnswerError, match="could not be evaluated"):
+        fetch_snapshot(manifest, destination, s3_client=s3, expectations=broken)
+
+    assert not destination.exists()
+
+
+def test_snapshot_identity_defaults_to_the_conservative_reading():
+    """An external constructor must keep working, and assume no gate ran."""
+    from src.deploy.fetch import SnapshotIdentity
+
+    identity = SnapshotIdentity(
+        label="l", bucket="b", key="k", version_id="v", sha256="a" * 64,
+        byte_size=1, path="/tmp/x", verified_at="2026-08-27T00:00:00Z",
+    )
+    assert identity.aggregates_verified is False
+    assert "aggregates=SKIPPED" in identity.describe()

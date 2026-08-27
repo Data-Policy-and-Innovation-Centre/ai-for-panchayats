@@ -49,7 +49,7 @@ class KnownAnswerQuery:
                 raise SnapshotManifestError(
                     f"known-answer query {self.name!r} tolerance must be a number or null"
                 )
-            if self.tolerance < 0 or not _finite(self.tolerance):
+            if not _finite(self.tolerance) or self.tolerance < 0:
                 raise SnapshotManifestError(
                     f"known-answer query {self.name!r} tolerance must be finite and non-negative"
                 )
@@ -121,6 +121,14 @@ def from_mapping(payload: Mapping[str, Any]) -> Expectations:
             raise SnapshotManifestError(
                 f"known-answer query {entry.get('name')!r} needs an expected row array"
             )
+        for row in rows:
+            # tuple("ok") is ("o", "k"), so a JSON string would silently become
+            # a two-column row instead of being rejected.
+            if not isinstance(row, (list, tuple)):
+                raise SnapshotManifestError(
+                    f"known-answer query {entry.get('name')!r} has an expected row "
+                    f"that is not an array: {row!r}"
+                )
         queries.append(
             KnownAnswerQuery(
                 name=entry.get("name"),
@@ -131,6 +139,9 @@ def from_mapping(payload: Mapping[str, Any]) -> Expectations:
         )
 
     counts = payload.get("relation_row_counts", {})
+    # dict([]) is {}, which would drop the entire row-count gate silently.
+    if not isinstance(counts, Mapping):
+        raise SnapshotManifestError("relation_row_counts must be a JSON object")
     return Expectations(relation_row_counts=dict(counts), queries=tuple(queries))
 
 

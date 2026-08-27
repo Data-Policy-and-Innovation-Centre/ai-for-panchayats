@@ -154,3 +154,29 @@ def test_a_misspelled_expectations_key_is_rejected():
     """Silently ignoring it would drop every check it was meant to carry."""
     with pytest.raises(SnapshotManifestError, match="unexpected fields: relation_row_count"):
         loads('{"schema_version": 1, "relation_row_count": {"plan": 3}}')
+
+
+def test_a_non_object_row_count_mapping_is_rejected():
+    """dict([]) is {}, which would drop the whole row-count gate."""
+    payload = (
+        '{"schema_version": 1, "relation_row_counts": [], "known_answer_queries": '
+        '[{"name": "t", "sql": "SELECT 1", "expected": [[1]], "tolerance": null}]}'
+    )
+    with pytest.raises(SnapshotManifestError, match="relation_row_counts must be a JSON object"):
+        loads(payload)
+
+
+def test_an_expected_row_that_is_a_string_is_rejected():
+    """tuple("ok") is ("o", "k") — a silent reshaping into a two-column row."""
+    payload = (
+        '{"schema_version": 1, "relation_row_counts": {"plan": 1}, "known_answer_queries": '
+        '[{"name": "t", "sql": "SELECT 1", "expected": ["ok"], "tolerance": null}]}'
+    )
+    with pytest.raises(SnapshotManifestError, match="not an array"):
+        loads(payload)
+
+
+def test_a_nan_tolerance_raises_a_typed_error():
+    """Ordering a Decimal NaN raises InvalidOperation unless finiteness wins."""
+    with pytest.raises(SnapshotManifestError, match="finite and non-negative"):
+        KnownAnswerQuery(name="p", sql="SELECT 1", expected=((1,),), tolerance=Decimal("NaN"))

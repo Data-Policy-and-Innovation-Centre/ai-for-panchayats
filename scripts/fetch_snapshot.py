@@ -41,9 +41,21 @@ def main(argv: list[str] | None = None) -> int:
     client = boto3.client("s3", region_name=args.region)
     try:
         manifest = load_manifest(args.manifest)
+        if manifest.expectations_key is None and not args.skip_expectations:
+            print(
+                f"{args.manifest} pins no expectations_key, so the aggregate gate would "
+                "not run. Rebuild the manifest with --expectations-key, or pass "
+                "--skip-expectations to accept an unverified publish.",
+                file=sys.stderr,
+            )
+            return 1
         expectations = None if args.skip_expectations else load_expectations(client, manifest)
         identity = fetch_snapshot(
-            manifest, args.destination, s3_client=client, expectations=expectations
+            manifest,
+            args.destination,
+            s3_client=client,
+            expectations=expectations,
+            allow_missing_expectations=args.skip_expectations,
         )
     except SnapshotError as exc:
         print(f"snapshot verification failed: {exc}", file=sys.stderr)

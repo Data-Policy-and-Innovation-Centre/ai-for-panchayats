@@ -43,14 +43,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="S3 object version of the aggregates; required with --expectations-key",
     )
-    parser.add_argument(
+    exceptions = parser.add_mutually_exclusive_group()
+    exceptions.add_argument(
         "--known-exception",
         action="append",
         dest="known_exceptions",
         help="repeatable; defaults to the open #43/#49, #61 and #62 exceptions",
     )
+    exceptions.add_argument(
+        "--no-known-exceptions",
+        action="store_true",
+        help="record no caveats, for an artifact whose exceptions are all resolved",
+    )
     parser.add_argument("--out", type=Path, default=None, help="write here instead of stdout")
     return parser.parse_args(argv)
+
+
+def _known_exceptions(args: argparse.Namespace) -> tuple[str, ...]:
+    """An empty tuple has to be reachable, or a corrected artifact keeps its caveats."""
+    if args.no_known_exceptions:
+        return ()
+    if args.known_exceptions is None:
+        return DEFAULT_EXCEPTIONS
+    return tuple(args.known_exceptions)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
             label=args.label,
             expectations_key=args.expectations_key,
             expectations_version_id=args.expectations_version_id,
-            known_exceptions=tuple(args.known_exceptions or DEFAULT_EXCEPTIONS),
+            # `or` would make an intentionally empty list unexpressible, so a
+            # corrected artifact would keep claiming caveats it no longer has.
+            known_exceptions=_known_exceptions(args),
         )
     except SnapshotError as exc:
         print(f"error: {exc}", file=sys.stderr)

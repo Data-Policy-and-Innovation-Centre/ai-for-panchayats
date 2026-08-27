@@ -27,7 +27,10 @@ from uuid import uuid4
 
 from . import expectations as expectations_module
 from .errors import (
+    KnownAnswerError,
+    SnapshotError,
     SnapshotIntegrityError,
+    SnapshotManifestError,
     SnapshotStorageError,
     SnapshotUnavailableError,
 )
@@ -64,11 +67,15 @@ class SnapshotIdentity:
     byte_size: int
     path: str
     verified_at: str
+    # Defaulted so an external constructor keeps working, and False is the
+    # conservative reading: assume the gate did not run unless told otherwise.
+    aggregates_verified: bool = False
 
     def describe(self) -> str:
+        gate = "aggregates=verified" if self.aggregates_verified else "aggregates=SKIPPED"
         return (
             f"{self.label} s3://{self.bucket}/{self.key}?versionId={self.version_id} "
-            f"sha256={self.sha256} bytes={self.byte_size}"
+            f"sha256={self.sha256} bytes={self.byte_size} {gate}"
         )
 
 
@@ -125,17 +132,48 @@ def _download(s3_client: Any, manifest: SnapshotManifest, target: Path) -> None:
 def _verify_contents(
     path: Path, manifest: SnapshotManifest, expectations: Expectations | None
 ) -> None:
-    with attach_read_only(path) as conn:
-        relations = relations_of(conn)
-        if relations != manifest.relations:
-            missing = sorted(set(manifest.relations) - set(relations))
-            extra = sorted(set(relations) - set(manifest.relations))
-            raise SnapshotIntegrityError(
-                "snapshot relations do not match the manifest "
-                f"(missing: {missing or 'none'}; unexpected: {extra or 'none'})"
-            )
-        if expectations is not None:
-            expectations_module.verify(conn, expectations)
+    try:
+        with attach_read_only(path) as conn:
+            relations = relations_of(conn)
+            if relations != manifest.relations:
+                missing = sorted(set(manifest.relations) - set(relations))
+                extra = sorted(set(relations) - set(manifest.relations))
+                raise SnapshotIntegrityError(
+                    "snapshot relations do not match the manifest "
+                    f"(missing: {missing or 'none'}; unexpected: {extra or 'none'})"
+                )
+            if expectations is not None:
+                _run_expectations(conn, expectations)
+    except SnapshotError:
+        raise
+    except Exception as exc:  # duckdb raises its own IOException on a bad file
+        import duckdb
+
+        raise SnapshotIntegrityError(
+            f"snapshot could not be opened as a DuckDB database: {exc}. "
+            f"The SHA-256 already matched, so the bytes are the pinned artifact; "
+            f"suspect a storage-format mismatch before substitution "
+            f"(manifest recorded DuckDB {manifest.duckdb_library_version}, "
+            f"running {duckdb.__version__})"
+        ) from exc
+
+
+def _run_expectations(conn: Any, expectations: Expectations) -> None:
+    """Evaluate the aggregate gate, keeping contract faults distinguishable.
+
+    A typo in the expectations SQL is a broken contract, not evidence that the
+    artifact was substituted -- and SnapshotIntegrityError is documented to mean
+    the latter. Reporting one as the other would send an operator hunting a
+    supply-chain problem that does not exist.
+    """
+    try:
+        expectations_module.verify(conn, expectations)
+    except SnapshotError:
+        raise
+    except Exception as exc:
+        raise KnownAnswerError(
+            f"expectations could not be evaluated against the snapshot: {exc}"
+        ) from exc
 
 
 def load_expectations(s3_client: Any, manifest: SnapshotManifest) -> Expectations | None:
@@ -164,6 +202,7 @@ def fetch_snapshot(
     *,
     s3_client: Any,
     expectations: Expectations | None = None,
+    allow_missing_expectations: bool = False,
     storage_headroom: float = DEFAULT_STORAGE_HEADROOM,
 ) -> SnapshotIdentity:
     """Download, verify and atomically publish the pinned snapshot.
@@ -173,6 +212,18 @@ def fetch_snapshot(
     the manifest, a relation inventory that disagrees with the manifest, or a
     failed aggregate expectation.
     """
+    if (
+        manifest.expectations_key is not None
+        and expectations is None
+        and not allow_missing_expectations
+    ):
+        # Otherwise a caller that simply forgot to load them gets a file
+        # published and logged as "verified" with the aggregate gate skipped.
+        raise SnapshotManifestError(
+            f"manifest pins expectations at {manifest.expectations_key!r} but none were "
+            "supplied; load them or pass allow_missing_expectations=True deliberately"
+        )
+
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _check_free_space(destination.parent, manifest.byte_size, storage_headroom)
@@ -212,6 +263,7 @@ def fetch_snapshot(
         byte_size=manifest.byte_size,
         path=str(destination),
         verified_at=utc_now(),
+        aggregates_verified=expectations is not None,
     )
     _log.info("snapshot verified and published: %s", identity.describe())
     return identity

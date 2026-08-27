@@ -26,7 +26,19 @@ aws s3 cp "$ARTIFACT" s3://dpic-prdw-snapshots/duckdb/<name>.duckdb \
   --region ap-south-1 --sse aws:kms --sse-kms-key-id alias/dpic-prdw-snapshots
 ```
 
-Then record the returned `VersionId` in a manifest. The expectations object is
+`aws s3 cp` does not print the object version, so read it back immediately —
+`head-object` returns whatever version is *current*, so cross-check the size
+against the file you just uploaded before trusting it:
+
+```bash
+aws s3api head-object --bucket dpic-prdw-snapshots \
+  --key duckdb/<name>.duckdb --region ap-south-1 \
+  --query '{VersionId:VersionId,ContentLength:ContentLength}' --output json
+```
+
+Pass the `VersionId` to `--version-id` when building the manifest. The manifest
+build recomputes the SHA-256 from the local artifact, so a mismatched pin is
+caught by the first `fetch_snapshot` run rather than silently deployed. The expectations object is
 uploaded the same way and its own `VersionId` is pinned as
 `expectations_version_id`, so a manifest describes its gate exactly and a
 rollback cannot be validated against a newer contract.
