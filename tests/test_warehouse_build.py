@@ -23,6 +23,11 @@ from _warehouse_helpers import approved, make_settings, normalize, publish_raw_r
 
 
 def _pl_aa_run(tmp_path: Path, run_id: str = "run-1", *, activity_code: int = 7):
+    # One fund line, one asset line: activity_asset/activity_fund are
+    # strictly 1:1 with planned_activity (see schema.py), so this fixture
+    # only exercises the happy path. A second line for the same activity
+    # (now a conflicting duplicate, quarantined) is exercised separately in
+    # test_activity_fund_second_line_for_same_activity_is_quarantined below.
     run = publish_raw_run(tmp_path, run_id, {
         "LGD_123_Test_GP/2021_PL.json": {
             "data": [
@@ -31,7 +36,6 @@ def _pl_aa_run(tmp_path: Path, run_id: str = "run-1", *, activity_code: int = 7)
                     "totalCost": 15000.50, "activityStts": 1,
                     "fundList": [
                         {"schemeCode": "S1", "amountTotal": 5000.25},
-                        {"schemeCode": "S2", "amountTotal": 250.10},
                     ],
                     "assetDetails": [{"astTyp": "well", "astUnitCost": 15000.50}],
                 },
@@ -61,17 +65,20 @@ def test_full_build_publishes_and_reports_counts(tmp_path: Path):
     assert isinstance(result, BuildResult)
     assert result.target.exists()
     assert result.counts["planned_activity"] == 1
-    assert result.counts["activity_fund"] == 2
+    assert result.counts["activity_fund"] == 1
     assert result.counts["activity_asset"] == 1
     assert result.counts["admin_approval"] == 1
     assert result.quarantine_count == 0
 
     con = duckdb.connect(str(result.target), read_only=True)
     try:
+        # total_cost is a planning-side estimate: DOUBLE, not DECIMAL (see
+        # schema.py's "MONEY TYPES" section). float64 exactly represents
+        # 15000.50, so this equality is safe.
         row = con.execute("SELECT total_cost, typeof(total_cost) FROM planned_activity").fetchone()
-        assert row == (Decimal("15000.50"), "DECIMAL(18,2)")
+        assert row == (15000.50, "DOUBLE")
         total = con.execute("SELECT sum(fund_amount_total) FROM activity_fund").fetchone()[0]
-        assert total == Decimal("5250.35")  # exact; would drift under float64
+        assert total == pytest.approx(5000.25)
     finally:
         con.close()
 
@@ -143,11 +150,11 @@ def test_kind_with_zero_records_is_explicit_empty_not_missing(tmp_path: Path):
 
     settings, spec_registry = _build_settings_and_registry(tmp_path)
     result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
-    for table in ("technical_approval", "physical_progress", "recommended_expenditure"):
+    for table in ("technical_approval", "physical_progress", "activity_expenditure"):
         assert result.counts[table] == 0
     con = duckdb.connect(str(result.target), read_only=True)
     try:
-        for table in ("technical_approval", "physical_progress", "recommended_expenditure"):
+        for table in ("technical_approval", "physical_progress", "activity_expenditure"):
             # The table exists and is queryable -- not simply absent.
             assert con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
     finally:
@@ -164,13 +171,38 @@ def test_empty_selection_still_publishes_a_valid_empty_warehouse(tmp_path: Path)
 # --------------------------------------------------------------------- analytical grain
 
 
-def test_activity_fund_grain_allows_multiple_lines_per_activity(tmp_path: Path):
-    settings, spec_registry = _build_settings_and_registry(tmp_path)
+def test_activity_fund_second_line_for_same_activity_is_quarantined(tmp_path: Path):
+    """activity_asset/activity_fund are strictly 1:1 with planned_activity
+    (see schema.py); a second scheme line for one activity is a conflicting
+    duplicate, quarantined through the real build path -- not a second row."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{
+            "activityCd": 7, "totalCost": 100,
+            "fundList": [
+                {"schemeCode": "S1", "amountTotal": 100},
+                {"schemeCode": "S2", "amountTotal": 200},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
     result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
-    assert result.counts["activity_fund"] == 2  # two scheme lines for one activity
+    assert result.counts["activity_fund"] == 1
+    assert result.quarantine_count == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        reasons = con.execute(
+            "SELECT reason_code FROM quarantine WHERE table_name = 'activity_fund'"
+        ).fetchall()
+        assert reasons == [("conflicting_duplicate_key",)]
+    finally:
+        con.close()
 
 
-def test_recommended_expenditure_identity_grain_through_build(tmp_path: Path):
+def test_activity_expenditure_identity_grain_through_build(tmp_path: Path):
     run = publish_raw_run(tmp_path, "run-1", {
         "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
         "LGD_123_Test_GP/2021_RE.json": {
@@ -184,19 +216,19 @@ def test_recommended_expenditure_identity_grain_through_build(tmp_path: Path):
     normalize(run, settings.canonical_root, chunk_size=100)
     spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
     result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
-    assert result.counts["recommended_expenditure"] == 2
+    assert result.counts["activity_expenditure"] == 2
     con = duckdb.connect(str(result.target), read_only=True)
     try:
-        s_nos = sorted(r[0] for r in con.execute("SELECT s_no FROM recommended_expenditure").fetchall())
+        s_nos = sorted(r[0] for r in con.execute("SELECT s_no FROM activity_expenditure").fetchall())
         assert s_nos == ["1", "2"]
     finally:
         con.close()
 
 
-def test_recommended_expenditure_missing_required_alias_fails_build_and_does_not_publish(tmp_path: Path):
+def test_activity_expenditure_missing_required_alias_fails_build_and_does_not_publish(tmp_path: Path):
     """If the real RE payload uses a spelling for a required identity field
     (here, s_no) that isn't in RE_CANDIDATES, the build must fail loudly
-    instead of silently publishing a recommended_expenditure table with an
+    instead of silently publishing an activity_expenditure table with an
     all-null identity column."""
 
     run = publish_raw_run(tmp_path, "run-1", {
@@ -232,7 +264,7 @@ def test_build_result_records_re_field_resolutions(tmp_path: Path):
     spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
     result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
 
-    re_resolutions = {r.field: r.matched_candidate for r in result.field_resolutions if r.table == "recommended_expenditure"}
+    re_resolutions = {r.field: r.matched_candidate for r in result.field_resolutions if r.table == "activity_expenditure"}
     assert re_resolutions["plan_code"] == "planCode"
     assert re_resolutions["s_no"] == "sNo"
     # scheme_name has no candidate in this payload -- optional, so it is
@@ -268,10 +300,14 @@ def test_insert_batching_is_exact_at_chunk_boundaries(tmp_path: Path):
 # --------------------------------------------------------------------- cross-source provenance
 
 
-def test_cross_source_facts_do_not_collide_and_gp_dimension_merges(tmp_path: Path):
-    """Two different source systems, same GP, disjoint activities: facts must
-    stay attributable to their own source and never collide on a bare code,
-    while the GP dimension conforms across both."""
+def test_cross_source_activity_code_collision_fails_build_by_design(tmp_path: Path):
+    """Primary keys are now the bare business key alone (activity_code,
+    plan_code, row_id, ...), not (source_system, source_run_id, ...) --
+    see schema.py's "single run per build" note. Two different source
+    systems minting the same bare activity_code in one build therefore no
+    longer coexist: the second INSERT trips the primary key and the whole
+    build fails, by design, rather than silently keeping both rows or
+    silently picking a winner."""
 
     settings = make_settings(tmp_path)
     run = _pl_aa_run(tmp_path, "run-1", activity_code=7)
@@ -293,8 +329,37 @@ def test_cross_source_facts_do_not_collide_and_gp_dimension_merges(tmp_path: Pat
         approved("snap-1", "egramSwaraj", "run-1"),
         approved("snap-2", "othersystem", "run-9"),
     )
+    with pytest.raises(duckdb.ConstraintException):
+        build(snapshot_ids=("snap-1", "snap-2"), settings=settings, registry=spec_registry)
+
+
+def test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes(tmp_path: Path):
+    """Two different source systems, same GP, but genuinely disjoint
+    activity codes: this does not hit the single-run-per-build collision
+    above, and the GP dimension still conforms to one row across both."""
+
+    settings = make_settings(tmp_path)
+    run = _pl_aa_run(tmp_path, "run-1", activity_code=7)
+    normalize(run, settings.canonical_root, chunk_size=100)
+
+    write_manual_snapshot(
+        settings.canonical_root, source="othersystem", run_id="run-9",
+        tables={
+            "pl": [{
+                "row_id": "o1", "source_system": "othersystem", "source_run_id": "run-9",
+                "business_id": "8",  # disjoint from the egramSwaraj activity's "7"
+                "gp_code": "123", "gram_panchayat_name": "Test GP",
+                "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
+            }],
+        },
+    )
+
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("snap-2", "othersystem", "run-9"),
+    )
     result = build(snapshot_ids=("snap-1", "snap-2"), settings=settings, registry=spec_registry)
-    assert result.counts["planned_activity"] == 2  # both kept: no bare-code collision
+    assert result.counts["planned_activity"] == 2  # disjoint codes: both kept
     assert result.counts["gram_panchayat"] == 1    # same GP, conformed once
 
     con = duckdb.connect(str(result.target), read_only=True)
@@ -302,7 +367,7 @@ def test_cross_source_facts_do_not_collide_and_gp_dimension_merges(tmp_path: Pat
         rows = con.execute(
             "SELECT source_system, activity_code FROM planned_activity ORDER BY source_system"
         ).fetchall()
-        assert rows == [("egramSwaraj", "7"), ("othersystem", "7")]
+        assert rows == [("egramSwaraj", "7"), ("othersystem", "8")]
     finally:
         con.close()
 

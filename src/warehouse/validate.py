@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import duckdb
 
-from .schema import FACT_TABLES
+from .schema import FACT_TABLES, NO_LINEAGE_TABLES
 from .select import SelectedSnapshot
 
 
@@ -38,51 +38,50 @@ def _scalar(con: duckdb.DuckDBPyConnection, sql: str):
 
 PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "gram_panchayat": ("gp_lgd_code",),
-    "plan": ("source_system", "source_run_id", "plan_code"),
-    "planned_activity": ("source_system", "source_run_id", "activity_code"),
-    "activity_delegation": ("source_system", "source_run_id", "activity_code"),
-    "activity_training": ("source_system", "source_run_id", "activity_code"),
-    "activity_community_service": ("source_system", "source_run_id", "activity_code"),
-    "activity_nsap": ("source_system", "source_run_id", "activity_code", "category", "age_band", "gender"),
-    "activity_asset": ("source_system", "source_run_id", "row_id"),
-    "activity_fund": ("source_system", "source_run_id", "row_id"),
-    "admin_approval": ("source_system", "source_run_id", "row_id"),
-    "admin_approval_scheme": ("source_system", "source_run_id", "row_id"),
-    "technical_approval": ("source_system", "source_run_id", "row_id"),
-    "physical_progress": ("source_system", "source_run_id", "row_id"),
-    "recommended_expenditure": (
-        "source_system", "source_run_id", "gp_lgd_code", "plan_code", "activity_code", "s_no",
-    ),
+    "plan": ("plan_code",),
+    "planned_activity": ("activity_code",),
+    "activity_delegation": ("activity_code",),
+    "activity_training": ("activity_code",),
+    "activity_community_service": ("activity_code",),
+    "activity_nsap": ("activity_code", "category", "age_band", "gender"),
+    "activity_asset": ("activity_code",),
+    "activity_fund": ("activity_code",),
+    "admin_approval": ("row_id",),
+    "admin_approval_scheme": ("row_id",),
+    "technical_approval": ("row_id",),
+    "physical_progress": ("row_id",),
+    "activity_expenditure": ("expenditure_id",),
+    "voucher": ("voucher_pk",),
+    "dim_code": ("variable", "code"),
+    "dim_welfare_scheme": ("scheme_code",),
+    # activity_voucher and dim_lsdg_theme are deliberately absent: neither
+    # has a declared primary key (see schema.py's comments on each).
 }
 
 FOREIGN_KEYS: list[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = [
     ("plan", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
-    ("planned_activity", ("source_system", "source_run_id", "plan_code"),
-     "plan", ("source_system", "source_run_id", "plan_code")),
+    ("planned_activity", ("plan_code",), "plan", ("plan_code",)),
     ("planned_activity", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
-    ("activity_delegation", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("activity_training", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("activity_community_service", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("activity_nsap", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("activity_asset", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("activity_fund", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("admin_approval", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
+    ("activity_delegation", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("activity_training", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("activity_community_service", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("activity_nsap", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("activity_asset", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("activity_fund", ("activity_code",), "planned_activity", ("activity_code",)),
+    ("admin_approval", ("activity_code",), "planned_activity", ("activity_code",)),
     ("admin_approval", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
-    ("admin_approval_scheme", ("source_system", "source_run_id", "parent_row_id"),
-     "admin_approval", ("source_system", "source_run_id", "row_id")),
-    ("technical_approval", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
+    ("admin_approval_scheme", ("parent_row_id",), "admin_approval", ("row_id",)),
+    ("technical_approval", ("activity_code",), "planned_activity", ("activity_code",)),
     ("technical_approval", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
-    ("physical_progress", ("source_system", "source_run_id", "activity_code"),
-     "planned_activity", ("source_system", "source_run_id", "activity_code")),
-    ("recommended_expenditure", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
+    ("physical_progress", ("activity_code",), "planned_activity", ("activity_code",)),
+    # activity_expenditure -> planned_activity(activity_code) is
+    # deliberately NOT listed: the spec itself says this FK is unenforced
+    # (20 real rows violate it). See schema.py's activity_expenditure
+    # comment.
+    ("activity_expenditure", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
+    ("voucher", ("gp_lgd_code",), "gram_panchayat", ("gp_lgd_code",)),
+    ("activity_voucher", ("expenditure_id",), "activity_expenditure", ("expenditure_id",)),
+    ("activity_voucher", ("voucher_pk",), "voucher", ("voucher_pk",)),
 ]
 
 
@@ -131,7 +130,7 @@ def check_provenance(con: duckdb.DuckDBPyConnection, selected: tuple[SelectedSna
     allowed = {(s.spec.source, s.spec.run_id) for s in selected}
     checks = []
     for table in FACT_TABLES:
-        if table == "gram_panchayat":
+        if table in NO_LINEAGE_TABLES:
             continue
         rows = con.execute(f"SELECT DISTINCT source_system, source_run_id FROM {table}").fetchall()
         stray = [pair for pair in rows if pair not in allowed]

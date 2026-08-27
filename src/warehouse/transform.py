@@ -13,26 +13,34 @@ say so explicitly). Two confidence tiers:
 
 * PL, AA, TA, PP renames are corroborated by *both* donor PRs independently
   and are used directly.
-* RE (recommended/activity-wise expenditure) renames are inferred by analogy
-  to the same API family (PR #30 only ever saw RE via an already-renamed CSV
-  export, never the JSON webservice the gated normalizer consumes), so
-  ``RE_CANDIDATES`` lists several plausible spellings per field and resolves
-  the first one present. This is stated plainly rather than guessed
-  silently: every field's resolution -- which candidate matched, or that
-  none did -- is recorded in a :class:`FieldResolutions` log and surfaced on
-  :class:`warehouse.build.BuildResult`. ``plan_code`` and ``s_no`` are part
-  of the documented ``recommended_expenditure`` identity
+* RE (activity_expenditure, née recommended_expenditure) renames are
+  inferred by analogy to the same API family (PR #30 only ever saw RE via an
+  already-renamed CSV export, never the JSON webservice the gated normalizer
+  consumes), so ``RE_CANDIDATES`` lists several plausible spellings per field
+  and resolves the first one present. This is stated plainly rather than
+  guessed silently: every field's resolution -- which candidate matched, or
+  that none did -- is recorded in a :class:`FieldResolutions` log and
+  surfaced on :class:`warehouse.build.BuildResult`. ``plan_code`` and
+  ``s_no`` are part of the documented ``activity_expenditure`` identity
   ``(gp_lgd_code, plan_code, activity_code, s_no)``, so if *no* candidate
   spelling for either is present in the source frame, resolution raises
   :class:`RequiredFieldUnresolved` rather than silently producing an
   all-null identity column; every other RE field is genuinely optional and
-  is allowed to resolve to null, but that outcome is still recorded.
+  is allowed to resolve to null, but that outcome is still recorded. Every
+  row surviving this identity check is also assigned an integer
+  ``expenditure_id`` surrogate (the table's real primary key -- see
+  ``schema.py``), via a caller-supplied ``start_id`` so ids stay unique
+  across every snapshot loaded into one build (see ``build.populate``).
 
 Where the normalizer turns a JSON list into a child table (``pl__fundlist``,
-``aa__...``), the corresponding table here is one-to-many, keyed by the
-child row's own ``row_id`` -- not 1:1 by activity code as PR #9 modeled it,
-which would silently collapse a genuinely repeated line (more than one
-funding scheme, more than one asset) into a spurious duplicate-key conflict.
+``pl__assetdetails``, ``aa__...``), the corresponding table here is keyed by
+``activity_code`` and is strictly 1:1 with ``planned_activity``: the real
+``activity_asset``/``activity_fund`` tables carry no per-row identity of
+their own (no ``row_id`` column), unlike an earlier revision of this module
+that modeled them one-to-many, keyed by an invented ``row_id``, on the
+theory that a repeated funding scheme or asset line needed its own row. A
+second line for the same activity is now treated the same as any other
+conflicting duplicate: quarantined, not kept as a second row.
 """
 
 from __future__ import annotations
@@ -42,7 +50,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .clean import strip_leading_zeros, to_code, to_datetime, to_decimal_money
+from .clean import strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int
 
 # --------------------------------------------------------------------- quarantine
 
@@ -475,7 +483,10 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
         id_vars=["source_system", "source_run_id", "activity_code"],
         var_name="column", value_name="beneficiary_count",
     )
-    melted["beneficiary_count"] = to_decimal_money(melted["beneficiary_count"])
+    # beneficiary_count is a COUNT, not money: parsed as a nullable integer
+    # (see warehouse.schema's activity_nsap DDL), never routed through
+    # decimal money parsing.
+    melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
     melted["age_band"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][1])
@@ -541,21 +552,30 @@ def _pl_child(
     table: str, activity_codes: set[str], quarantine: Quarantine,
     *, source_system: str, source_run_id: str,
 ) -> pd.DataFrame:
+    """Shape one activity_asset/activity_fund frame, keyed on activity_code.
+
+    These tables are strictly 1:1 with planned_activity (see
+    ``schema.DDL["activity_asset"]``'s comment): the real source gives no
+    per-row identity of its own, so a second line for the same activity is
+    a genuine conflicting duplicate, quarantined by ``_dedupe`` like any
+    other -- not a second legitimate row keyed on an invented row_id.
+    """
+
+    keep = ["source_system", "source_run_id", "activity_code"] + columns
     if child.empty:
-        return pd.DataFrame(columns=["source_system", "source_run_id", "row_id", "activity_code"] + columns)
+        return pd.DataFrame(columns=keep)
     out = child.rename(columns=renames)
     identity = _base_identity(out)
     for name, series in identity.items():
         out[name] = series
-    keep = ["source_system", "source_run_id", "row_id", "activity_code"] + columns
     out = _ensure_columns(out, keep)
     frame = out[keep].copy()
     frame["activity_code"] = to_code(frame["activity_code"])
     for column in money_columns:
         frame[column] = to_decimal_money(frame[column])
-    frame = frame.dropna(subset=["row_id", "activity_code"])
+    frame = frame.dropna(subset=["activity_code"])
     frame = _dedupe(
-        frame, ["source_system", "source_run_id", "row_id"], table, quarantine,
+        frame, ["source_system", "source_run_id", "activity_code"], table, quarantine,
         source_system=source_system, source_run_id=source_run_id,
     )
     return _restrict(
@@ -763,7 +783,7 @@ def physical_progress(pp: pd.DataFrame, activity_codes: set[str], quarantine: Qu
     )
 
 
-# --------------------------------------------------------------------- RE: recommended_expenditure
+# --------------------------------------------------------------------- RE: activity_expenditure
 
 # Unverified against real data (see module docstring): several candidate
 # spellings per field, first match wins.
@@ -784,7 +804,10 @@ RE_CANDIDATES: dict[str, tuple[str, ...]] = {
     "st": ("st", "ST"),
     "total_expenditure": ("totalExpenditure", "total_expenditure", "Total Expenditure"),
 }
-RECOMMENDED_EXPENDITURE_COLUMNS = [
+# expenditure_id is prepended once the surrogate id is assigned, at the end
+# of activity_expenditure() below -- not part of the RE_CANDIDATES-driven
+# shaping, since it has no source-field spelling at all.
+ACTIVITY_EXPENDITURE_COLUMNS = [
     "source_system", "source_run_id", "gp_lgd_code", "plan_code", "activity_code",
     "fiscal_year", "s_no", "scheme_name", "approved_cost_action_plan",
     "technical_approved_cost", "admin_approved_cost", "general", "sc", "st",
@@ -796,20 +819,40 @@ RE_MONEY_COLUMNS = [
 ]
 # plan_code and s_no, together with gp_lgd_code and activity_code (both of
 # which come from base identity, not from RE_CANDIDATES), make up the
-# documented recommended_expenditure identity. An all-null identity
-# component is definitionally unusable, so these two are the only RE_CANDIDATES
-# fields required to resolve to a real column; every other field here is
-# descriptive/financial detail that a row can legitimately lack.
+# documented activity_expenditure business identity
+# (gp_lgd_code, plan_code, activity_code, s_no) -- distinct from its actual
+# primary key, the expenditure_id surrogate assigned below. An all-null
+# identity component is definitionally unusable, so these two are the only
+# RE_CANDIDATES fields required to resolve to a real column; every other
+# field here is descriptive/financial detail that a row can legitimately
+# lack.
 RE_REQUIRED_FIELDS = frozenset({"plan_code", "s_no"})
 
 
-def recommended_expenditure(
+def activity_expenditure(
     re: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
     *, source_system: str, source_run_id: str,
     resolutions: FieldResolutions | None = None,
+    start_id: int = 1,
 ) -> pd.DataFrame:
+    """Shape one activity_expenditure frame and assign its expenditure_id.
+
+    ``expenditure_id`` is the table's real primary key (an INTEGER
+    surrogate -- see ``schema.py``): the source gives this table no row
+    identity beyond the (gp_lgd_code, plan_code, activity_code, s_no)
+    business tuple, which is too wide a composite to use as a foreign-key
+    target from activity_voucher. Ids are assigned contiguously starting at
+    ``start_id`` *after* every quarantine/dedupe/restrict step, so they are
+    dense and 1:1 with the rows actually returned. The caller
+    (``build.populate``) is responsible for advancing ``start_id`` by the
+    number of rows returned before calling this again for the next
+    snapshot, so ids stay unique across every snapshot loaded into one
+    build.
+    """
+
+    columns = ["expenditure_id"] + ACTIVITY_EXPENDITURE_COLUMNS
     if re.empty:
-        return pd.DataFrame(columns=RECOMMENDED_EXPENDITURE_COLUMNS)
+        return pd.DataFrame(columns=columns)
     if resolutions is None:
         resolutions = FieldResolutions()
     identity = _base_identity(re)
@@ -818,15 +861,15 @@ def recommended_expenditure(
                                       "activity_code", "fiscal_year")})
     for canonical, candidates in RE_CANDIDATES.items():
         series, matched = _first_present(
-            re, "recommended_expenditure", canonical, candidates,
+            re, "activity_expenditure", canonical, candidates,
             required=canonical in RE_REQUIRED_FIELDS,
         )
         frame[canonical] = series
         resolutions.add(
-            "recommended_expenditure", canonical, matched,
+            "activity_expenditure", canonical, matched,
             source_system=source_system, source_run_id=source_run_id,
         )
-    frame = frame[RECOMMENDED_EXPENDITURE_COLUMNS]
+    frame = frame[ACTIVITY_EXPENDITURE_COLUMNS]
     frame["plan_code"] = to_code(frame["plan_code"])
     frame["activity_code"] = to_code(frame["activity_code"])
     frame["s_no"] = to_code(frame["s_no"])
@@ -835,9 +878,12 @@ def recommended_expenditure(
     frame = frame.dropna(subset=["gp_lgd_code", "plan_code", "activity_code", "s_no"])
     frame = _dedupe(
         frame, ["source_system", "source_run_id", "gp_lgd_code", "plan_code", "activity_code", "s_no"],
-        "recommended_expenditure", quarantine, source_system=source_system, source_run_id=source_run_id,
+        "activity_expenditure", quarantine, source_system=source_system, source_run_id=source_run_id,
     )
-    return _restrict(
-        frame, "recommended_expenditure", "gp_lgd_code", gp_codes, quarantine,
+    frame = _restrict(
+        frame, "activity_expenditure", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    frame = frame.reset_index(drop=True)
+    frame.insert(0, "expenditure_id", range(start_id, start_id + len(frame)))
+    return frame
