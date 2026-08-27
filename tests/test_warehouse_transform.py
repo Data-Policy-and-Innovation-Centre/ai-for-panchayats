@@ -162,6 +162,37 @@ def test_activity_nsap_one_row_per_nonzero_category():
     assert rows[("widow", "na", "female")] == 2
 
 
+def test_activity_nsap_assigns_nsap_id_starting_at_start_id():
+    """nsap_id is a real, published column and the table's actual primary
+    key (confirmed against the real table header -- see schema.py), not an
+    invented row_id. It must be assigned the same way
+    activity_expenditure.expenditure_id is: densely, starting at the
+    caller-supplied start_id, 1:1 with the rows actually returned."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male=3,
+        activityNsap_old_age_below_eighty_female=0,
+        activityNsap_widow_female=2,
+    )])
+    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1", start_id=101)
+    assert len(out) == 2  # two non-zero categories survive
+    assert list(out["nsap_id"]) == [101, 102]  # dense, starting at start_id
+
+
+def test_activity_nsap_empty_frame_has_nsap_id_column():
+    """The table is legitimately empty in every real build to date (all
+    source NSAP/PMAY-G columns are null in the real planning file); the
+    empty-frame path must still declare the nsap_id column so downstream
+    code (e.g. warehouse.load.insert's column reindex) never sees a
+    missing column."""
+
+    pl = pd.DataFrame([_row(row_id="r0", business_id="7")])  # no NSAP columns at all
+    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    assert out.empty
+    assert "nsap_id" in out.columns
+
+
 # --------------------------------------------------------------------- activity_expenditure identity
 
 

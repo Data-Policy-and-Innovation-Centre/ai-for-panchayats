@@ -97,6 +97,45 @@ def test_activity_nsap_beneficiary_count_is_integer_not_money(tmp_path: Path):
         con.close()
 
 
+def test_activity_nsap_keys_on_nsap_id_not_the_business_tuple(tmp_path: Path):
+    """nsap_id is a real, published column in the target schema (confirmed
+    against the real table header, which lists it first) and the table's
+    actual primary key -- not an invented artifact the way
+    activity_asset/activity_fund's old row_id was. Two rows sharing the
+    same (activity_code, category, age_band, gender) business tuple but
+    different nsap_id must both be insertable (the business tuple is no
+    longer the key); two rows sharing the same nsap_id must not."""
+
+    con = duckdb.connect(str(tmp_path / "schema.duckdb"))
+    try:
+        _create_all(con)
+        columns = [row[1] for row in con.execute("PRAGMA table_info('activity_nsap')").fetchall()]
+        assert columns[0] == "nsap_id"
+        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute(
+            "INSERT INTO plan VALUES (NULL, NULL, 'P1', '123', '2021-2022', NULL, NULL, NULL)"
+        )
+        con.execute(
+            "INSERT INTO planned_activity VALUES "
+            "(NULL, NULL, '7', 'P1', '123', '2021-2022', NULL, NULL, NULL, NULL, NULL, NULL, "
+            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+        )
+        # Same business tuple, different nsap_id: allowed now that nsap_id
+        # (not the business tuple) is the key.
+        con.execute(
+            "INSERT INTO activity_nsap VALUES (1, NULL, NULL, '7', 'widow', 'na', 'female', 2)"
+        )
+        con.execute(
+            "INSERT INTO activity_nsap VALUES (2, NULL, NULL, '7', 'widow', 'na', 'female', 3)"
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            con.execute(
+                "INSERT INTO activity_nsap VALUES (1, NULL, NULL, '7', 'disabled', 'na', 'male', 1)"
+            )
+    finally:
+        con.close()
+
+
 def test_activity_asset_and_fund_have_no_row_id_and_key_on_activity_code(tmp_path: Path):
     """activity_asset/activity_fund are strictly 1:1 with planned_activity:
     no invented row_id, keyed on activity_code alone. A second row for the

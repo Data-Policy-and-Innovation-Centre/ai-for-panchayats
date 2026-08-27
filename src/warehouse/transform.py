@@ -466,13 +466,24 @@ def activity_community_service(pl: pd.DataFrame, activity_codes: set[str], quara
 
 
 def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
-                   *, source_system: str, source_run_id: str) -> pd.DataFrame:
-    """Wide NSAP beneficiary columns to one row per non-zero category."""
+                   *, source_system: str, source_run_id: str, start_id: int = 1) -> pd.DataFrame:
+    """Wide NSAP beneficiary columns to one row per non-zero category.
 
+    ``nsap_id`` is a real, published column in the target schema (confirmed
+    against the real table header) and the table's actual primary key --
+    not an invented artifact the way activity_asset/activity_fund's old
+    row_id was. It is assigned the same way
+    ``transform.activity_expenditure`` assigns ``expenditure_id``: densely,
+    starting at the caller-supplied ``start_id``, after every filtering
+    step, so ids are 1:1 with the rows actually returned. The caller
+    (``build.populate``) advances ``start_id`` by the number of rows
+    returned before calling this again for the next snapshot.
+    """
+
+    columns = ["nsap_id", "source_system", "source_run_id", "activity_code", "category",
+               "age_band", "gender", "beneficiary_count"]
     out = _clean_pl(pl)
     present = [c for c in NSAP_COLUMNS if c in out.columns]
-    columns = ["source_system", "source_run_id", "activity_code", "category",
-               "age_band", "gender", "beneficiary_count"]
     if not present:
         return pd.DataFrame(columns=columns)
 
@@ -491,9 +502,11 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
     melted["age_band"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][1])
     melted["gender"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][2])
-    return melted[columns].drop_duplicates(
+    frame = melted[[c for c in columns if c != "nsap_id"]].drop_duplicates(
         ["source_system", "source_run_id", "activity_code", "category", "age_band", "gender"],
     ).reset_index(drop=True)
+    frame.insert(0, "nsap_id", range(start_id, start_id + len(frame)))
+    return frame
 
 
 # --------------------------------------------------------------------- PL children: asset, fund

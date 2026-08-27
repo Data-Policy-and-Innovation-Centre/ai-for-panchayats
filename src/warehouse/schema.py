@@ -11,10 +11,8 @@ plus three lookup tables) rather than the earlier from-first-principles
 design. Departures from that spec are deliberate and documented where they
 occur below: the ``activity_code`` foreign key on ``activity_expenditure``
 is intentionally unenforced, the ``plan_code`` foreign key the spec gives
-for that same table is deliberately NOT added, ``dim_lsdg_theme`` has no
-declared primary key (the spec itself gives none), and ``activity_nsap``
-keeps a composite business key rather than the spec's ``nsap_id`` surrogate
-(see the ``activity_nsap`` comment below for why).
+for that same table is deliberately NOT added, and ``dim_lsdg_theme`` has
+no declared primary key (the spec itself gives none).
 
 This change was scoped to six specific, explicitly enumerated divergences
 between the prior DDL and the spec (see the accompanying report). Beyond
@@ -27,11 +25,14 @@ asset_loc_overflow_json}`` (the four ``main_asset_*`` fields already exist
 on ``planned_activity`` in this codebase, not on ``activity_asset``);
 ``activity_fund.fund_overflow_json``; ``activity_training.
 training_capacity_raw``; and ``activity_community_service.
-community_service_raw``. None of these have any corresponding source-field
-mapping in ``transform.py``, so adding the column here would only ever
-produce an all-NULL column with no way to verify against real data that it
-is even correctly named or placed. This is stated plainly rather than
-guessed silently -- see the accompanying report's "spec conflicts" section.
+community_service_raw``. These ARE confirmed to be real columns in the
+target tables (unlike the nsap_id question below, which turned out to be
+a real column too, once checked) -- they are left out for a different
+reason: none of them has any corresponding source-field mapping in
+``transform.py`` yet, so adding the column here would only ever produce an
+all-NULL column with no working loader. That is loader work belonging with
+the relevant source adapter, not schema work, and is deliberately deferred
+rather than faked with an all-NULL column.
 
 PRIMARY KEYS -- single run per build
 ---------------------------------------------------------------------------
@@ -77,21 +78,28 @@ drops leading zeros.
 
 INTEGER SURROGATE KEYS
 ---------------------------------------------------------------------------
-``activity_expenditure.expenditure_id`` and ``voucher.voucher_pk`` are
-INTEGER surrogates because the source data gives these tables no natural
-row identity of their own (an expenditure line is identified by the source
-only as one row among many for a GP/plan/activity/serial-number tuple; a
-voucher only by a compound business tuple that itself only carries a
-UNIQUE constraint, not a key -- see ``voucher`` below). ``expenditure_id`` is
-assigned by ``transform.activity_expenditure`` via an explicit, caller-supplied
-starting offset (see that function's ``start_id`` parameter and
-``build.populate``'s running counter) so that every row loaded across a
-build's snapshots gets a distinct id without a database round trip.
-``voucher.voucher_pk`` has no loader wired yet (no canonical "voucher" kind
-exists in ``transform.py``/``build.py`` yet -- see the module report for
-this change), so it is declared as a plain ``INTEGER PRIMARY KEY`` without a
-generator; whichever adapter first populates this table needs to assign it
-the same way ``expenditure_id`` is assigned.
+``activity_expenditure.expenditure_id``, ``activity_nsap.nsap_id``, and
+``voucher.voucher_pk`` are INTEGER surrogates: all three are real, published
+columns in the target schema (not artifacts invented by this codebase, the
+way ``activity_asset``/``activity_fund``'s old ``row_id`` was -- see the
+comments on those two tables), because the source data gives each of these
+three tables no natural row identity of its own beyond a wide business
+tuple (an expenditure line only as one row among many for a
+GP/plan/activity/serial-number tuple; an NSAP beneficiary line only as one
+row among many for an activity/category/age-band/gender tuple; a voucher
+only by a compound business tuple that itself only carries a UNIQUE
+constraint, not a key -- see ``voucher`` below).
+
+``expenditure_id`` and ``nsap_id`` are both assigned the same way: by
+their respective ``transform`` function (``transform.activity_expenditure``,
+``transform.activity_nsap``) via an explicit, caller-supplied ``start_id``,
+advanced by ``build.populate``'s running counter after each snapshot, so
+every row loaded across a build's snapshots gets a distinct, dense id
+without a database round trip. ``voucher.voucher_pk`` has no loader wired
+yet (no canonical "voucher" kind exists in ``transform.py``/``build.py`` yet
+-- see the module report for this change), so it is declared as a plain
+``INTEGER PRIMARY KEY`` without a generator; whichever adapter first
+populates this table needs to assign it the same start_id-and-counter way.
 
 DIM_CODE PROVENANCE -- keep, don't launder
 ---------------------------------------------------------------------------
@@ -260,19 +268,20 @@ DDL: dict[str, str] = {
     # activity: a wide "male count / female count / ..." row makes "how many
     # widows were served" a column-name lookup instead of a filter.
     #
-    # The spec's ER diagram gives this table an integer surrogate PK
-    # (nsap_id) rather than a business key. That surrogate is deliberately
-    # NOT added here: the table is legitimately empty in every real build
-    # to date, its natural (activity_code, category, age_band, gender)
-    # tuple is already a clean, non-invented business key (unlike the
-    # activity_asset/activity_fund row_id this same spec asks to remove),
-    # and adding a second surrogate-id generator (beyond
-    # activity_expenditure.expenditure_id) for a table with zero real rows
-    # to validate it against was judged not worth the risk. This is called
-    # out explicitly rather than silently diverging from the spec -- see
-    # the accompanying report.
+    # nsap_id is a real, published column in the target schema (confirmed
+    # against the real table header, which lists it first) -- not an
+    # invented artifact of this codebase the way activity_asset/
+    # activity_fund's old row_id was. It is an INTEGER surrogate assigned
+    # the same way activity_expenditure.expenditure_id is (see the module
+    # docstring's "INTEGER SURROGATE KEYS" section): by
+    # transform.activity_nsap via a caller-supplied start_id, advanced by
+    # build.populate's running counter. The table is legitimately EMPTY in
+    # every real build to date (all source NSAP/PMAY-G columns are null in
+    # the real planning file), so the id-assignment logic is tested at the
+    # unit level rather than through an end-to-end populated build.
     "activity_nsap": """
         CREATE TABLE activity_nsap (
+            nsap_id           INTEGER PRIMARY KEY,
             source_system     VARCHAR,
             source_run_id     VARCHAR,
             activity_code     VARCHAR,
@@ -280,7 +289,6 @@ DDL: dict[str, str] = {
             age_band          VARCHAR,
             gender            VARCHAR,
             beneficiary_count INTEGER,
-            PRIMARY KEY (activity_code, category, age_band, gender),
             FOREIGN KEY (activity_code) REFERENCES planned_activity (activity_code)
         )""",
     # Expenditure ("recommended"/activity-wise expenditure, source kind RE).

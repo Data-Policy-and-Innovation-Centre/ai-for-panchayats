@@ -43,7 +43,7 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "activity_delegation": ("activity_code",),
     "activity_training": ("activity_code",),
     "activity_community_service": ("activity_code",),
-    "activity_nsap": ("activity_code", "category", "age_band", "gender"),
+    "activity_nsap": ("nsap_id",),
     "activity_asset": ("activity_code",),
     "activity_fund": ("activity_code",),
     "admin_approval": ("row_id",),
