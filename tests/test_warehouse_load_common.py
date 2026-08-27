@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,7 +13,9 @@ from warehouse.load_common import (
     CsvSchemaError,
     DateParseError,
     FiscalYearError,
+    IdentifierError,
     MoneyParseError,
+    ProvenanceError,
     ProvenanceSpec,
     add_provenance,
     clean_identifier,
@@ -96,6 +99,13 @@ def test_date_parser_requires_explicit_format_and_preserves_source_blanks():
         parse_date(source, date_format="mixed", column="voucher_date")
 
 
+def test_iso_date_requires_zero_padded_month_and_day():
+    source = pd.Series(["2021-1-02", "2021-01-2"])
+
+    with pytest.raises(DateParseError, match="source blanks=0"):
+        parse_date_series(source, date_format="%Y-%m-%d", column="approval_date")
+
+
 def test_money_is_exact_decimal_and_absent_is_not_zero():
     source = pd.Series(["0.10", "0.20", "", "0"])
     parsed = parse_money_series(source, column="amount", places=2)
@@ -113,6 +123,31 @@ def test_unparseable_money_raises_instead_of_becoming_zero():
 
     # Parsing without a target scale remains lossless for planning-side input.
     assert parse_money("Rs. 1,25,000.5", column="planned_cost") == Decimal("125000.5")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["1.001", Decimal("1.001"), "-0.001"],
+)
+def test_money_with_more_fractional_digits_fails_closed(value):
+    with pytest.raises(MoneyParseError, match="fractional digits"):
+        parse_money(value, column="amount", places=2)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Decimal("sNaN"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        float("nan"),
+        float("inf"),
+        np.float32("nan"),
+    ],
+)
+def test_nonfinite_money_values_raise_typed_error(value):
+    with pytest.raises(MoneyParseError):
+        parse_money(value, column="amount")
 
 
 def test_fiscal_year_short_form_and_nonconsecutive_year_fail():
@@ -138,6 +173,21 @@ def test_identifier_cleaning_preserves_leading_zeroes_and_strips_float_artifact(
     assert pd.isna(cleaned.iloc[2])
 
 
+@pytest.mark.parametrize(
+    "value", ["", "nan", "NaN", "none", "NULL", "<NA>", None, pd.NA]
+)
+def test_identifier_missing_sentinels_normalize_to_none(value):
+    assert clean_identifier(value) is None
+
+
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), np.float32("nan"), Decimal("NaN")]
+)
+def test_nonfinite_numeric_identifier_raises_typed_error(value):
+    with pytest.raises(IdentifierError):
+        clean_identifier(value)
+
+
 def test_provenance_is_deterministic_and_matches_canonical_contract():
     kwargs = {
         "source_system": "egramswaraj",
@@ -158,6 +208,33 @@ def test_provenance_is_deterministic_and_matches_canonical_contract():
     assert row["gp_code"] == "0123"
     assert row["business_id"] == "0007"
     assert row["source_file"] == "2021-2022/PL.csv"
+
+
+def test_child_provenance_has_distinct_row_id_but_root_source_record_id():
+    root = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+    )
+    child = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+        parent_row_id=root["row_id"],
+        position=0,
+    )
+
+    assert child["row_id"] != root["row_id"]
+    assert child["parent_row_id"] == root["row_id"]
+    assert child["source_record_id"] == root["source_record_id"]
 
 
 def test_add_provenance_advances_source_rows_and_does_not_mutate_input():
@@ -211,3 +288,49 @@ def test_add_provenance_empty_frame_still_declares_contract_columns():
     )
     assert "row_id" in out.columns
     assert "source_record_id" in out.columns
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"source_system": "", "source_run_id": "run", "source_file": "PL.csv"},
+        {"source_system": "src", "source_run_id": pd.NA, "source_file": "PL.csv"},
+        {"source_system": "src", "source_run_id": "run", "source_file": ""},
+        {
+            "source_system": "src",
+            "source_run_id": "run",
+            "source_file": "PL.csv",
+            "schema_version": pd.NA,
+        },
+        {
+            "source_system": "src",
+            "source_run_id": "run",
+            "source_file": "PL.csv",
+            "source_kind": "",
+        },
+    ],
+)
+def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs):
+    with pytest.raises(ProvenanceError):
+        ProvenanceSpec(**kwargs)
+
+
+def test_provenance_normalizes_nullable_optional_fields_without_raw_type_error():
+    row = row_provenance(
+        source_system="src",
+        source_run_id="run",
+        source_file="PL.csv",
+        source_row_number=1,
+        source_kind="PL",
+        gp_code=pd.NA,
+        gp_name=pd.NA,
+        fiscal_year=pd.NA,
+        business_id=pd.NA,
+        parent_row_id=pd.NA,
+        position=pd.NA,
+    )
+    assert row["gp_code"] is None
+    assert row["gram_panchayat_name"] is None
+    assert row["fiscal_year"] is None
+    assert row["parent_row_id"] is None
+    assert row["pos"] is None

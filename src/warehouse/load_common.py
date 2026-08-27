@@ -29,10 +29,11 @@ import csv
 import hashlib
 import json
 import math
+import numbers
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +142,66 @@ _INTEGER_DOT_ZERO = re.compile(r"^(-?\d+)\.0+$")
 _FISCAL_YEAR = re.compile(r"^(?P<start>\d{4})-(?P<end>\d{4})$")
 _CURRENCY_PREFIX = re.compile(r"(?i)^\s*(?:₹|rs\.?|inr)\s*")
 _NULL_TEXT = frozenset({"", "na", "n/a", "nan", "none", "null", "<na>", "-"})
+_IDENTIFIER_NULL_TEXT = frozenset({"", "nan", "none", "null", "<na>", "n/a"})
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _nonfinite_number(value: object) -> bool:
+    """Whether a numeric scalar is NaN or infinite.
+
+    ``numpy`` scalar numbers are intentionally handled without importing
+    numpy directly.  ``math.isfinite`` accepts the common numpy real scalar
+    types and the guarded conversion covers numeric implementations that do
+    not expose the exact same protocol.
+    """
+
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    if isinstance(value, numbers.Number) and not isinstance(value, bool):
+        try:
+            return not math.isfinite(value)
+        except (OverflowError, TypeError, ValueError):
+            try:
+                return not math.isfinite(float(value))
+            except (OverflowError, TypeError, ValueError):
+                return False
+    return False
+
+
+def _optional_text(value: object, *, field: str) -> str | None:
+    """Normalize a nullable provenance scalar without leaking raw TypeError."""
+
+    if _is_blank(value):
+        return None
+    try:
+        text = str(value).strip()
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError(f"{field} cannot be converted to text") from exc
+    return text or None
+
+
+def _required_text(value: object, *, field: str) -> str:
+    text = _optional_text(value, field=field)
+    if text is None:
+        raise ProvenanceError(f"{field} must be a non-empty string")
+    return text
+
+
+def _optional_position(value: object) -> int | None:
+    if _nonfinite_number(value):
+        raise ProvenanceError("position must be a non-negative integer or null")
+    if _is_blank(value):
+        return None
+    if not isinstance(value, numbers.Integral) or isinstance(value, bool) or value < 0:
+        raise ProvenanceError("position must be a non-negative integer or null")
+    return int(value)
+
+
+def _safe_identifier(value: object, *, field: str) -> str | None:
+    try:
+        return clean_identifier(value, column=field)
+    except IdentifierError as exc:
+        raise ProvenanceError(f"{field} is not a valid identifier: {exc}") from exc
 
 
 def _is_blank(value: object) -> bool:
@@ -403,6 +464,15 @@ def parse_date_series(
             parsed_null_count=-1,
         )
     source_blank_count = int(_source_blank_mask(series).sum())
+    source_text = series.astype("string").str.strip()
+    strict_iso_invalid = pd.Series(False, index=series.index)
+    if date_format == "%Y-%m-%d":
+        # pandas accepts unpadded month/day components even with an explicit
+        # ``%m``/``%d`` format.  The warehouse contract is stricter: ISO dates
+        # must be exactly ``YYYY-MM-DD`` before semantic date parsing.
+        strict_iso_invalid = ~_source_blank_mask(series) & ~source_text.str.fullmatch(
+            _ISO_DATE
+        )
     try:
         parsed = pd.to_datetime(series, format=date_format, errors="coerce", exact=True)
     except (TypeError, ValueError) as exc:
@@ -412,6 +482,8 @@ def parse_date_series(
             source_blank_count=source_blank_count,
             parsed_null_count=-1,
         ) from exc
+    if strict_iso_invalid.any():
+        parsed = parsed.mask(strict_iso_invalid)
     parsed_null_count = int(parsed.isna().sum())
     if parsed_null_count != source_blank_count:
         invalid_rows = ~_source_blank_mask(series) & parsed.isna()
@@ -468,6 +540,10 @@ def _decimal_from_value(
     allow_null: bool,
     places: int | None,
 ) -> Decimal | None:
+    if _nonfinite_number(value):
+        raise MoneyParseError(
+            column=column, value=value, row=row, detail="is not finite"
+        )
     if _is_blank(value) or (
         isinstance(value, str) and value.strip().casefold() in _NULL_TEXT
     ):
@@ -482,10 +558,6 @@ def _decimal_from_value(
     if isinstance(value, bool):
         raise MoneyParseError(
             column=column, value=value, row=row, detail="boolean values are not money"
-        )
-    if isinstance(value, float) and not math.isfinite(value):
-        raise MoneyParseError(
-            column=column, value=value, row=row, detail="is not finite"
         )
     if isinstance(value, Decimal):
         decimal_value = value
@@ -510,7 +582,7 @@ def _decimal_from_value(
             column=column, value=value, row=row, detail="is not finite"
         )
     if places is not None:
-        if not isinstance(places, int) or places < 0:
+        if not isinstance(places, int) or isinstance(places, bool) or places < 0:
             raise MoneyParseError(
                 column=column,
                 value=value,
@@ -518,8 +590,19 @@ def _decimal_from_value(
                 detail="has an invalid decimal scale",
             )
         quantum = Decimal(1).scaleb(-places)
+        # Quantisation must never silently round a source amount.  Decimal's
+        # exponent includes trailing zeroes, so a caller can also detect a
+        # source scale mismatch rather than unknowingly accepting it.
+        fractional_digits = max(0, -decimal_value.as_tuple().exponent)
+        if fractional_digits > places:
+            raise MoneyParseError(
+                column=column,
+                value=value,
+                row=row,
+                detail=f"has {fractional_digits} fractional digits; at most {places} are allowed",
+            )
         try:
-            decimal_value = decimal_value.quantize(quantum, rounding=ROUND_HALF_UP)
+            decimal_value = decimal_value.quantize(quantum)
         except (InvalidOperation, ValueError) as exc:
             raise MoneyParseError(
                 column=column,
@@ -540,8 +623,9 @@ def parse_money_series(
     """Parse a monetary Series to exact ``Decimal`` values.
 
     ``places=None`` is lossless.  Pass ``places=2`` when targeting a
-    ``DECIMAL(16,2)`` warehouse column; quantisation is then explicit and uses
-    ``ROUND_HALF_UP``.  Invalid non-blank input raises :class:`MoneyParseError`.
+    ``DECIMAL(16,2)`` warehouse column; values with more fractional digits are
+    rejected instead of rounded.  Invalid non-blank input raises
+    :class:`MoneyParseError`.
     """
 
     values: list[Decimal | None] = []
@@ -644,6 +728,8 @@ def clean_identifier(
     or zero filling occurs.
     """
 
+    if _nonfinite_number(value):
+        raise IdentifierError(f"{column!r} at row {row!r}: identifier is not finite")
     if _is_blank(value):
         if allow_null:
             return None
@@ -652,9 +738,11 @@ def clean_identifier(
         raise IdentifierError(
             f"{column!r} at row {row!r}: boolean is not an identifier"
         )
-    if isinstance(value, float) and not math.isfinite(value):
-        raise IdentifierError(f"{column!r} at row {row!r}: identifier is not finite")
     text = str(value).strip()
+    if text.casefold() in _IDENTIFIER_NULL_TEXT:
+        if allow_null:
+            return None
+        raise IdentifierError(f"{column!r} at row {row!r}: identifier is blank")
     match = _INTEGER_DOT_ZERO.fullmatch(text)
     if match is not None:
         text = match.group(1)
@@ -697,22 +785,30 @@ def deterministic_provenance_id(
 ) -> str:
     """Derive a stable row ID from the source identity and row location."""
 
+    source_system = _required_text(source_system, field="source_system")
+    source_run_id = _required_text(source_run_id, field="source_run_id")
+    source_file = _required_text(source_file, field="source_file")
+    source_kind = _required_text(source_kind, field="source_kind")
+    gp_code = _safe_identifier(gp_code, field="gp_code")
+    fiscal_year = _optional_text(fiscal_year, field="fiscal_year") or ""
+    parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
+    position = _optional_position(position)
     if (
-        not isinstance(source_row_number, int)
+        not isinstance(source_row_number, numbers.Integral)
         or isinstance(source_row_number, bool)
         or source_row_number < 1
     ):
         raise ProvenanceError("source_row_number must be a positive integer")
     values = (
         "warehouse-loader-provenance-v1",
-        str(source_system),
-        str(source_run_id),
+        source_system,
+        source_run_id,
         Path(source_file).as_posix(),
-        str(source_kind),
-        clean_identifier(gp_code) or "",
-        str(fiscal_year or ""),
-        str(source_row_number),
-        str(parent_row_id or ""),
+        source_kind,
+        gp_code or "",
+        fiscal_year,
+        str(int(source_row_number)),
+        parent_row_id or "",
         str(position) if position is not None else "",
     )
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
@@ -731,25 +827,44 @@ def row_provenance(
     gp_name: str | None = None,
     fiscal_year: str | None = None,
     business_id: str | None = None,
+    source_record_id: str | None = None,
     parent_row_id: str | None = None,
     position: int | None = None,
     mapping_status: str = "mapped",
 ) -> dict[str, Any]:
     """Return a row matching the existing canonical provenance contract."""
 
-    required_text = {
-        "source_system": source_system,
-        "source_run_id": source_run_id,
-        "source_file": source_file,
-        "schema_version": schema_version,
-    }
-    missing = tuple(
-        name
-        for name, value in required_text.items()
-        if not isinstance(value, str) or not value.strip()
+    source_system = _required_text(source_system, field="source_system")
+    source_run_id = _required_text(source_run_id, field="source_run_id")
+    source_file = _required_text(source_file, field="source_file")
+    schema_version = _required_text(schema_version, field="schema_version")
+    source_kind = _required_text(source_kind, field="source_kind")
+    gp_code = _safe_identifier(gp_code, field="gp_code")
+    gp_name = _optional_text(gp_name, field="gp_name")
+    fiscal_year = _optional_text(fiscal_year, field="fiscal_year")
+    business_id = _safe_identifier(business_id, field="business_id")
+    parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
+    position = _optional_position(position)
+    mapping_status = _required_text(mapping_status, field="mapping_status")
+    explicit_source_record_id = _optional_text(
+        source_record_id, field="source_record_id"
     )
-    if missing:
-        raise ProvenanceError(f"missing provenance field(s): {missing}")
+    # Validate the row number before deriving either root or child identity.
+    if (
+        not isinstance(source_row_number, numbers.Integral)
+        or isinstance(source_row_number, bool)
+        or source_row_number < 1
+    ):
+        raise ProvenanceError("source_row_number must be a positive integer")
+    root_id = deterministic_provenance_id(
+        source_system=source_system,
+        source_run_id=source_run_id,
+        source_file=source_file,
+        source_row_number=int(source_row_number),
+        source_kind=source_kind,
+        gp_code=gp_code,
+        fiscal_year=fiscal_year,
+    )
     row_id = deterministic_provenance_id(
         source_system=source_system,
         source_run_id=source_run_id,
@@ -761,21 +876,27 @@ def row_provenance(
         parent_row_id=parent_row_id,
         position=position,
     )
+    if explicit_source_record_id is not None:
+        record_id = explicit_source_record_id
+    else:
+        # Children retain the root source record identity even though their
+        # row IDs include parent/position and are therefore distinct.
+        record_id = root_id
     return {
         "row_id": row_id,
         "parent_row_id": parent_row_id,
         "pos": position,
-        "source_system": str(source_system),
-        "source_run_id": str(source_run_id),
-        "source_record_id": row_id,
-        "schema_version": str(schema_version),
+        "source_system": source_system,
+        "source_run_id": source_run_id,
+        "source_record_id": record_id,
+        "schema_version": schema_version,
         "source_file": Path(source_file).as_posix(),
-        "source_kind": str(source_kind),
-        "gp_code": clean_identifier(gp_code),
+        "source_kind": source_kind,
+        "gp_code": gp_code,
         "gram_panchayat_name": gp_name,
         "fiscal_year": fiscal_year,
         "plan_year": fiscal_year,
-        "business_id": clean_identifier(business_id),
+        "business_id": business_id,
         "mapping_status": mapping_status,
     }
 
@@ -792,6 +913,23 @@ class ProvenanceSpec:
     gp_code: str | None = None
     gp_name: str | None = None
     fiscal_year: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an unusable spec before even an empty frame is processed."""
+
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate all required and nullable metadata without filesystem IO."""
+
+        _required_text(self.source_system, field="source_system")
+        _required_text(self.source_run_id, field="source_run_id")
+        _required_text(self.source_file, field="source_file")
+        _required_text(self.source_kind, field="source_kind")
+        _required_text(self.schema_version, field="schema_version")
+        _safe_identifier(self.gp_code, field="gp_code")
+        _optional_text(self.gp_name, field="gp_name")
+        _optional_text(self.fiscal_year, field="fiscal_year")
 
 
 def add_provenance(
@@ -810,19 +948,31 @@ def add_provenance(
     supplied as constants on ``ProvenanceSpec`` or as existing frame columns.
     """
 
+    if not isinstance(frame, pd.DataFrame):
+        raise ProvenanceError("frame must be a pandas DataFrame")
+    if not isinstance(spec, ProvenanceSpec):
+        raise ProvenanceError("spec must be a ProvenanceSpec")
+    # ``ProvenanceSpec.__post_init__`` validates normal construction.  Keep an
+    # explicit call here so a future mutable/spec-like implementation still
+    # fails before column iteration, including for empty frames.
+    spec.validate()
     if (
-        not isinstance(start_row_number, int)
+        not isinstance(start_row_number, numbers.Integral)
         or isinstance(start_row_number, bool)
         or start_row_number < 1
     ):
         raise ProvenanceError("start_row_number must be a positive integer")
     for name in (business_id_column, gp_code_column, fiscal_year_column):
-        if name is not None and name not in frame.columns:
+        if name is None:
+            continue
+        if not isinstance(name, str) or not name.strip():
+            raise ProvenanceError(f"provenance source column name is invalid: {name!r}")
+        if name not in frame.columns:
             raise ProvenanceError(f"provenance source column is missing: {name}")
     out = frame.copy()
     rows: list[dict[str, Any]] = []
-    for offset, (index, row) in enumerate(frame.iterrows()):
-        source_row_number = start_row_number + offset
+    for offset, (_, row) in enumerate(frame.iterrows()):
+        source_row_number = int(start_row_number) + offset
         gp_code = row[gp_code_column] if gp_code_column else spec.gp_code
         fiscal_year = (
             row[fiscal_year_column] if fiscal_year_column else spec.fiscal_year
