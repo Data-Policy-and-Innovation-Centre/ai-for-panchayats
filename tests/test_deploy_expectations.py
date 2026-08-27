@@ -136,3 +136,21 @@ def test_a_numeric_result_still_accepts_an_exact_decimal_string():
 def test_a_numeric_result_against_non_numeric_text_is_a_mismatch():
     with pytest.raises(KnownAnswerError, match="probe"):
         _check([(Decimal("1"),)], (("not-a-number",),))
+
+
+def test_an_expectations_object_defining_no_checks_is_rejected():
+    """An empty contract would let verify() run no loops and publish anyway."""
+    with pytest.raises(SnapshotManifestError, match="define no checks"):
+        Expectations(relation_row_counts={})
+
+    with pytest.raises(SnapshotManifestError, match="define no checks"):
+        loads('{"schema_version": 1}')
+
+    with pytest.raises(SnapshotManifestError, match="define no checks"):
+        loads('{"schema_version": 1, "relation_row_counts": {}, "known_answer_queries": []}')
+
+
+def test_a_misspelled_expectations_key_is_rejected():
+    """Silently ignoring it would drop every check it was meant to carry."""
+    with pytest.raises(SnapshotManifestError, match="unexpected fields: relation_row_count"):
+        loads('{"schema_version": 1, "relation_row_count": {"plan": 3}}')

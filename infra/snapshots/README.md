@@ -49,13 +49,20 @@ break that property.
 
 ## Current status
 
-No manifest is committed yet: the artifact has not been uploaded, so no real
-object version exists to pin. The artifact identified for deployment is
-`database_allgps.duckdb`, 1,011,363,840 bytes, SHA-256
-`903cb371d4637d7b9e15391097de0970c6a9dd7295e578cc4585cf0ccb92a7db`, carrying 19
-tables and **no views** — the consumer creates its five views at startup via
-`DuckDBFileAdapter.ensure_views()`. It ships labelled
-`provisional_full_state_snapshot`: see the known exceptions #43/#49, #61, #62.
+`full_state.json` is the one committed manifest. It pins the uploaded
+`database_allgps.duckdb` — 1,011,363,840 bytes, SHA-256
+`903cb371d4637d7b9e15391097de0970c6a9dd7295e578cc4585cf0ccb92a7db` — at a real
+S3 object version, together with the object version of the expectations file
+that gates it.
+
+The artifact carries 19 tables and **no views**: the consumer creates its five
+views at startup via `DuckDBFileAdapter.ensure_views()`, so a startup check
+that queries a view must run after that, not against the raw file.
+
+It ships labelled `provisional_full_state_snapshot`. Packaging proves a task
+opens the exact identified artifact; it is not evidence the artifact is
+independently reproducible or correct. See the known exceptions #43/#49, #61
+and #62, which the manifest also records.
 
 One further defect is carried by the artifact and is **not** fixed by packaging
 it. `activity_voucher.voucher_pk` was written through a float64 during the

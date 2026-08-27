@@ -65,6 +65,15 @@ class Expectations:
     def __post_init__(self) -> None:
         if not isinstance(self.relation_row_counts, Mapping):
             raise SnapshotManifestError("relation_row_counts must be a JSON object")
+        # An expectations object that defines nothing would let verify() run no
+        # loops at all and publish the snapshot with the aggregate gate
+        # silently skipped -- the failure mode this whole file exists to
+        # prevent. An empty contract is a broken contract, not a permissive one.
+        if not self.relation_row_counts and not self.queries:
+            raise SnapshotManifestError(
+                "expectations define no checks: expected a non-empty "
+                "relation_row_counts or known_answer_queries"
+            )
         for name, count in self.relation_row_counts.items():
             if not isinstance(name, str) or not name.strip():
                 raise SnapshotManifestError("relation_row_counts keys must be relation names")
@@ -77,6 +86,15 @@ class Expectations:
 def from_mapping(payload: Mapping[str, Any]) -> Expectations:
     if not isinstance(payload, Mapping):
         raise SnapshotManifestError("expectations payload must be a JSON object")
+
+    known = {"schema_version", "relation_row_counts", "known_answer_queries"}
+    unexpected = sorted(set(payload) - known)
+    if unexpected:
+        # A misspelled key would otherwise be ignored and the checks it was
+        # meant to carry would vanish without a word.
+        raise SnapshotManifestError(
+            f"expectations have unexpected fields: {', '.join(unexpected)}"
+        )
 
     version = payload.get("schema_version", SCHEMA_VERSION)
     if version != SCHEMA_VERSION:
