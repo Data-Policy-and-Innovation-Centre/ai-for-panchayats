@@ -41,10 +41,15 @@ resource "aws_budgets_budget" "account_monthly" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
-  # Actual spend, after the fact.
+  # Actual spend, after the fact. 80% of the default $450 limit is $360,
+  # below the account's ~$390/month baseline documented on
+  # monthly_cost_alarm_usd -- so at 80% this fired every month from the
+  # unrelated baseline alone, before this deployment spent a cent, which is
+  # exactly the false-alarm noise the budget's own threshold was chosen to
+  # avoid. 90% ($405) sits above that baseline.
   notification {
     comparison_operator        = "GREATER_THAN"
-    threshold                  = 80
+    threshold                  = 90
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
     subscriber_email_addresses = [var.alarm_email]

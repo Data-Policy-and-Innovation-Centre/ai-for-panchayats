@@ -15,6 +15,24 @@ variable "snapshot_state_key" {
   default     = "prdw/snapshot/terraform.tfstate"
 }
 
+variable "snapshot_state_bucket" {
+  description = <<-EOT
+    S3 bucket holding the snapshot module's state. Must match the bucket the
+    snapshot module was itself initialized against -- see
+    bootstrap_state_bucket.sh's TF_STATE_BUCKET override. A mismatch here
+    either finds no state at all or reads stale outputs from the default
+    bucket instead of the one the override actually wrote to.
+  EOT
+  type        = string
+  default     = "dpic-prdw-tfstate"
+}
+
+variable "snapshot_state_region" {
+  description = "Region of the snapshot module's state bucket. Must match the snapshot module's own backend region."
+  type        = string
+  default     = "ap-south-1"
+}
+
 variable "image_tag" {
   description = "Image tag to deploy. Required: an empty value registers <repo>: and every task fails to pull."
   type        = string

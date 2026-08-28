@@ -286,11 +286,21 @@ resource "aws_ecs_service" "app" {
     container_port   = 8000
   }
 
-  depends_on = [aws_lb_listener.http]
-
-  lifecycle {
-    ignore_changes = [desired_count]
-  }
+  # Whichever of these three actually associates the target group with a
+  # load balancer -- the http listener itself with certificate_arn == "" and
+  # enable_cdn == false, the https listener with a certificate, or the
+  # separate from_cdn rule behind CloudFront -- must exist first, or the ECS
+  # API can be asked to register targets against a group no listener has
+  # attached yet. Depending on only aws_lb_listener.http missed the CDN case:
+  # with enable_cdn == true (the default) that listener's own default action
+  # is a fixed-response 403, and the forward lives on aws_lb_listener_rule.
+  # from_cdn instead. Listing all three is harmless for the two whose count
+  # is 0 in a given mode -- a resource with no instances is a no-op dependency.
+  depends_on = [
+    aws_lb_listener.http,
+    aws_lb_listener.https,
+    aws_lb_listener_rule.from_cdn,
+  ]
 
   # No autoscaling, deliberately (#54).
   #

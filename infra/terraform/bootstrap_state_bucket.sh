@@ -154,7 +154,7 @@ except ValueError:
     sys.exit(1)
 
 covered = set()
-for st in doc.get("Statement", []):
+for st in listify(doc.get("Statement", [])):
     if st.get("Effect") != "Deny" or "NotPrincipal" in st or "NotAction" in st:
         continue
     actions = set(listify(st.get("Action")))
@@ -224,6 +224,13 @@ A backend block cannot read variables, so \`terraform init\` would target those
 and ignore the bucket this script just prepared. Initialise with:
 
   terraform -chdir="$SCRIPT_DIR/snapshot" init -reconfigure -backend-config="bucket=$BUCKET" -backend-config="region=$REGION"
+
+The app module reads the snapshot module's outputs through its own
+data.terraform_remote_state, which has the same problem one layer up: pass
+the override through as plan/apply variables, or it silently reads
+$DEFAULT_BUCKET instead of $BUCKET.
+
+  terraform -chdir="$SCRIPT_DIR/app" plan -var snapshot_state_bucket=$BUCKET -var snapshot_state_region=$REGION ...
 
 NOTE
 fi

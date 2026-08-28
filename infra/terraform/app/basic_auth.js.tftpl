@@ -19,6 +19,10 @@ function handler(event) {
 
     // Header names arrive lowercased, whatever the client sent.
     if (headers.authorization && headers.authorization.value === "${expected}") {
+        // The origin has no use for the credential, and this hop to the ALB
+        // is plain HTTP (see cdn.tf) -- forwarding it would send the shared
+        // pilot password across the internet in cleartext on every request.
+        delete headers.authorization;
         return request;
     }
 

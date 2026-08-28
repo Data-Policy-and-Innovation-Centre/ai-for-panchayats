@@ -10,9 +10,9 @@ data "terraform_remote_state" "snapshot" {
   backend = "s3"
 
   config = {
-    bucket = "dpic-prdw-tfstate"
+    bucket = var.snapshot_state_bucket
     key    = var.snapshot_state_key
-    region = var.region
+    region = var.snapshot_state_region
   }
 }
 
