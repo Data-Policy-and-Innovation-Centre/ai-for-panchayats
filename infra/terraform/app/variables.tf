@@ -104,9 +104,15 @@ variable "enable_cdn" {
 }
 
 variable "alarm_email" {
-  description = "Address to subscribe to the alarm topic. Empty creates the topic and alarms but no subscription, so alarms are visible in the console and nothing is emailed."
+  description = "Address subscribed to the alarm topic and the budget notifications."
   type        = string
-  default     = ""
+  # Committed rather than left empty or kept in a gitignored tfvars. Empty means
+  # the alarms publish to a topic nobody is subscribed to and NO budget is
+  # created at all, which is worse than the address being visible -- and it is
+  # already visible, in the author line of every commit in this repository.
+  # A tfvars would keep it out of the tree at the cost of a clean checkout
+  # silently dropping both the subscription and the budget.
+  default = "yashaswi@uchicagotrust.org"
 }
 
 variable "monthly_cost_alarm_usd" {
