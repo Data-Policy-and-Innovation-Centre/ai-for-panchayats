@@ -69,7 +69,15 @@ resource "aws_budgets_budget" "account_monthly" {
 # The service is serving nothing. This is the alarm that matters most: a task
 # that cannot verify its snapshot exits before opening its port, so a bad
 # snapshot or a bad image shows up here rather than as errors.
+#
+# Skipped entirely when desired_count is 0: that is the deliberate first pass
+# of the two-part bootstrap in service.tf (see the BOOTSTRAP ORDER note on
+# aws_ecr_repository.app), where zero running tasks is the intended state,
+# not an outage, and building/pushing the initial image plus seeding the
+# secret can easily run past this alarm's five-minute window.
 resource "aws_cloudwatch_metric_alarm" "no_running_tasks" {
+  count = var.desired_count > 0 ? 1 : 0
+
   alarm_name          = "${var.name}-no-running-tasks"
   namespace           = "ECS/ContainerInsights"
   metric_name         = "RunningTaskCount"

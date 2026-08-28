@@ -177,7 +177,11 @@ for st in listify(doc.get("Statement", [])):
         continue
     covered |= set(listify(st.get("Resource")))
 
-sys.exit(0 if required.issubset(covered) else 1)
+# A Resource of "*" denies insecure transport account-wide, which necessarily
+# covers this bucket and its objects too even though neither ARN appears
+# literally -- treat it as satisfying both required entries.
+ok = "*" in covered or required.issubset(covered)
+sys.exit(0 if ok else 1)
 '; then
   echo "keeping existing bucket policy (already denies insecure transport)"
 elif [ -n "$current_policy" ]; then
