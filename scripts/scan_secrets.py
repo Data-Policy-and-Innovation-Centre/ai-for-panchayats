@@ -30,7 +30,10 @@ ALLOWLIST = REPO_ROOT / ".secretsallow"
 
 # Paths whose contents are checksums or vendored metadata, not credentials.
 SKIP = re.compile(
-    r"(^|/)(uv\.lock|dvc\.lock|poetry\.lock|package-lock\.json)$"
+    # Lockfiles are inventories of content digests. Every entry is a 64-hex
+    # literal by construction, so scanning them yields only false positives.
+    r"(^|/)(uv\.lock|dvc\.lock|poetry\.lock|package-lock\.json"
+    r"|\.terraform\.lock\.hcl)$"
     r"|(^|/)\.dvc/|\.dvc$"
     r"|(^|/)\.secretsallow$"
     r"|(^|/)scripts/scan_secrets\.py$"
