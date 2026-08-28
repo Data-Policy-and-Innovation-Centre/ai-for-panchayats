@@ -10,8 +10,37 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONSUMER_REPO="${CONSUMER_REPO:-https://github.com/Data-Policy-and-Innovation-Centre/Odisha_PRDW.git}"
 CONSUMER_REF="${CONSUMER_REF:?set CONSUMER_REF to the consumer commit to build}"
 IMAGE="${IMAGE:-odisha-prdw-chatbot}"
-TAG="${TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD)-${CONSUMER_REF:0:7}}"
-PLATFORM="${PLATFORM:-linux/amd64}"   # Fargate runs x86_64 unless configured otherwise
+# ARM64 by default, because that is what the service runs: variables.tf
+# defaults cpu_architecture to ARM64 (Graviton is 44% cheaper per vCPU-hour in
+# ap-south-1). Defaulting to amd64 here meant a caller who omitted PLATFORM got
+# an x86 image, and the only thing standing between that and a dead deployment
+# was a tag SUFFIX -- which service.tf checks as a string. Terraform accepts
+# the revision, then no task can start.
+PLATFORM="${PLATFORM:-linux/arm64}"
+
+# The suffix is derived from the platform, never supplied independently, so the
+# two cannot disagree. This is the other half of the precondition in
+# service.tf: that one refuses a tag whose suffix contradicts the task
+# architecture, this one refuses to MINT such a tag.
+case "$PLATFORM" in
+  linux/arm64) ARCH_SUFFIX="-arm64" ;;
+  linux/amd64) ARCH_SUFFIX="" ;;
+  *) echo "[build] unsupported PLATFORM '$PLATFORM' (expected linux/arm64 or linux/amd64)" >&2; exit 2 ;;
+esac
+
+TAG="${TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD)-${CONSUMER_REF:0:7}${ARCH_SUFFIX}}"
+
+# An explicitly supplied TAG still has to agree with the platform being built.
+if [[ "$ARCH_SUFFIX" == "-arm64" && "$TAG" != *-arm64 ]]; then
+  echo "[build] PLATFORM=$PLATFORM builds an arm64 image, but TAG='$TAG' does not end in -arm64." >&2
+  echo "[build] service.tf requires the suffix to match the task architecture." >&2
+  exit 2
+fi
+if [[ "$ARCH_SUFFIX" == "" && "$TAG" == *-arm64 ]]; then
+  echo "[build] TAG='$TAG' claims arm64 but PLATFORM=$PLATFORM builds x86_64." >&2
+  echo "[build] Terraform would accept this tag and then no task could start." >&2
+  exit 2
+fi
 
 CTX="$(mktemp -d)"
 trap 'rm -rf "$CTX"' EXIT
@@ -68,4 +97,17 @@ else
   docker build \
     --platform "$PLATFORM" -f "$CTX/docker/Dockerfile" -t "$IMAGE:$TAG" "$CTX"
 fi
+# Assert what was actually built, not what was asked for. The checks above
+# constrain the tag; this one constrains the artifact -- a buildx builder
+# without the requested emulation can quietly produce the host architecture,
+# and the tag would still read correctly.
+built="$(docker image inspect --format '{{.Architecture}}' "$IMAGE:$TAG")"
+want="${PLATFORM#linux/}"
+if [[ "$built" != "$want" ]]; then
+  echo "[build] built image is $built but PLATFORM=$PLATFORM was requested." >&2
+  echo "[build] Pushing this under $TAG would register a task definition that cannot start." >&2
+  exit 1
+fi
+echo "[build] verified image architecture: $built"
+
 echo "$IMAGE:$TAG"
