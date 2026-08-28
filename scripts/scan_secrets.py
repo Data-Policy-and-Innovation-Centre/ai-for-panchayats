@@ -124,7 +124,13 @@ EXEMPTIONS = [
         # happens to contain infra/snapshots/*.json is not this project's
         # manifest and gets no exemption.
         re.compile(r"^infra/snapshots/[^/]+\.json$"),
-        re.compile(r'"sha256"\s*:\s*"([0-9a-fA-F]{64})"'),
+        # Lowercase only, matching SnapshotManifest.__post_init__, which
+        # rejects anything but 64 lowercase hex ("sha256 must be 64 lowercase
+        # hexadecimal characters"). An uppercase value in this field can never
+        # be a digest this project would deploy, so exempting it would only
+        # ever hide a misplaced secret. Fail closed on what the manifest
+        # itself refuses.
+        re.compile(r'"sha256"\s*:\s*"([0-9a-f]{64})"'),
         "the content digest of a published snapshot artifact",
     ),
 ]

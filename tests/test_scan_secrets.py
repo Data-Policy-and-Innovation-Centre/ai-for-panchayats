@@ -170,6 +170,20 @@ def test_a_republished_snapshot_needs_no_new_allowlist_entry(repo: Path):
     assert scan_range(repo, "main~2..main") == []
 
 
+def test_an_uppercase_digest_in_the_manifest_is_still_flagged(repo: Path):
+    """The exemption tracks what the manifest will actually accept.
+
+    SnapshotManifest.__post_init__ rejects anything but 64 lowercase hex, so an
+    uppercase value in this field can never be a digest this project deploys --
+    only a secret that happens to be sitting there. Exempting it would widen
+    the hole rather than close it.
+    """
+    commit(repo, "infra/snapshots/full_state.json", _manifest("A" * 64), "uppercase")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+
+
 def test_a_credential_field_in_a_manifest_is_still_flagged(repo: Path):
     """Path alone must not exempt: same file, credential-shaped field."""
     body = _manifest().replace(
