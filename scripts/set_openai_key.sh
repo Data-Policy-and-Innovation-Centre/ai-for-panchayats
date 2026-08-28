@@ -111,17 +111,27 @@ echo "[key] deployment $DEPLOY_ID"
 # cold start can exceed while fetching and checksumming the snapshot, and it can
 # also return on the PRE-roll steady state and hand us the old task to verify.
 # Poll the named deployment instead.
-deadline=$((SECONDS + ROLL_TIMEOUT)); state=""
+deadline=$((SECONDS + ROLL_TIMEOUT)); state=""; rolled=0
 while (( SECONDS < deadline )); do
   read -r pid state running <<<"$(aws ecs describe-services --cluster "$NAME" --services "$NAME" \
     --region "$REGION" --query 'services[0].deployments[?status==`PRIMARY`]|[0].[id,rolloutState,runningCount]' \
     --output text 2>/dev/null || echo ". . .")"
-  [[ "$pid" == "$DEPLOY_ID" && "$state" == "COMPLETED" && "${running:-0}" -ge 1 ]] && break
+  [[ "$pid" == "$DEPLOY_ID" && "$state" == "COMPLETED" && "${running:-0}" -ge 1 ]] && { rolled=1; break; }
   [[ "$state" == "FAILED" ]] && { echo "[key] rollout FAILED (circuit breaker may have rolled back)" >&2; rollback_hint; exit 1; }
   sleep 15
 done
-if [[ "$state" != "COMPLETED" ]]; then
-  echo "[key] rollout did not complete within ${ROLL_TIMEOUT}s (last state: ${state:-unknown})" >&2; rollback_hint; exit 1
+# A flag set at the break, not a re-test of one variable. Checking `state`
+# alone was wrong in a way that mattered: if ECS restores an earlier
+# deployment, PRIMARY becomes a DIFFERENT id that is already COMPLETED, the
+# loop correctly keeps waiting, and then the deadline passes with state ==
+# COMPLETED -- so the old postcondition declared success and the probe ran
+# against a task still holding the OLD key. The check now cannot disagree
+# with the condition it is meant to confirm.
+if (( ! rolled )); then
+  echo "[key] rollout did not complete within ${ROLL_TIMEOUT}s" >&2
+  echo "[key]   wanted deployment $DEPLOY_ID COMPLETED with at least one running task" >&2
+  echo "[key]   saw deployment ${pid:-unknown} ${state:-unknown} running ${running:-0}" >&2
+  rollback_hint; exit 1
 fi
 echo "[key] rollout complete"
 
