@@ -100,6 +100,9 @@ resource "aws_iam_role_policy" "task_snapshot" {
 # The value is deliberately NOT set here: Terraform state would then carry the
 # key. Set it once with:
 #   aws secretsmanager put-secret-value --secret-id <name> --secret-string sk-...
+# On a brand new deployment this secret has no version yet when the default
+# service tries to start -- see the BOOTSTRAP ORDER note on aws_ecr_
+# repository.app in service.tf for the two-pass sequence that avoids it.
 resource "aws_secretsmanager_secret" "openai" {
   name        = "${var.name}/openai-api-key"
   description = "OPENAI_API_KEY for the Odisha PR&DW chatbot router"

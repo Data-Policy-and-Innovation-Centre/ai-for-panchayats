@@ -6,7 +6,7 @@ output "url" {
   value = (
     var.enable_cdn ? "https://${aws_cloudfront_distribution.app[0].domain_name}" :
     var.certificate_arn == "" ? "http://${aws_lb.main.dns_name}" :
-    "https://${aws_lb.main.dns_name}"
+    "https://${var.public_domain}"
   )
 }
 

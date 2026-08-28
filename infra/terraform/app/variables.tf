@@ -86,6 +86,24 @@ variable "certificate_arn" {
   default     = ""
 }
 
+variable "public_domain" {
+  description = <<-EOT
+    Public hostname the certificate_arn certificate covers. Required whenever
+    certificate_arn is set: the `url` output uses it instead of the ALB's own
+    *.amazonaws.com hostname, which the certificate does not cover -- a
+    client connecting to that name gets a TLS hostname mismatch even though
+    the handshake itself succeeds. Pointing this hostname's DNS at the load
+    balancer is outside Terraform's scope here.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.certificate_arn == "" || length(trimspace(var.public_domain)) > 0
+    error_message = "public_domain must be set when certificate_arn is set."
+  }
+}
+
 variable "ingress_cidrs" {
   description = "Who may reach the load balancer. Narrow this for a private test."
   type        = list(string)

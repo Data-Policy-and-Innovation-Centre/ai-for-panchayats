@@ -1,3 +1,18 @@
+# BOOTSTRAP ORDER on a brand new deployment (empty account/workspace, no
+# prior apply): this module creates the ECR repository, the OpenAI secret
+# (metadata only, see aws_secretsmanager_secret.openai below), AND a service
+# that starts pulling var.image_tag immediately, all in one apply. Neither
+# the image nor the secret's value can exist yet, so a first apply run with
+# the real desired_count fails every task at launch -- image-pull error, then
+# (once an image exists) a secrets-injection error -- and never stabilizes.
+# Bootstrap in two passes instead:
+#   1. terraform apply -var desired_count=0 -var image_tag=<placeholder>
+#   2. docker/build.sh && push the image; aws secretsmanager put-secret-value
+#      --secret-id <output.openai_secret_name> --secret-string sk-...
+#   3. terraform apply -var desired_count=1 -var image_tag=<real tag>
+# Not enforced in code: a precondition here cannot see whether the secret
+# has a version or the tag exists in ECR without itself requiring one of
+# them to already exist, which is the same chicken-and-egg problem.
 resource "aws_ecr_repository" "app" {
   name                 = var.name
   image_tag_mutability = "IMMUTABLE" # a tag must always mean one image
