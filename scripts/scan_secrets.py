@@ -90,6 +90,62 @@ RULES = [
     ),
 ]
 
+# A content digest is structurally the opposite of a credential: publishing it
+# is the entire point, and it cannot be rotated. But it is 64 hex characters,
+# which is also what an issued API secret looks like, so `bare-sha256-literal`
+# cannot tell them apart on shape alone.
+#
+# Baselining each one in .secretsallow does not work here. The fingerprint is
+# sha256(path\0value), so a NEW digest is a NEW fingerprint: every snapshot
+# republish would open a pull request that is red by construction and needs a
+# hand-written allow-list line. An allow-list that grows on every routine
+# release stops being read, and an unread allow-list is where a real credential
+# goes to hide.
+#
+# So the exemption is structural instead: it must match BOTH a path and a field
+# name. A 64-hex literal in any other file is still a finding, and a 64-hex
+# literal in a credential-shaped field of a manifest is still a finding -- only
+# the digest field of a snapshot manifest is exempt.
+@dataclass(frozen=True)
+class Exemption:
+    name: str
+    path: re.Pattern
+    # Must capture the exempt value in group 1: the span of that group is what
+    # gets compared against findings, so a rule firing on the same characters
+    # is suppressed while one firing elsewhere in the file is not.
+    pattern: re.Pattern
+    why: str
+
+
+EXEMPTIONS = [
+    Exemption(
+        "snapshot-manifest-digest",
+        # Anchored at the repository root: a vendored or copied tree that
+        # happens to contain infra/snapshots/*.json is not this project's
+        # manifest and gets no exemption.
+        re.compile(r"^infra/snapshots/[^/]+\.json$"),
+        re.compile(r'"sha256"\s*:\s*"([0-9a-fA-F]{64})"'),
+        "the content digest of a published snapshot artifact",
+    ),
+]
+
+
+def exempt_spans(text: str, path: str) -> list[tuple[int, int]]:
+    """Character ranges in this file that are known not to be credentials.
+
+    Scoped by path AND by the field the value is assigned to. Both must match,
+    so renaming the field or moving the file re-arms the scanner rather than
+    silently keeping the exemption.
+    """
+    spans = []
+    for exemption in EXEMPTIONS:
+        if not exemption.path.search(path):
+            continue
+        for match in exemption.pattern.finditer(text):
+            spans.append(match.span(1))
+    return spans
+
+
 # Values that are obviously not credentials, so contributors are not forced to
 # baseline every example. Keep this list short and literal.
 PLACEHOLDERS = re.compile(
@@ -121,8 +177,15 @@ def fingerprint(path: str, value: str) -> str:
 
 def scan_text(text: str, path: str, commit: str = "worktree") -> list[Finding]:
     findings: dict[str, Finding] = {}
+    exempt = exempt_spans(text, path)
     for rule in RULES:
         for match in rule.pattern.finditer(text):
+            span = match.span(1) if rule.pattern.groups else match.span(0)
+            # Containment, not equality: a rule whose group covers part of an
+            # exempt value is describing the same characters, and a substring
+            # of a published digest is not a credential either.
+            if any(start <= span[0] and span[1] <= end for start, end in exempt):
+                continue
             value = (match.group(1) if rule.pattern.groups else match.group(0)).strip()
             if PLACEHOLDERS.match(value):
                 continue

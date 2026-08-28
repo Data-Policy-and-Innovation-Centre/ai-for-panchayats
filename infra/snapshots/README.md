@@ -62,10 +62,12 @@ break that property.
 ## Current status
 
 `full_state.json` is the one committed manifest. It pins the uploaded
-`database_allgps.duckdb` — 1,011,363,840 bytes, SHA-256
-`903cb371d4637d7b9e15391097de0970c6a9dd7295e578cc4585cf0ccb92a7db` — at a real
-S3 object version, together with the object version of the expectations file
-that gates it.
+`database_allgps.duckdb` by byte size and SHA-256, at a real S3 object version,
+together with the object version of the expectations file that gates it.
+
+Read the current values from the manifest itself rather than from this page:
+they change on every republish, and a digest copied into prose goes stale
+silently. `jq '{byte_size, sha256, version_id}' infra/snapshots/full_state.json`
 
 The artifact carries 19 tables and **no views**: the consumer creates its five
 views at startup via `DuckDBFileAdapter.ensure_views()`, so a startup check
