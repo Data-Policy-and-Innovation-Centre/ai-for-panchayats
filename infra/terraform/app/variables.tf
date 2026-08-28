@@ -116,9 +116,15 @@ variable "alarm_email" {
 }
 
 variable "monthly_cost_alarm_usd" {
-  description = "Estimated-charges threshold for the account billing alarm. The chatbot alone projects to about $109/month; the default leaves room for that plus the unrelated workloads sharing this account, while still firing well before a runaway."
+  description = "Monthly budget threshold. Account-wide, not per-project: linked accounts cannot use cost allocation tags as a cost filter, so this counts every workload sharing the account."
   type        = number
-  default     = 600
+  # The account's baseline is roughly $390/month from workloads that are not
+  # this project. This deployment is about $52. $450 therefore sits ~$60 above
+  # the baseline -- about the size of the whole deployment -- so a runaway here
+  # is caught while the existing unrelated spend does not trip it. If the other
+  # workloads grow this will start firing on them, which is a signal about the
+  # account rather than a false alarm.
+  default = 450
 }
 
 variable "cpu_architecture" {
