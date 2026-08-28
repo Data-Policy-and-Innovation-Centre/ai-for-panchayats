@@ -19,6 +19,16 @@ REGION="${AWS_REGION:-ap-south-1}"
 NAME="${NAME:-prdw-chatbot}"
 SECRET_ID="${SECRET_ID:-$NAME/openai-api-key}"
 URL="${URL:-https://d1ahy2bofi6eol.cloudfront.net}"
+
+# Probe credentials are validated HERE, before anything is mutated. Checking
+# caller input after the secret has been rotated and the service rolled is the
+# same ordering mistake this probe block exists to fix: the destructive half
+# succeeds and the operator learns they mistyped a variable afterwards.
+CHATBOT_USER="${CHATBOT_USER:-}"
+CHATBOT_PASSWORD="${CHATBOT_PASSWORD:-}"
+if [[ -n "$CHATBOT_USER$CHATBOT_PASSWORD" && ( -z "$CHATBOT_USER" || -z "$CHATBOT_PASSWORD" ) ]]; then
+  echo "[key] set both CHATBOT_USER and CHATBOT_PASSWORD, or neither" >&2; exit 2
+fi
 CHAT_MODEL="${CHAT_MODEL:-gpt-5.4-mini}"
 EMBED_MODEL="${EMBED_MODEL:-text-embedding-3-large}"
 ROLL_TIMEOUT="${ROLL_TIMEOUT:-1500}"   # entrypoint fetches ~1GB before uvicorn
@@ -103,13 +113,66 @@ echo "[key] rollout complete"
 # A 200 proved nothing last time. Fail closed: a missing or unparseable tier is
 # a failure, not a pass, because the consumer app is pinned only at image build
 # time and its response shape can drift underneath us.
+# The endpoint is behind CloudFront Basic authentication (#59), so an
+# unauthenticated probe gets a 401 and this script would report FAILURE on
+# every run -- after it had already rotated the secret and rolled the service.
+# Worst possible order: the destructive half succeeds, the reporting half lies.
+#
+# Credentials come from the environment first so a caller can supply them
+# without Terraform, then from the app module's own output. Never in argv:
+# `ps auxww` is world-readable.
+if [[ -z "$CHATBOT_PASSWORD" ]] && command -v terraform >/dev/null 2>&1; then
+  CHATBOT_USER="$(terraform -chdir="$REPO_ROOT/infra/terraform/app" output -raw basic_auth_username 2>/dev/null || true)"
+  CHATBOT_PASSWORD="$(terraform -chdir="$REPO_ROOT/infra/terraform/app" output -raw basic_auth_password 2>/dev/null || true)"
+fi
+# curl reads a config value as a quoted string in which \\ and \" are escapes,
+# so a password containing either is silently mangled -- `a\b"c` transmits as
+# `ab`. Terraform generates this one without punctuation, but an env-supplied
+# credential is outside our control.
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+supplied_creds=0
+if [[ -n "$CHATBOT_PASSWORD" ]]; then
+  printf 'user = "%s:%s"\n' "$(esc "$CHATBOT_USER")" "$(esc "$CHATBOT_PASSWORD")" > "$TMPD/probe"
+  supplied_creds=1
+else
+  : > "$TMPD/probe"
+fi
+
 echo "[key] checking a real question"
 set +e
 ans=$(curl -sS --max-time 90 -X POST "$URL/query" -H 'Content-Type: application/json' \
+      --config "$TMPD/probe" -w '\n%{http_code}' \
       -d '{"message":"What is the total actual expenditure under each focus area in 2024-2025?"}')
 rc=$?
 set -e
 [[ $rc -ne 0 ]] && { echo "[key] could not reach $URL (curl $rc). Key IS written; service IS rolled." >&2; exit 1; }
+
+code="${ans##*$'\n'}"
+ans="${ans%$'\n'*}"
+rollback_hint() {
+  echo "[key] To roll the secret back: aws secretsmanager update-secret-version-stage \\" >&2
+  echo "[key]   --secret-id $SECRET_ID --version-stage AWSCURRENT --move-to-version-id ${PREV:-<previous>} --region $REGION" >&2
+}
+
+if [[ "$code" == "401" ]]; then
+  if [[ "$supplied_creds" == "1" ]]; then
+    echo "[key] the endpoint rejected the credentials used, so the key could NOT be verified." >&2
+    echo "[key] They may be stale: the pilot password is rotated by replacing random_password.basic_auth." >&2
+  else
+    echo "[key] the endpoint asked for credentials and none were available, so the key could NOT be verified." >&2
+  fi
+  echo "[key] The key IS written and the service IS rolled; only the proof is missing." >&2
+  echo "[key] Verify by hand with the current pilot credentials:" >&2
+  echo "[key]   CHATBOT_USER=\$(terraform -chdir=infra/terraform/app output -raw basic_auth_username) \\" >&2
+  echo "[key]   CHATBOT_PASSWORD=\$(terraform -chdir=infra/terraform/app output -raw basic_auth_password) \\" >&2
+  echo "[key]   CHATBOT_URL=$URL uv run python scripts/benchmark_deployment.py --repeat 1" >&2
+  exit 1
+fi
+if [[ "$code" != "200" ]]; then
+  echo "[key] probe returned HTTP $code, not 200. Key IS written; service IS rolled." >&2
+  rollback_hint
+  exit 1
+fi
 
 printf '%s' "$ans" | python3 -c '
 import sys, json
@@ -120,8 +183,13 @@ except Exception as e:
 t = d.get("tier")
 if not isinstance(t, str):
     sys.exit(f"[key] no usable tier field (got {t!r}) - cannot confirm the key works")
-if t == "fallback":
-    sys.exit("[key] tier=fallback - the key is not working for the router")
-print(f"[key] tier={t} - the deployed task answered a real question")
+# clarify and fallback are both non-answers, and both are HTTP 200. The same
+# classification benchmark_deployment.py uses: a deployment that never
+# executes a query must not pass a check whose whole point is proving it can.
+if t in ("fallback", "clarify"):
+    sys.exit(f"[key] tier={t} - the router declined to answer, so the key is unproven")
+if not d.get("query_id"):
+    sys.exit(f"[key] tier={t} but no query_id - no query was executed")
+print(f"[key] tier={t} query_id={d['query_id']} - the deployed task answered a real question")
 ' || { echo "[key] verification FAILED. To roll back: aws secretsmanager update-secret-version-stage \\
   --secret-id $SECRET_ID --version-stage AWSCURRENT --move-to-version-id ${PREV:-<previous>} --region $REGION" >&2; exit 1; }
