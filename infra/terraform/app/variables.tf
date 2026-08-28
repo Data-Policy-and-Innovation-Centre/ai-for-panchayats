@@ -26,27 +26,27 @@ variable "image_tag" {
 }
 
 variable "task_cpu" {
-  description = "Fargate CPU units. 1 vCPU, measured under #72."
+  description = "Fargate CPU units. 2 vCPU."
   type        = string
-  # Was 2048. Container Insights over six hours of live serving recorded a peak
-  # of 793 CPU units against 2048 reserved -- 39%. Measured p95 latency is 3.6s
-  # and is dominated by LLM round trips, not by DuckDB or by CPU, so halving
-  # this leaves the same peak at 77% of a smaller allocation without moving the
-  # bottleneck. Startup is the one CPU-bound step (SHA-256 over ~1GB, 13s at 2
-  # vCPU) and roughly doubles here, which is immaterial against a 420s grace.
-  default = "1024"
+  # Reverted from 1024. See task_memory: the pair was reduced together and the
+  # reduction failed, so both go back to the known-good values.
+  default = "2048"
 }
 
 variable "task_memory" {
-  description = "Fargate memory in MiB. 4 GB, measured under #72."
+  description = "Fargate memory in MiB. 8 GB."
   type        = string
-  # Was 8192. Peak observed container memory is 630 MiB -- 7.7% of what was
-  # reserved. 4096 is deliberately not the tightest fit the measurement would
-  # allow: DuckDB memory-maps the ~1GB snapshot, so the page cache wants room
-  # the working-set figure does not show, and 1 vCPU only admits 2048-8192 MiB.
-  # This keeps roughly 6x headroom over the observed peak and still saves about
-  # $45/month against the original pair.
-  default = "4096"
+  # Reverted from 4096, which crash-looped: tasks verified the snapshot, opened
+  # the database, then died before "Application startup complete" while the
+  # application materialises its views and in-memory cache tables.
+  #
+  # The 4096 figure came from Container Insights showing a 630 MiB peak, but
+  # that was measured across six hours of an ALREADY-RUNNING task. Steady state
+  # is not the high-water mark: startup builds the cache tables and DuckDB
+  # memory-maps the ~1GB snapshot, and a five-minute metric period cannot see a
+  # spike inside a two-minute startup. Do not re-cut this without measuring
+  # startup peak specifically -- #72.
+  default = "8192"
 }
 
 variable "desired_count" {
