@@ -54,7 +54,25 @@ locals {
 }
 
 resource "aws_ecs_task_definition" "app" {
-  family                   = var.name
+  family = var.name
+
+  # Keep superseded revisions ACTIVE. Without this the provider deregisters
+  # the old revision every time it replaces one, and #57's rollback procedure
+  # -- "restore the prior task definition" -- silently has nothing to restore.
+  #
+  # Found by running the drill rather than by reading the code. Rolling back to
+  # :7 one minute after :8 went live returned:
+  #
+  #   ClientException: TaskDefinition is inactive
+  #
+  # and `list-task-definitions --status ACTIVE` returned exactly one revision
+  # while :1 through :7 were all INACTIVE. An INACTIVE revision cannot start a
+  # task or be assigned to a service, so at that moment the only way back from
+  # a bad deployment was to rebuild the previous image and re-apply -- minutes
+  # of work during an incident, and impossible at all if the previous image tag
+  # had been forgotten.
+  skip_destroy = true
+
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = var.task_cpu
