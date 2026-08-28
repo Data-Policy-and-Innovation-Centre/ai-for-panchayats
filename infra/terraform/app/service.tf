@@ -60,7 +60,37 @@ resource "aws_ecs_task_definition" "app" {
   cpu                      = var.task_cpu
   memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.task.arn
+
+  # Graviton is 44% cheaper per vCPU-hour and per GB-hour in ap-south-1
+  # ($0.02383 vs $0.04256, $0.00261 vs $0.004655), which is the single largest
+  # saving available without giving up capacity. It requires an image built for
+  # the matching architecture -- docker/build.sh takes PLATFORM -- and every
+  # Python dependency has a cp313 aarch64 manylinux wheel, so nothing compiles
+  # from source. A task whose architecture does not match its image fails to
+  # start, so these two must change together.
+  runtime_platform {
+    cpu_architecture        = var.cpu_architecture
+    operating_system_family = "LINUX"
+  }
+
+  # The architecture and the image must agree, and nothing else checks that.
+  # docker/build.sh takes PLATFORM but does not put it in the default tag, so
+  # the two are set by hand and can silently disagree. A mismatch is not loud:
+  # with minimum_healthy_percent at 100 the old task keeps serving, the new one
+  # can never start, `no_running_tasks` stays green because a task IS running,
+  # and `apply` reports success. Convention: an arm64 image tag ends in
+  # "-arm64", so require that here and fail at plan time instead.
+  lifecycle {
+    precondition {
+      condition = (
+        var.cpu_architecture == "ARM64"
+        ? endswith(var.image_tag, "-arm64")
+        : !endswith(var.image_tag, "-arm64")
+      )
+      error_message = "image_tag must end in -arm64 when cpu_architecture is ARM64, and must not otherwise. Build with PLATFORM=linux/arm64 and TAG=<tag>-arm64."
+    }
+  }
+  task_role_arn = aws_iam_role.task.arn
 
   # The snapshot plus its staging copy live here. The default 20 GiB is ample
   # for a ~1 GB artifact; fetch_snapshot refuses to start without headroom.

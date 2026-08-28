@@ -111,3 +111,19 @@ variable "monthly_cost_alarm_usd" {
   type        = number
   default     = 600
 }
+
+variable "cpu_architecture" {
+  description = "Fargate CPU architecture. Must match the architecture the image was built for; a mismatch registers cleanly and then no task can start."
+  type        = string
+  # ARM64, because that is what is deployed. A default that disagrees with
+  # reality is the dangerous one here: image_tag has no default so Terraform
+  # forces the operator to supply it, but this one would be silently dropped --
+  # a clean checkout running `apply -var image_tag=...-arm64` would register an
+  # X86_64 revision pointing at an arm64-only image and exit 0.
+  default = "ARM64"
+
+  validation {
+    condition     = contains(["X86_64", "ARM64"], var.cpu_architecture)
+    error_message = "cpu_architecture must be X86_64 or ARM64."
+  }
+}
