@@ -121,13 +121,16 @@ def from_mapping(payload: Mapping[str, Any]) -> Expectations:
             raise SnapshotManifestError(
                 f"known-answer query {entry.get('name')!r} needs an expected row array"
             )
-        for row in rows:
+        for row_index, row in enumerate(rows):
             # tuple("ok") is ("o", "k"), so a JSON string would silently become
             # a two-column row instead of being rejected.
             if not isinstance(row, (list, tuple)):
+                # No `row!r` here: `expected` rows are derived from protected
+                # source data, and this exception text reaches task logs. Name
+                # the query and the offending index only, never the value.
                 raise SnapshotManifestError(
                     f"known-answer query {entry.get('name')!r} has an expected row "
-                    f"that is not an array: {row!r}"
+                    f"that is not an array at index {row_index}"
                 )
         queries.append(
             KnownAnswerQuery(
