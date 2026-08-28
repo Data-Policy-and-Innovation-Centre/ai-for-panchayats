@@ -221,14 +221,23 @@ image.*
   attestation manifest can otherwise claim the immutable tag.
 - The consumer application is built from a pinned commit of a specific
   repository, and the built image records that commit in its tag.
+- Every input the image is built from is pinned (#84): all 32 Python packages
+  are `==` including transitives, the base image is pinned by manifest digest
+  rather than the moving `python:3.13-slim` tag, and the Node major used for
+  the host-side dashboard build is recorded in `docker/.node-version` and
+  enforced by `build.sh`. Demonstrated rather than asserted: two independent
+  builds of the same commit produced byte-identical image IDs.
 
 **Residual risk**
 
-- `docker/requirements.txt` floats on `>=` with no lockfile, and the Vite build
-  runs `npm ci` on the host with whatever Node happens to be installed.
-  Rebuilding the same tag can therefore produce different content, which makes
-  ECR immutability a weaker guarantee than it appears. Issue **E1** in the
-  continuous-delivery milestone addresses this directly.
+- The pins are enforced only where `build.sh` runs. Nothing stops someone
+  building the image by invoking `docker build` directly, which skips the Node
+  gate entirely. Moving the build into CI (#90) is what makes the enforcement
+  unavoidable rather than conventional.
+- The base image digest must now be bumped by hand, so a security patch in
+  Debian or CPython no longer arrives on the next rebuild. That is the intended
+  trade for reproducibility, but it is a standing obligation rather than a
+  solved problem.
 - Nothing acts on scan findings; scan-on-push records them, and no alarm reads
   them.
 - The image is built on a developer laptop, not in CI. Issue **J** moves it.
@@ -330,7 +339,7 @@ is 30 days and access is IAM-controlled — contained, but not by design.
 | 1 | One shared password, so no per-person identity or revocation | Sized for a bounded pilot with a known group | Signed URLs or edge OIDC |
 | 2 | CloudFront → origin is cleartext | No domain obtainable, so no trusted origin certificate | A registered domain + ACM |
 | 3 | Deployment runs from a long-lived IAM user | No CI identity exists yet | CD milestone, issues G and H |
-| 4 | Python and Node dependencies unpinned | Predates the image build | CD milestone, issue E1 |
+| 4 | Base-image patches now require a manual digest bump | The price of a reproducible build | Automated base-bump PRs |
 | 5 | No record of which snapshot a live task serves | Identity discarded after verification | CD milestone, issue E2 |
 | 6 | No record of who queried the application | Access logging off, and a shared credential could not attribute it anyway | Access logging plus per-person credentials |
 | 7 | Origin shared secret is readable from Terraform state | Inherent to `random_password` | Move to Secrets Manager, or accept |

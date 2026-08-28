@@ -7,6 +7,45 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Prerequisites, checked before anything else happens (#84). The clone and
+# `npm ci` take minutes; discovering there is no docker afterwards wastes all
+# of it. This sits above every other line that does work -- in particular above
+# the TAG default, which shells out to git, so a missing git is reported by
+# name here instead of dying at `command not found` two lines later.
+for tool in git node npm docker; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "[build] required tool not found: $tool" >&2; exit 2; }
+done
+
+# The binary existing is not the same as the daemon running, and Docker Desktop
+# installed-but-stopped is the common case. Without this the build still burns
+# the clone and `npm ci` before failing at the first `docker build`.
+docker info >/dev/null 2>&1 || {
+  echo "[build] docker is installed but the daemon is not reachable; start Docker and retry." >&2; exit 2; }
+
+# The frontend is built on the HOST, outside Docker, so the Node that happens
+# to be installed is a build input as real as any pinned package -- and the
+# consumer only declares `engines: {node: ">=20.0.0"}`, a floor, which permits
+# any future major. docker/.node-version records the major that produced the
+# image now in production.
+NODE_VERSION_FILE="$REPO_ROOT/docker/.node-version"
+[[ -f "$NODE_VERSION_FILE" ]] || { echo "[build] missing $NODE_VERSION_FILE" >&2; exit 2; }
+# Compare majors on both sides. .node-version conventionally holds a full
+# version ("24.9.1") as often as a major ("24"), and a whole-string compare
+# against a full version would reject every Node that could ever be installed.
+WANT_NODE="$(tr -d '[:space:]' < "$NODE_VERSION_FILE")"
+WANT_NODE_MAJOR="${WANT_NODE#v}"; WANT_NODE_MAJOR="${WANT_NODE_MAJOR%%.*}"
+HAVE_NODE="$(node --version)"            # e.g. v24.1.0
+HAVE_NODE_MAJOR="${HAVE_NODE#v}"; HAVE_NODE_MAJOR="${HAVE_NODE_MAJOR%%.*}"
+if [[ "$HAVE_NODE_MAJOR" != "$WANT_NODE_MAJOR" ]]; then
+  echo "[build] node major $HAVE_NODE_MAJOR does not match the pinned major $WANT_NODE_MAJOR ($HAVE_NODE)." >&2
+  echo "[build] The dashboard bundle is a build output; a different Node major can change it." >&2
+  echo "[build] Install Node $WANT_NODE_MAJOR (nvm use $WANT_NODE_MAJOR / fnm use $WANT_NODE_MAJOR), or change" >&2
+  echo "[build] $NODE_VERSION_FILE deliberately and rebuild the deployed image." >&2
+  exit 2
+fi
+echo "[build] node $HAVE_NODE (major $WANT_NODE_MAJOR pinned), npm $(npm --version)"
 CONSUMER_REPO="${CONSUMER_REPO:-https://github.com/Data-Policy-and-Innovation-Centre/Odisha_PRDW.git}"
 CONSUMER_REF="${CONSUMER_REF:?set CONSUMER_REF to the consumer commit to build}"
 IMAGE="${IMAGE:-odisha-prdw-chatbot}"

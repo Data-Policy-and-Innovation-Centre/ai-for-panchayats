@@ -5,7 +5,19 @@
 # version-pinned DuckDB snapshot from private S3, verifies its object version,
 # byte count and SHA-256, checks the aggregate gate, and only then publishes it
 # to task-local storage. A task that cannot prove its database never serves.
-FROM python:3.13-slim
+# Pinned by digest, not by tag (#84). `python:3.13-slim` is a moving target:
+# it advances on every patch release and every Debian base rebuild, so the same
+# commit built a week apart started from different bytes. That is the largest
+# unpinned input in the image -- larger than any single package -- and it is
+# invisible, because the tag string never changes.
+#
+# This digest is a manifest LIST covering amd64 and arm64, so it pins both
+# platforms build.sh supports rather than nailing the image to one.
+#
+# The cost is deliberate: security patches in the base now require a conscious
+# bump here instead of arriving on the next rebuild. Bump it, rebuild, deploy,
+# and let the deployment prove it -- the same rule the Python pins follow.
+FROM python:3.13-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
