@@ -1,0 +1,16 @@
+# Terraform state can contain resource metadata and must never be committed;
+# the S3 backend is the only source of truth.
+.terraform/
+# .terraform.lock.hcl IS committed: it pins provider versions/hashes so a
+# later apply cannot silently pick up a different provider build.
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+# Terraform also auto-loads the JSON forms; without these an operator's
+# environment values could be committed as trackable files.
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+!example.tfvars
+crash.log

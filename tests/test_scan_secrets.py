@@ -40,7 +40,11 @@ def repo(tmp_path: Path) -> Path:
 
 
 def commit(repo: Path, name: str, body: str, message: str) -> None:
-    (repo / name).write_text(body)
+    # Parents, because some paths are meaningful: the snapshot-manifest
+    # exemption is scoped by path, so its tests cannot write at the root.
+    target = repo / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body)
     run_git(repo, "add", "-A")
     run_git(repo, "commit", "-qm", message)
 
@@ -125,6 +129,93 @@ def test_placeholder_values_are_not_flagged(repo: Path):
            "add placeholders")
 
     assert scan_range(repo, "main~1..main") == []
+
+
+# ------------------------------------------------- snapshot manifest digests
+
+# The exemption is deliberately narrow, so each half of "path AND field" gets
+# its own negative case: widening either one silently would let a real
+# credential through, and only a test that fails on the widening will say so.
+
+
+def _manifest(digest: str = FAKE_HEX) -> str:
+    """A snapshot manifest, shaped like the real infra/snapshots/*.json."""
+    return (
+        '{\n'
+        '  "label": "provisional_full_state_snapshot",\n'
+        '  "bucket": "dpic-prdw-snapshots",\n'
+        '  "key": "duckdb/database_allgps.duckdb",\n'
+        f'  "sha256": "{digest}",\n'
+        '  "byte_size": 1011363840\n'
+        '}\n'
+    )
+
+
+def test_snapshot_manifest_digest_is_not_flagged(repo: Path):
+    commit(repo, "infra/snapshots/full_state.json", _manifest(), "publish snapshot")
+
+    assert scan_range(repo, "main~1..main") == []
+
+
+def test_a_republished_snapshot_needs_no_new_allowlist_entry(repo: Path):
+    r"""The point of the exemption: a NEW digest must not need a NEW baseline.
+
+    The fingerprint is sha256(path\0value), so every republish produces a
+    different one. If this regressed to an allow-list approach the second
+    commit here would fail while the first passed.
+    """
+    commit(repo, "infra/snapshots/full_state.json", _manifest("a" * 64), "publish")
+    commit(repo, "infra/snapshots/full_state.json", _manifest("b" * 64), "republish")
+
+    assert scan_range(repo, "main~2..main") == []
+
+
+def test_an_uppercase_digest_in_the_manifest_is_still_flagged(repo: Path):
+    """The exemption tracks what the manifest will actually accept.
+
+    SnapshotManifest.__post_init__ rejects anything but 64 lowercase hex, so an
+    uppercase value in this field can never be a digest this project deploys --
+    only a secret that happens to be sitting there. Exempting it would widen
+    the hole rather than close it.
+    """
+    commit(repo, "infra/snapshots/full_state.json", _manifest("A" * 64), "uppercase")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+
+
+def test_a_credential_field_in_a_manifest_is_still_flagged(repo: Path):
+    """Path alone must not exempt: same file, credential-shaped field."""
+    body = _manifest().replace(
+        '  "byte_size": 1011363840\n',
+        f'  "byte_size": 1011363840,\n  "api_key": "{"c" * 64}"\n',
+    )
+    commit(repo, "infra/snapshots/full_state.json", body, "leak a key")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+    assert findings[0].path == "infra/snapshots/full_state.json"
+
+
+def test_a_digest_field_outside_the_manifest_path_is_still_flagged(repo: Path):
+    """Field name alone must not exempt: same field, different file."""
+    commit(repo, "config.json", f'{{"sha256": "{FAKE_HEX}"}}\n', "add config")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+    assert findings[0].path == "config.json"
+
+
+def test_a_bare_digest_in_a_manifest_is_still_flagged(repo: Path):
+    """Assignment to `sha256` is what is exempt, not 64 hex anywhere in the file."""
+    body = _manifest().replace(
+        '  "byte_size": 1011363840\n',
+        f'  "byte_size": 1011363840,\n  "notes": ["{"d" * 64}"]\n',
+    )
+    commit(repo, "infra/snapshots/full_state.json", body, "add a stray hex")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
 
 
 # ------------------------------------------------------------------ allowlist
