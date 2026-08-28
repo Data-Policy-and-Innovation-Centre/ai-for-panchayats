@@ -119,6 +119,38 @@ class Exemption:
 
 EXEMPTIONS = [
     Exemption(
+        # Same shape of problem as the snapshot manifest, in a different file:
+        # pinning a base image by digest (#84) writes 64 hex characters into
+        # the Dockerfile, and a digest is the opposite of a credential --
+        # publishing it is the point, and it cannot be rotated.
+        #
+        # The field half is strong here: nothing but a base image can appear
+        # after `FROM <ref>@sha256:`, so this cannot be widened into hiding a
+        # secret. Any Dockerfile qualifies rather than one path, because a
+        # second Dockerfile would hit the identical false positive and the
+        # field constraint is what does the work.
+        "container-base-image-digest",
+        # Both spellings: `Dockerfile`, `Dockerfile.prod`, and the
+        # `api.Dockerfile` convention. A second digest-pinned image file that
+        # did not match would fail the scan with no way out but a .secretsallow
+        # entry -- which goes stale on the next bump, and is the exact thing
+        # #80 removed.
+        re.compile(r"(^|/)(Dockerfile[^/]*|[^/]*\.Dockerfile)$"),
+        # (?i:FROM) scopes case-insensitivity to the KEYWORD only. A blanket
+        # re.I would also loosen [0-9a-f] and start exempting uppercase values,
+        # which is the opposite of what the digest class is for.
+        #
+        # (?:--\S+\s+)* admits `FROM --platform=$BUILDPLATFORM ...`, which this
+        # repository will reach for the moment it builds both architectures in
+        # one Dockerfile; without it a legitimate pin turns CI red.
+        #
+        # Lowercase digest only: OCI digests are lowercase hex by
+        # specification, so an uppercase value there is not a digest this
+        # project would build from. Same reasoning as the manifest exemption.
+        re.compile(r"^[ \t]*(?i:FROM)\s+(?:--\S+\s+)*\S+@sha256:([0-9a-f]{64})", re.M),
+        "the content digest of a pinned container base image",
+    ),
+    Exemption(
         "snapshot-manifest-digest",
         # Anchored at the repository root: a vendored or copied tree that
         # happens to contain infra/snapshots/*.json is not this project's

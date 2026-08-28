@@ -218,6 +218,66 @@ def test_a_bare_digest_in_a_manifest_is_still_flagged(repo: Path):
     assert len(findings) == 1
 
 
+# ---------------------------------------------------- container base digests
+
+
+def test_pinned_base_image_digest_is_not_flagged(repo: Path):
+    commit(repo, "docker/Dockerfile",
+           f"FROM python:3.13-slim@sha256:{FAKE_HEX}\nRUN echo hi\n", "pin base")
+
+    assert scan_range(repo, "main~1..main") == []
+
+
+@pytest.mark.parametrize("path", [
+    "docker/Dockerfile",
+    "docker/Dockerfile.prod",
+    "docker/api.Dockerfile",
+])
+@pytest.mark.parametrize("line", [
+    "FROM python:3.13-slim@sha256:{d}",
+    "from python:3.13-slim@sha256:{d}",                       # keyword is case-insensitive
+    "  FROM python:3.13-slim@sha256:{d}",                     # indented
+    "FROM --platform=$BUILDPLATFORM python:3.13-slim@sha256:{d}",
+])
+def test_base_digest_forms_that_docker_accepts_are_not_flagged(repo: Path, path: str, line: str):
+    """Every spelling docker itself builds must clear the scanner.
+
+    A form that builds fine but fails the scan has no way out except a
+    .secretsallow entry, which goes stale on the next digest bump -- the exact
+    trap #80 removed.
+    """
+    commit(repo, path, line.format(d=FAKE_HEX) + "\nRUN echo hi\n", f"pin via {path}")
+
+    assert scan_range(repo, "main~1..main") == []
+
+
+def test_a_credential_elsewhere_in_a_dockerfile_is_still_flagged(repo: Path):
+    """The FROM line is exempt, not the file."""
+    commit(repo, "docker/Dockerfile",
+           f"FROM python:3.13-slim@sha256:{FAKE_HEX}\n"
+           f'ENV API_KEY="{"e" * 64}"\n', "leak in a dockerfile")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+
+
+def test_a_from_digest_outside_a_dockerfile_is_still_flagged(repo: Path):
+    """Field alone must not exempt: same syntax, ordinary file."""
+    commit(repo, "notes.txt", f"FROM python:3.13-slim@sha256:{FAKE_HEX}\n", "prose")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+
+
+def test_an_uppercase_base_digest_is_still_flagged(repo: Path):
+    """OCI digests are lowercase hex; an uppercase value there is not a digest."""
+    commit(repo, "docker/Dockerfile",
+           f"FROM python:3.13-slim@sha256:{'A' * 64}\n", "uppercase")
+
+    findings = scan_range(repo, "main~1..main")
+    assert len(findings) == 1
+
+
 # ------------------------------------------------------------------ allowlist
 
 
