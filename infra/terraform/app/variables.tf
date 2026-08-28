@@ -26,27 +26,30 @@ variable "image_tag" {
 }
 
 variable "task_cpu" {
-  description = "Fargate CPU units. 2 vCPU."
+  description = "Fargate CPU units. 1 vCPU, measured under #72."
   type        = string
-  # Reverted from 1024. See task_memory: the pair was reduced together and the
-  # reduction failed, so both go back to the known-good values.
-  default = "2048"
+  # Peak observed CPU is 793 units against 2048 -- 39% -- and measured p95
+  # latency is 3.6s dominated by LLM round trips rather than by DuckDB or by
+  # CPU. Halving leaves that peak at 77% of the smaller allocation without
+  # moving the bottleneck. The one CPU-bound step is the SHA-256 over ~1GB at
+  # startup, 13s at 2 vCPU, which roughly doubles and stays far inside the
+  # 420s health-check grace.
+  default = "1024"
 }
 
 variable "task_memory" {
-  description = "Fargate memory in MiB. 8 GB."
+  description = "Fargate memory in MiB. 4 GB, measured under #72."
   type        = string
-  # Reverted from 4096, which crash-looped: tasks verified the snapshot, opened
-  # the database, then died before "Application startup complete" while the
-  # application materialises its views and in-memory cache tables.
+  # Peak 586 MiB, sampled at ONE-MINUTE resolution across a full cold start --
+  # snapshot fetch, database open, view and cache-table construction, and the
+  # vector index build. The earlier 630 MiB figure was five-minute data from an
+  # already-running task and could not have seen a startup spike; this can.
   #
-  # The 4096 figure came from Container Insights showing a 630 MiB peak, but
-  # that was measured across six hours of an ALREADY-RUNNING task. Steady state
-  # is not the high-water mark: startup builds the cache tables and DuckDB
-  # memory-maps the ~1GB snapshot, and a five-minute metric period cannot see a
-  # spike inside a two-minute startup. Do not re-cut this without measuring
-  # startup peak specifically -- #72.
-  default = "8192"
+  # 4096 is not the tightest fit the measurement allows. DuckDB memory-maps the
+  # ~1GB snapshot, so the page cache wants room the working-set figure does not
+  # show, and 1 vCPU only admits 2048-8192 MiB anyway. That leaves about 7x
+  # headroom over the observed peak.
+  default = "4096"
 }
 
 variable "desired_count" {
