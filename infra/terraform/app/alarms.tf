@@ -165,3 +165,46 @@ resource "aws_cloudwatch_metric_alarm" "elb_5xx" {
   alarm_description = "More than five load-balancer-generated 5xx in five minutes (target unreachable or timed out)."
   alarm_actions     = [aws_sns_topic.alerts.arn]
 }
+
+# Abuse tripwire for #59. The application is unauthenticated, so the failure
+# mode that costs real money is volume, not errors -- a script can issue
+# requests as fast as one task will serve them, and every one spends OpenAI
+# credit that no AWS budget can see.
+#
+# Measured at the load balancer rather than at CloudFront, for two reasons.
+# The technical one: CloudFront publishes its metrics only to us-east-1, and a
+# CloudWatch alarm cannot notify an SNS topic in another region, so watching it
+# would mean a second topic and a second email confirmation. The better one:
+# the load balancer sees only what CloudFront could not serve from cache, so a
+# crawler pulling the JS bundle repeatedly never reaches this metric.
+#
+# What it counts is every uncached path, not only /query: /assets/* is the sole
+# cached behavior, so page loads land here too. Treat it as an upper bound on
+# language-model calls rather than a count of them -- something hammering / can
+# trip it having spent nothing. That is still the right alarm, because the
+# question being asked is "is a script driving this?", and the answer is yes
+# either way.
+#
+# It does not identify the caller (that needs CloudFront access logging, which
+# is not enabled) and it throttles nothing.
+resource "aws_cloudwatch_metric_alarm" "request_flood" {
+  alarm_name        = "${var.name}-request-flood"
+  alarm_description = "Origin request volume far above human browsing. The endpoint is unauthenticated: check for scripted use before the OpenAI bill does it for you."
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "RequestCount"
+  dimensions  = { LoadBalancer = aws_lb.main.arn_suffix }
+
+  statistic           = "Sum"
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.request_flood_threshold
+  period              = 300
+  # Two periods, so one burst -- a demo, a page reloaded in anger -- does not
+  # page anyone. Sustained volume does.
+  evaluation_periods = 2
+
+  # No traffic is a quiet site, not a broken alarm.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}

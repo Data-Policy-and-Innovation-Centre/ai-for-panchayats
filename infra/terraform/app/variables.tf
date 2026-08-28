@@ -142,3 +142,43 @@ variable "cpu_architecture" {
     error_message = "cpu_architecture must be X86_64 or ARM64."
   }
 }
+
+variable "enable_cloudtrail" {
+  description = "Create the account trail and its bucket. Off only where a trail already exists at the organisation level -- two trails means paying twice for the same events."
+  type        = bool
+  default     = true
+}
+
+variable "audit_retention_days" {
+  description = "How long CloudTrail log files are kept in S3."
+  type        = number
+  # 400 rather than 365: an annual review looking back a full year still finds
+  # the beginning of that year present. Volume is a few MB a month at this
+  # size, so the extra five weeks costs cents.
+  default = 400
+}
+
+variable "enable_flow_logs" {
+  description = "Record VPC flow logs to CloudWatch Logs."
+  type        = bool
+  default     = true
+}
+
+variable "flow_log_retention_days" {
+  description = "How long flow log records are kept."
+  type        = number
+  # Flow logs answer 'what reached this VPC recently', which is an incident
+  # question, not an audit question -- CloudTrail is the durable record. 30
+  # days matches the application log group so the two can be read side by side.
+  default = 30
+}
+
+variable "request_flood_threshold" {
+  description = "Origin requests in a 5-minute period that count as abnormal, sustained over two periods."
+  type        = number
+  # Measured, not guessed: over the first 30 hours of real testing -- including
+  # a benchmark run -- the busiest five minutes at the load balancer carried 24
+  # requests of all kinds, page loads included, not 24 questions. 300 is more
+  # than ten times that, and less than a scripted client produces in a minute.
+  default = 300
+}

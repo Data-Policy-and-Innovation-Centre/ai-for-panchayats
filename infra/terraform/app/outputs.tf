@@ -35,3 +35,13 @@ output "cluster" {
 output "service" {
   value = aws_ecs_service.app.name
 }
+
+output "audit_bucket" {
+  description = "CloudTrail destination. Empty when enable_cloudtrail is false."
+  value       = var.enable_cloudtrail ? aws_s3_bucket.audit[0].id : ""
+}
+
+output "flow_log_group" {
+  description = "VPC flow log group. Empty when enable_flow_logs is false."
+  value       = var.enable_flow_logs ? aws_cloudwatch_log_group.flow[0].name : ""
+}
