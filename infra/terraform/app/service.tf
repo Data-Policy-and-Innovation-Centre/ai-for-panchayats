@@ -7,8 +7,21 @@
 # (once an image exists) a secrets-injection error -- and never stabilizes.
 # Bootstrap in two passes instead:
 #   1. terraform apply -var desired_count=0 -var image_tag=<placeholder>
-#   2. docker/build.sh && push the image; aws secretsmanager put-secret-value
-#      --secret-id <output.openai_secret_name> --secret-string sk-...
+#   2. Build and push an image for <placeholder> to the repository this
+#      apply just created. Nothing in THIS branch does that yet -- the
+#      Docker build and the OPENAI_API_KEY delivery helper referenced by
+#      infra/THREAT_MODEL.md #3 both ship in the separate, still-open
+#      deploy/snapshot-packaging branch (PR #74) and are not part of this
+#      diff. Until that lands, populate the image and the secret by
+#      whatever externally reproducible process produced the tag already
+#      running in production. Whatever the method, never pass the key on
+#      an `aws` command line -- `--secret-string sk-...` lands in this
+#      process's argv, readable by any other user on the host via
+#      `ps auxww`. Read it into a variable (prompt, or a gitignored file)
+#      and hand the CLI a `file://` path instead, e.g.:
+#        printf '%s' "$OPENAI_API_KEY" > "$tmp"   # $tmp from mktemp, chmod 700
+#        aws secretsmanager put-secret-value --secret-id <name> \
+#          --secret-string "file://$tmp"
 #   3. terraform apply -var desired_count=1 -var image_tag=<real tag>
 # Not enforced in code: a precondition here cannot see whether the secret
 # has a version or the tag exists in ECR without itself requiring one of

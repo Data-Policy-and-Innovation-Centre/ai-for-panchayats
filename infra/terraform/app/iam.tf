@@ -97,12 +97,12 @@ resource "aws_iam_role_policy" "task_snapshot" {
   policy = data.aws_iam_policy_document.task_snapshot.json
 }
 
-# The value is deliberately NOT set here: Terraform state would then carry the
-# key. Set it once with:
-#   aws secretsmanager put-secret-value --secret-id <name> --secret-string sk-...
-# On a brand new deployment this secret has no version yet when the default
-# service tries to start -- see the BOOTSTRAP ORDER note on aws_ecr_
-# repository.app in service.tf for the two-pass sequence that avoids it.
+# The value is deliberately NOT set here: Terraform state would then carry
+# the key. Set it once out of band -- never with `--secret-string sk-...` on
+# an `aws` command line, which lands the key in this process's argv, readable
+# by any other user on the host via `ps auxww`; use a `file://` path instead
+# (see the BOOTSTRAP ORDER note on aws_ecr_repository.app in service.tf,
+# which also covers this secret having no version yet on a first apply).
 resource "aws_secretsmanager_secret" "openai" {
   name        = "${var.name}/openai-api-key"
   description = "OPENAI_API_KEY for the Odisha PR&DW chatbot router"

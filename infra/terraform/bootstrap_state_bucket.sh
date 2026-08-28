@@ -225,7 +225,13 @@ and ignore the bucket this script just prepared. Initialise with:
 
   terraform -chdir="$SCRIPT_DIR/snapshot" init -reconfigure -backend-config="bucket=$BUCKET" -backend-config="region=$REGION"
 
-The app module reads the snapshot module's outputs through its own
+The app module's own backend hard-codes the same defaults in app/versions.tf,
+so it needs the same -reconfigure as the snapshot module, run once before any
+plan or apply against it:
+
+  terraform -chdir="$SCRIPT_DIR/app" init -reconfigure -backend-config="bucket=$BUCKET" -backend-config="region=$REGION"
+
+It also reads the snapshot module's outputs through its own
 data.terraform_remote_state, which has the same problem one layer up: pass
 the override through as plan/apply variables, or it silently reads
 $DEFAULT_BUCKET instead of $BUCKET.
