@@ -1,0 +1,40 @@
+// Viewer-request function: the gate in front of the pilot.
+//
+// This runs at the CloudFront edge, BEFORE the cache lookup and before any
+// request reaches the load balancer. An unauthenticated caller therefore never
+// touches the application, never reaches the language model, and costs nothing
+// but a 401 -- which is the whole point, since the failure mode being defended
+// against is spend, not data exposure. The data served is public.
+//
+// Runtime is cloudfront-js-2.0: no Buffer, no crypto, no async, and a 1 ms
+// budget. Comparing the whole Authorization header as one string is both the
+// simplest thing that works and the only thing available -- there is no
+// constant-time compare here. That is acceptable because the password is 32
+// random characters: distinguishing a timing difference of nanoseconds through
+// internet jitter, over enough samples to matter, is not a practical path
+// against that much entropy.
+function handler(event) {
+    var request = event.request;
+    var headers = request.headers;
+
+    // Header names arrive lowercased, whatever the client sent.
+    if (headers.authorization && headers.authorization.value === "${expected}") {
+        return request;
+    }
+
+    return {
+        statusCode: 401,
+        statusDescription: "Unauthorized",
+        headers: {
+            // Without this the browser shows a bare error page instead of a
+            // login prompt, and the pilot has no way in.
+            "www-authenticate": {
+                value: 'Basic realm="${realm}", charset="UTF-8"'
+            },
+            // Viewer-request responses are not cached by CloudFront, but a
+            // browser or a corporate proxy would happily keep this 401 and
+            // then refuse to re-prompt after the password is rotated.
+            "cache-control": { value: "no-store" }
+        }
+    };
+}

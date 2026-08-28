@@ -80,9 +80,9 @@ variable "allow_public_http" {
     release; it exists so a bounded pre-cutover test is possible. It is only
     consulted when neither enable_cdn nor certificate_arn provides TLS.
 
-    Note what this does NOT gate: the chatbot is published to the internet
-    without authentication in every configuration here. That is a separate
-    exposure, tracked on #59, and no variable in this module withholds it.
+    Note what this does NOT gate: whether viewers must authenticate. That is
+    enable_basic_auth, further down this file, and the two are independent --
+    plain HTTP with a password and HTTPS without one are both reachable states.
   EOT
   type        = bool
   default     = false
@@ -181,4 +181,19 @@ variable "request_flood_threshold" {
   # requests of all kinds, page loads included, not 24 questions. 300 is more
   # than ten times that, and less than a scripted client produces in a minute.
   default = 300
+}
+
+variable "enable_basic_auth" {
+  description = "Gate the distribution behind one shared HTTP Basic credential. Read the password with `terraform output -raw basic_auth_password`."
+  type        = bool
+  # On by default: this deployment's URL is published in a public repository,
+  # so an unprotected apply is exposed the moment it finishes, and defaulting
+  # to off would make that the easy path.
+  default = true
+}
+
+variable "basic_auth_username" {
+  description = "Username half of the shared credential. Not a secret; the password is."
+  type        = string
+  default     = "pilot"
 }

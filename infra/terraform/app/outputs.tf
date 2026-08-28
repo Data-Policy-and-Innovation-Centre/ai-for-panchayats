@@ -45,3 +45,14 @@ output "flow_log_group" {
   description = "VPC flow log group. Empty when enable_flow_logs is false."
   value       = var.enable_flow_logs ? aws_cloudwatch_log_group.flow[0].name : ""
 }
+
+output "basic_auth_username" {
+  description = "Empty when basic auth is off."
+  value       = local.basic_auth_enabled ? var.basic_auth_username : ""
+}
+
+output "basic_auth_password" {
+  description = "Shared pilot password. Read it with `terraform output -raw basic_auth_password`; rotate it with `terraform apply -replace='random_password.basic_auth[0]'` -- quoted, or zsh treats the index as a glob and reports no matches."
+  value       = local.basic_auth_enabled ? random_password.basic_auth[0].result : ""
+  sensitive   = true
+}

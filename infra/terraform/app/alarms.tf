@@ -189,7 +189,7 @@ resource "aws_cloudwatch_metric_alarm" "elb_5xx" {
 # is not enabled) and it throttles nothing.
 resource "aws_cloudwatch_metric_alarm" "request_flood" {
   alarm_name        = "${var.name}-request-flood"
-  alarm_description = "Origin request volume far above human browsing. The endpoint is unauthenticated: check for scripted use before the OpenAI bill does it for you."
+  alarm_description = "Origin request volume far above human browsing. These requests carry the shared pilot credential, so look for a script inside the pilot or a leaked password -- and check OpenAI spend."
 
   namespace   = "AWS/ApplicationELB"
   metric_name = "RequestCount"

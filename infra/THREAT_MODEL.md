@@ -9,9 +9,11 @@ Each threat below lists the controls that exist, what would detect the attempt,
 and the residual risk that is knowingly accepted. Residual risks are collected
 again at the end so they can be read without the rest.
 
-The single most important thing to know before reading further: **the
-application is public and unauthenticated.** Every "who could do this" below
-answers *anyone on the internet who has the URL* unless it says otherwise.
+The single most important thing to know before reading further: the application
+is reachable by **anyone holding one shared password**, checked at the CloudFront
+edge. Every "who could do this" below answers *anyone who has that credential*
+unless it says otherwise. The credential is shared, so it identifies the pilot
+group as a whole and never an individual.
 
 ---
 
@@ -161,6 +163,15 @@ and degrades rather than bills.
 - An AWS Budget at $450/month notifies on account spend, and five CloudWatch
   alarms cover no-running-tasks, unhealthy hosts, target 5xx, ELB 5xx and slow
   responses.
+- **The OpenAI account holds a $10 balance with auto-reload off.** This is the
+  only control in this document that bounds the worst case absolutely rather
+  than reporting on it: when the balance is gone the spending stops, whatever
+  else has failed.
+- HTTP Basic authentication runs as a CloudFront viewer-request function, so an
+  unauthenticated request is rejected at the edge before the cache lookup and
+  before the origin. Measured: an unauthenticated `POST /query` returns 401 in
+  63 ms without reaching the load balancer, against 5.8 s for the authenticated
+  one that actually answers.
 
 **Detection**
 
@@ -181,13 +192,19 @@ billed by OpenAI and is invisible to every alarm in this account.
 
 **Residual risk**
 
-**This is the largest accepted risk in the deployment.** There is no rate limit,
-no WAF, no per-client quota and no authentication. A single script can issue
-requests as fast as one task will serve them, and every one of them spends
-OpenAI credit. The flood alarm says it is happening; it does not stop it, and it
-fires after the requests have already been paid for. The only hard backstop is
-the OpenAI account's own spending cap, which is set outside this repository. Mitigation is the authentication decision that
-this issue leaves open.
+Authentication removes the anonymous internet from this threat; it does not
+remove the threat. There is still no rate limit, no WAF and no per-client quota,
+so anyone **inside** the pilot — or anyone they pass the password to — can issue
+requests as fast as one task will serve them, and every one spends OpenAI credit.
+The flood alarm says it is happening; it does not stop it, and it fires after the
+requests have been paid for.
+
+A shared credential also cannot be revoked for one person. Rotating it locks out
+everyone and requires redistributing a new password, which is the honest cost of
+choosing one password over per-person identity.
+
+What bounds the damage is the $10 balance with auto-reload off, not anything in
+this account.
 
 ---
 
@@ -233,10 +250,16 @@ not meant for.*
   `com.amazonaws.global.cloudfront.origin-facing` prefix list, and the listener's
   default action is a 403 — only requests carrying `X-Origin-Verify` are
   forwarded. Verified negatively: a direct request to the load balancer's own
-  DNS name times out, while the CloudFront URL returns 200.
+  DNS name times out, while the CloudFront URL answers — 200 with the shared
+  credential, 401 without it.
 - Tasks accept inbound only from the load balancer's security group, by group
   membership rather than by CIDR. There is no database endpoint in the VPC.
-- The data served is public.
+- Requests must carry the shared Basic credential, checked at the edge on
+  **both** cache behaviors — the default one and `/assets/*`. Gating only the
+  default would have left the ~1 MB JS bundle open to exactly the crawler this
+  is meant to stop.
+- The data served is public, so the credential protects the budget behind the
+  application rather than the answers it gives.
 
 **Detection**
 
@@ -247,8 +270,18 @@ logs are **not** enabled — see residual risk.
 
 **Residual risk**
 
-- **The application is unauthenticated.** Anyone with the URL can query it. The
-  URL is not secret; it appears in issue comments in this public repository.
+- **One shared password is not identity.** It cannot say which tester asked
+  what, cannot be revoked for one person, and travels onward as easily as any
+  other password. It is sized for a bounded pilot with a known group. Per-person
+  auth means CloudFront signed URLs or an OIDC flow at the edge; both are
+  recorded as options on #59.
+- The password is readable by anyone with `cloudfront:GetFunction` in this
+  account — it is compiled into the edge function body, because CloudFront
+  Functions have no secret store to read at request time. That is a wider
+  audience than the Terraform state it also sits in, and `GetFunction` is part
+  of the AWS-managed `ReadOnlyAccess` policy.
+- The URL itself is not secret and appears in issue comments in this public
+  repository. That is now a non-issue rather than the exposure it was.
 - No CloudFront access logs, so there is no record of *who* queried the
   application — only that traffic arrived. Flow logs see CloudFront's edge
   addresses, not the viewer's, and the flood alarm counts requests without
@@ -294,12 +327,12 @@ is 30 days and access is IAM-controlled — contained, but not by design.
 
 | # | Risk | Why accepted | What would close it |
 |---|---|---|---|
-| 1 | Application is public and unauthenticated; unbounded LLM spend | Testing posture; users need frictionless access | The open decision on #59 |
+| 1 | One shared password, so no per-person identity or revocation | Sized for a bounded pilot with a known group | Signed URLs or edge OIDC |
 | 2 | CloudFront → origin is cleartext | No domain obtainable, so no trusted origin certificate | A registered domain + ACM |
 | 3 | Deployment runs from a long-lived IAM user | No CI identity exists yet | CD milestone, issues G and H |
 | 4 | Python and Node dependencies unpinned | Predates the image build | CD milestone, issue E1 |
 | 5 | No record of which snapshot a live task serves | Identity discarded after verification | CD milestone, issue E2 |
-| 6 | No record of who queried the application | CloudFront access logging not enabled | Enable it; costs S3 storage only |
+| 6 | No record of who queried the application | Access logging off, and a shared credential could not attribute it anyway | Access logging plus per-person credentials |
 | 7 | Origin shared secret is readable from Terraform state | Inherent to `random_password` | Move to Secrets Manager, or accept |
 
 ## Review

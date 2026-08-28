@@ -107,6 +107,19 @@ resource "aws_cloudfront_distribution" "app" {
 
     cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
     origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer.id
+
+    # Attached to BOTH behaviors deliberately. Gating only the default one
+    # would leave /assets/* open, and the bundle is the largest object here --
+    # exactly what an unauthenticated crawler would pull repeatedly. Viewer
+    # request runs before the cache lookup, so a cached asset is still gated.
+    dynamic "function_association" {
+      for_each = local.basic_auth_enabled ? [1] : []
+
+      content {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.basic_auth[0].arn
+      }
+    }
   }
 
   # Vite fingerprints these filenames by content, so a changed asset is a
@@ -120,6 +133,15 @@ resource "aws_cloudfront_distribution" "app" {
     compress               = true
 
     cache_policy_id = data.aws_cloudfront_cache_policy.optimized.id
+
+    dynamic "function_association" {
+      for_each = local.basic_auth_enabled ? [1] : []
+
+      content {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.basic_auth[0].arn
+      }
+    }
   }
 
   restrictions {
