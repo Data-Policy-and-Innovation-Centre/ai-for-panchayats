@@ -243,4 +243,17 @@ resource "aws_ecs_service" "app" {
   lifecycle {
     ignore_changes = [desired_count]
   }
+
+  # No autoscaling, deliberately (#54).
+  #
+  # A new task cannot serve until it has downloaded and SHA-256'd roughly a
+  # gigabyte and the application has rebuilt its vector retriever: about two
+  # minutes measured end to end, inside a 420s health-check grace. Scale-out
+  # that slow cannot absorb a traffic spike -- the spike is over before the
+  # capacity arrives -- while each additional task costs about $45/month at the
+  # current size and holds its own full copy of the snapshot.
+  #
+  # Revisit when #72's deferred concurrency work runs against a representative
+  # query mix, which needs #61 resolved first. Until then a fixed desired_count
+  # is both cheaper and more predictable than a policy that reacts too late.
 }

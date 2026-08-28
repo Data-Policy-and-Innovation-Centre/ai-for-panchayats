@@ -26,19 +26,27 @@ variable "image_tag" {
 }
 
 variable "task_cpu" {
-  description = "Fargate CPU units. 2 vCPU is the starting point #72 will measure."
+  description = "Fargate CPU units. 1 vCPU, measured under #72."
   type        = string
-  default     = "2048"
+  # Was 2048. Container Insights over six hours of live serving recorded a peak
+  # of 793 CPU units against 2048 reserved -- 39%. Measured p95 latency is 3.6s
+  # and is dominated by LLM round trips, not by DuckDB or by CPU, so halving
+  # this leaves the same peak at 77% of a smaller allocation without moving the
+  # bottleneck. Startup is the one CPU-bound step (SHA-256 over ~1GB, 13s at 2
+  # vCPU) and roughly doubles here, which is immaterial against a 420s grace.
+  default = "1024"
 }
 
 variable "task_memory" {
-  description = <<-EOT
-    Fargate memory in MiB. The snapshot is ~1 GB on disk and DuckDB memory-maps
-    it, so this must leave room for the file plus query working set. #72 sweeps
-    this together with the adapter's own memory_limit.
-  EOT
+  description = "Fargate memory in MiB. 4 GB, measured under #72."
   type        = string
-  default     = "8192"
+  # Was 8192. Peak observed container memory is 630 MiB -- 7.7% of what was
+  # reserved. 4096 is deliberately not the tightest fit the measurement would
+  # allow: DuckDB memory-maps the ~1GB snapshot, so the page cache wants room
+  # the working-set figure does not show, and 1 vCPU only admits 2048-8192 MiB.
+  # This keeps roughly 6x headroom over the observed peak and still saves about
+  # $45/month against the original pair.
+  default = "4096"
 }
 
 variable "desired_count" {
@@ -90,4 +98,16 @@ variable "enable_cdn" {
   EOT
   type        = bool
   default     = true
+}
+
+variable "alarm_email" {
+  description = "Address to subscribe to the alarm topic. Empty creates the topic and alarms but no subscription, so alarms are visible in the console and nothing is emailed."
+  type        = string
+  default     = ""
+}
+
+variable "monthly_cost_alarm_usd" {
+  description = "Estimated-charges threshold for the account billing alarm. The chatbot alone projects to about $109/month; the default leaves room for that plus the unrelated workloads sharing this account, while still firing well before a runaway."
+  type        = number
+  default     = 600
 }
