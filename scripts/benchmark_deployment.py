@@ -112,16 +112,39 @@ def fingerprint(payload: bytes) -> str:
     """A stable digest of an answer's content, with no content in the output."""
     try:
         normalised = answer_fields(json.loads(payload))
-    except (json.JSONDecodeError, AttributeError):
+    except (ValueError, AttributeError):
+        # ValueError, not JSONDecodeError: a non-UTF-8 body raises
+        # UnicodeDecodeError, which is a ValueError but NOT a JSONDecodeError,
+        # and would otherwise crash the run on a truncated or binary response.
         # A non-JSON body is itself the finding; hash it as-is rather than
-        # silently reporting a parity failure with no explanation.
+        # reporting a parity failure with no explanation.
         return "raw:" + hashlib.sha256(payload).hexdigest()[:16]
     canonical = json.dumps(normalised, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()[:16]
 
 
+# A response that clarifies or falls back is a 200 and takes about as long as
+# a real answer, so neither the status code nor the latency distinguishes it.
+# Left unchecked the script would report the clarifier's timings as the
+# database's, print "errors: 0", and exit 0 -- which is precisely how the first
+# version of this file's question list went unnoticed.
+NON_ANSWER_TIERS = {"clarify", "fallback"}
+
+
+def is_real_answer(document) -> bool:
+    """True when the router actually executed a query rather than deflecting."""
+    if not isinstance(document, dict):
+        return False
+    return bool(document.get("query_id")) and document.get("tier") not in NON_ANSWER_TIERS
+
+
 def ask(url: str, question: str, session: str, auth: str | None, timeout: float):
-    """One query. Returns (seconds, http_status, fingerprint_or_None)."""
+    """One query. Returns (seconds, http_status_or_label, fingerprint_or_None).
+
+    A 200 that did not execute a query is reported as the string "clarify"
+    rather than 200, so it lands in the failure list instead of the latency
+    sample.
+    """
     request = urllib.request.Request(
         url.rstrip("/") + "/query",
         data=json.dumps({"message": question, "session_id": session}).encode(),
@@ -135,13 +158,25 @@ def ask(url: str, question: str, session: str, auth: str | None, timeout: float)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read()
-            return time.monotonic() - started, response.status, fingerprint(body)
+            elapsed = time.monotonic() - started
+            try:
+                document = json.loads(body)
+            except ValueError:
+                document = None
+            if response.status == 200 and not is_real_answer(document):
+                tier = document.get("tier") if isinstance(document, dict) else "non-JSON"
+                return elapsed, f"200/{tier}", None
+            return elapsed, response.status, fingerprint(body)
     except urllib.error.HTTPError as exc:
         # Drain the body so the connection closes cleanly, but do not
         # fingerprint an error page as though it were an answer.
         exc.read()
         return time.monotonic() - started, exc.code, None
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except OSError as exc:
+        # OSError, not just URLError: a peer-side reset surfaces as
+        # ConnectionResetError straight from getresponse(), which URLError does
+        # not cover, and an uncaught one would abort the run and discard every
+        # measurement taken so far. TimeoutError is an OSError subclass too.
         print(f"    transport failure: {exc}", file=sys.stderr)
         return time.monotonic() - started, 0, None
 
@@ -172,6 +207,12 @@ def main() -> int:
 
     if not args.url:
         parser.error("no URL: pass --url or set CHATBOT_URL")
+    if args.repeat < 1:
+        # Otherwise the run sends nothing, reports "errors: 0 of 0" and exits
+        # 0, which reads exactly like a pass in CI.
+        parser.error("--repeat must be at least 1")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
 
     user = os.environ.get("CHATBOT_USER", "")
     password = os.environ.get("CHATBOT_PASSWORD", "")
@@ -199,7 +240,7 @@ def main() -> int:
                 print(f"  {seconds:7.3f}s  {digest}  {question[:58]}")
             else:
                 failures.append((question, status))
-                print(f"  {seconds:7.3f}s  HTTP {status:<3}  {question[:58]}")
+                print(f"  {seconds:7.3f}s  {str(status):<11}  {question[:58]}")
 
     print()
     if latencies:
@@ -209,7 +250,11 @@ def main() -> int:
               f"mean={statistics.fmean(latencies):.3f}s")
     print(f"errors: {len(failures)} of {len(QUESTIONS) * args.repeat}")
     for question, status in failures:
-        print(f"  HTTP {status}  {question}")
+        print(f"  {status}  {question}")
+    if any(str(s).startswith("200/") for _, s in failures):
+        print("\n  A '200/clarify' is not a slow answer -- it is the router declining to")
+        print("  execute. Those calls are excluded from the latency sample, because")
+        print("  including them would report the clarifier's timings as the database's.")
 
     divergent = {q: d for q, d in prints.items() if len(d) > 1}
     if divergent:
