@@ -119,13 +119,17 @@ resource "aws_ecs_task_definition" "app" {
     operating_system_family = "LINUX"
   }
 
-  # The architecture and the image must agree, and nothing else checks that.
-  # docker/build.sh takes PLATFORM but does not put it in the default tag, so
-  # the two are set by hand and can silently disagree. A mismatch is not loud:
-  # with minimum_healthy_percent at 100 the old task keeps serving, the new one
-  # can never start, `no_running_tasks` stays green because a task IS running,
-  # and `apply` reports success. Convention: an arm64 image tag ends in
-  # "-arm64", so require that here and fail at plan time instead.
+  # The architecture and the image must agree. A mismatch is not loud: with
+  # minimum_healthy_percent at 100 the old task keeps serving, the new one can
+  # never start, `no_running_tasks` stays green because a task IS running, and
+  # `apply` reports success.
+  #
+  # This is one of three checks, and it is the weakest of them, so do not read
+  # it as the guarantee. It tests the tag STRING. docker/build.sh derives that
+  # suffix from PLATFORM and refuses to mint a tag that contradicts it, then
+  # asserts the built image's actual architecture with `docker image inspect`.
+  # Only that last one inspects the artifact; this one catches an image_tag
+  # typed by hand at apply time, which is the case the other two cannot see.
   lifecycle {
     precondition {
       condition = (
@@ -133,7 +137,7 @@ resource "aws_ecs_task_definition" "app" {
         ? endswith(var.image_tag, "-arm64")
         : !endswith(var.image_tag, "-arm64")
       )
-      error_message = "image_tag must end in -arm64 when cpu_architecture is ARM64, and must not otherwise. Build with PLATFORM=linux/arm64 and TAG=<tag>-arm64."
+      error_message = "image_tag must end in -arm64 when cpu_architecture is ARM64, and must not otherwise. docker/build.sh derives the suffix from PLATFORM, so building with PLATFORM=linux/arm64 (its default) produces a correct tag without setting TAG at all."
     }
   }
   task_role_arn = aws_iam_role.task.arn
