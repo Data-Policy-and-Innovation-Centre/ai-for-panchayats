@@ -225,8 +225,16 @@ image.*
   are `==` including transitives, the base image is pinned by manifest digest
   rather than the moving `python:3.13-slim` tag, and the Node major used for
   the host-side dashboard build is recorded in `docker/.node-version` and
-  enforced by `build.sh`. Demonstrated rather than asserted: two independent
-  builds of the same commit produced byte-identical image IDs.
+  enforced by `build.sh`. The image installs no apt packages at all: `curl`
+  was the only one, it was unversioned, and the healthcheck now uses `urllib`
+  from the standard library instead.
+- Demonstrated rather than asserted, with the limit stated: two independent
+  builds of the same commit produced byte-identical image IDs. That was
+  measured on the image as it stood BEFORE the apt layer was removed, and the
+  builds ran minutes apart -- so it shows the build is deterministic across
+  invocations, not that it is stable across a Debian or PyPI change weeks
+  later. Dropping the apt layer removes the input that made the second claim
+  indefensible; it has not itself been re-measured over time.
 
 **Residual risk**
 
@@ -234,6 +242,12 @@ image.*
   building the image by invoking `docker build` directly, which skips the Node
   gate entirely. Moving the build into CI (#90) is what makes the enforcement
   unavoidable rather than conventional.
+- Only the Node MAJOR is enforced, and the npm version is printed rather than
+  checked. Both participate in the host-side Vite build, so two builders on
+  different 24.x patches remain a possible source of bundle drift. Enforcing
+  exact versions locally would reject every developer whose toolchain differs
+  by a patch; the place to pin exactly and for free is the CI build, where one
+  runner controls the toolchain.
 - The base image digest must now be bumped by hand, so a security patch in
   Debian or CPython no longer arrives on the next rebuild. That is the intended
   trade for reproducibility, but it is a standing obligation rather than a
