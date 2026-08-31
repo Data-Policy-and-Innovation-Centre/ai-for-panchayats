@@ -11,6 +11,7 @@ from pipeline.normalize import (
     NormalizationError,
     _normalise_year,
     normalize_egramswaraj,
+    to_records,
     validate_canonical_manifest,
 )
 
@@ -100,6 +101,29 @@ def test_empty_is_valid_and_malformed_is_reason_coded_quarantine(tmp_path: Path)
     canonical = json.loads((result.output_root / "canonical_manifest.json").read_text())
     assert canonical["tables"]["pl"]["row_count"] == 0
     assert canonical["quarantine_count"] == 2
+
+
+def test_kinds_filter_skips_supported_kinds_without_quarantining_them(tmp_path: Path):
+    """A supported-but-unrequested kind must be skipped, not quarantined.
+
+    Codex review (PR #64, normalize.py:485): with --kinds PL, valid AA/TA/
+    PP/RE files used to hit `source_kind not in wanted` and get quarantined
+    as unknown_source_kind, falsely reporting an intentional exclusion as
+    malformed input. Only filenames with no recognized kind at all should be
+    quarantined; kinds excluded by the filter should simply be absent.
+    """
+    run = make_run(tmp_path, "run-filtered", {
+        "2021_PL.json": {"data": [{"id": "ok"}]},
+        "2021_AA.json": {"data": [{"id": "ok"}]},
+        "2021_unknown.json": {"data": [{"id": "ok"}]},
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical", kinds=["PL"])
+    assert "pl" in result.tables
+    assert "aa" not in result.tables
+    quarantine = rows(files(result, "quarantine")[0])
+    assert {row["source_file"] for row in quarantine} == {"2021_unknown.json"}
+    assert {row["reason_code"] for row in quarantine} == {"unknown_source_kind"}
+    assert result.quarantine_count == 1
 
 
 def test_forged_row_count_is_rejected(tmp_path: Path):
@@ -192,6 +216,38 @@ def test_failed_second_publication_preserves_previous_output(tmp_path: Path, mon
     assert not list((tmp_path / "canonical" / "egramSwaraj").glob(".run-failing.staging-*"))
 
 
+def test_source_fields_cannot_overwrite_canonical_provenance(tmp_path: Path):
+    """A source field named like a provenance column must not win.
+
+    Codex review (PR #64, normalize.py:414): if an input record contains a
+    reserved canonical name (row_id, source_run_id, source_file,
+    fiscal_year, ...), the old code applied provenance first and let the
+    source fields overwrite it, so a child row's parent_row_id would
+    reference a hash the parent itself no longer exposed as its own row_id.
+    """
+    run = make_run(tmp_path, "run-collide", {
+        "2021_PL.json": [{
+            "activityCd": "A1",
+            "row_id": "forged-row-id",
+            "source_run_id": "forged-run-id",
+            "source_file": "forged-file",
+            "fiscal_year": "1900-1901",
+            "children": [{"x": 1}],
+        }],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    parent = rows(files(result, "pl")[0])[0]
+    child = rows(files(result, "pl__children")[0])[0]
+
+    assert parent["row_id"] != "forged-row-id"
+    assert parent["source_run_id"] == "run-collide"
+    assert parent["source_file"] == "2021_PL.json"
+    assert parent["fiscal_year"] == "2021-2022"
+    # Referential integrity: the child's parent_row_id must match the
+    # parent's real (generated) row_id, not the forged source value.
+    assert child["parent_row_id"] == parent["row_id"]
+
+
 def test_existing_snapshot_is_immutable_and_row_ids_are_cross_run_stable(tmp_path: Path):
     first = make_run(tmp_path, "run-one", {"2021_PL.json": [{"id": "same"}]})
     first_result = normalize_egramswaraj(first, tmp_path / "canonical")
@@ -204,6 +260,87 @@ def test_existing_snapshot_is_immutable_and_row_ids_are_cross_run_stable(tmp_pat
     assert first_row["source_record_id"] == second_row["source_record_id"]
     with pytest.raises(NormalizationError, match="already exists"):
         normalize_egramswaraj(second, tmp_path / "canonical")
+
+
+def test_row_id_survives_record_reordering_across_runs(tmp_path: Path):
+    """row_id must key off record identity, not array position.
+
+    Codex review (PR #64, normalize.py:407): the row_id hash's only
+    record-specific component used to be root_pos. If the source ever
+    returns the same two records in a different order on a later run, each
+    record would inherit the *other's* row_id, silently swapping canonical
+    identities and every child link. Records carry a business id
+    (activityCd), so identity must follow that id regardless of position.
+    """
+    first = make_run(tmp_path, "run-order-a", {
+        "2021_PL.json": [
+            {"activityCd": "A1", "note": "first"},
+            {"activityCd": "A2", "note": "second"},
+        ],
+    })
+    first_result = normalize_egramswaraj(first, tmp_path / "canonical")
+    first_by_id = {row["business_id"]: row for row in rows(files(first_result, "pl")[0])}
+
+    second = make_run(tmp_path, "run-order-b", {
+        "2021_PL.json": [
+            {"activityCd": "A2", "note": "second"},
+            {"activityCd": "A1", "note": "first"},
+        ],
+    })
+    second_result = normalize_egramswaraj(second, tmp_path / "canonical")
+    second_by_id = {row["business_id"]: row for row in rows(files(second_result, "pl")[0])}
+
+    assert first_by_id["A1"]["row_id"] == second_by_id["A1"]["row_id"]
+    assert first_by_id["A2"]["row_id"] == second_by_id["A2"]["row_id"]
+    assert first_by_id["A1"]["row_id"] != first_by_id["A2"]["row_id"]
+
+
+def test_row_id_deduplicates_records_without_a_business_id_deterministically(tmp_path: Path):
+    """Records with no business id fall back to content, not position.
+
+    Two records with identical content (no activityCd) must not collide on
+    the same row_id, and the disambiguation must be stable across runs that
+    present them in the same order.
+    """
+    run = make_run(tmp_path, "run-dup", {
+        "2021_PL.json": [{"note": "dup"}, {"note": "dup"}, {"note": "unique"}],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    row_ids = [row["row_id"] for row in rows(files(result, "pl")[0])]
+    assert len(row_ids) == len(set(row_ids)) == 3
+
+
+def test_to_records_streams_instead_of_materializing_a_second_full_list():
+    """to_records() must not build a second full-size list up front.
+
+    Codex review (PR #64, normalize.py:488): read_text()+json.loads()
+    already holds the whole parsed payload in memory; the old
+    `[{**header, **dict(item)} for item in values]` list comprehension then
+    built a *second* full-size list of merged records before any row
+    reached the bounded write buffer, so chunk_size/max_buffered_rows did
+    not actually bound how much of a large payload was resident at once.
+    to_records() now returns a generator so at most one merged record is
+    alive on top of the parsed payload at a time -- this is a partial fix
+    (the input file is still fully parsed by json.loads up front; see the
+    PR reply for the documented residual and why it is bounded in practice
+    for this source).
+    """
+    import types
+
+    payload = {"status": "OK", "data": [{"id": str(i)} for i in range(50)]}
+    records, reason = to_records(payload)
+    assert reason is None
+    assert isinstance(records, types.GeneratorType)
+    materialized = list(records)
+    assert len(materialized) == 50
+    assert materialized[0] == {"status": "OK", "id": "0"}
+
+    # Root-array and single-record shapes are also lazy iterables (not
+    # necessarily generators, but never a pre-built list of merged dicts).
+    array_records, array_reason = to_records([{"id": "1"}, {"id": "2"}])
+    assert array_reason is None
+    assert not isinstance(array_records, list)
+    assert list(array_records) == [{"id": "1"}, {"id": "2"}]
 
 
 def test_union_schema_is_stable_across_chunk_boundaries(tmp_path: Path):
