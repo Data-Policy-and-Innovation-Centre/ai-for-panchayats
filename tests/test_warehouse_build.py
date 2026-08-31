@@ -399,6 +399,59 @@ def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
         con.close()
 
 
+def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
+    """A direct AA child array with no scheme-shaped column (attachments,
+    comments, ...) must not be swept into ``admin_approval_scheme`` just
+    because it sits one level below ``aa``. Before the fix, the empty
+    keyword used to discover the scheme table (its own JSON key is
+    unverified, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
+    matched *any* direct AA child, so an attachments array would load as
+    two all-null scheme rows and get marked consumed instead of reported
+    unconsumed."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalAttachments": [
+                {"fileName": "doc1.pdf", "uploadedBy": "clerk1"},
+                {"fileName": "doc2.pdf", "uploadedBy": "clerk2"},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts.get("admin_approval_scheme", 0) == 0
+    assert "aa__admapprovalattachments" not in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("aa__admapprovalattachments",)
+
+
+def test_scheme_and_unrelated_aa_children_are_both_handled_correctly(tmp_path: Path):
+    """A scheme array and an unrelated array can be siblings under the same
+    AA record; only the scheme one is loaded, the other is reported
+    unconsumed."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [{"wrkSchmCd": "SC1", "wrkAdmApprFndSnctnGen": 100}],
+            "admApprovalAttachments": [{"fileName": "doc1.pdf"}],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts["admin_approval_scheme"] == 1
+    assert "aa__admapprovalschemewebservice" in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("aa__admapprovalattachments",)
+
+
 def test_unrecognized_child_table_is_tracked_not_silently_dropped(tmp_path: Path):
     """A nested array the warehouse has no handler for (e.g. a grandchild
     under fundList) must still be visible in the build result, never

@@ -100,6 +100,24 @@ def test_schema_version_mismatch_is_rejected(tmp_path: Path):
         resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
 
 
+def test_snapshot_declaring_unsupported_schema_version_is_rejected(tmp_path: Path):
+    """Registry and manifest can agree on a version and still be wrong: both
+    might declare a newer schema (e.g. ``"2"``) that this warehouse build --
+    pinned to ``WarehouseSettings.schema_version`` (``"1"``) -- does not know
+    how to consume. Without this check that agreement alone was enough to
+    pass selection, letting version-1 transforms misread a version-2 layout.
+    """
+
+    settings = make_settings(tmp_path)
+    write_manual_snapshot(
+        settings.canonical_root, source="othersystem", run_id="run-x", schema_version="2",
+        tables={},
+    )
+    spec_registry = registry(approved("snap-x", "othersystem", "run-x", schema_version="2"))
+    with pytest.raises(SelectionError, match="unsupported schema_version"):
+        resolve_snapshots(settings, ("snap-x",), registry=spec_registry)
+
+
 def test_duplicate_source_run_selection_is_rejected(tmp_path: Path):
     settings = _minimal_pl_run(tmp_path)
     spec_registry = registry(

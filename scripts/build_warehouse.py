@@ -22,13 +22,15 @@ import sys
 from pathlib import Path
 
 # Run directly (not via pytest, which sets pythonpath=["src", "."] itself),
-# so `src` needs to be on sys.path explicitly -- same convention as
-# scripts/run_egram_scraper.py.
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+# so the repository root needs to be on sys.path explicitly -- same
+# convention as scripts/run_egram_scraper.py. `src.warehouse` itself imports
+# `src.pipeline`, so the repo root (not `src/`) must be the one path added;
+# otherwise `import src.pipeline` fails with ModuleNotFoundError.
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from warehouse.build import build  # noqa: E402
-from warehouse.select import SelectionError  # noqa: E402
-from warehouse.validate import ValidationFailed  # noqa: E402
+from src.warehouse.build import build  # noqa: E402
+from src.warehouse.select import SelectionError  # noqa: E402
+from src.warehouse.validate import ValidationFailed  # noqa: E402
 
 logger = logging.getLogger("build_warehouse")
 

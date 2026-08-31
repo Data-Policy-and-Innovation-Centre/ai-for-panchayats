@@ -214,10 +214,21 @@ def populate(
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
         parent_row_ids = set(approvals["row_id"].dropna())
 
-        scheme_children = _child_tables(tables, "aa", "")
-        scheme_frame = pd.concat(
-            [_read(root, tables, name) for name in scheme_children], ignore_index=True,
-        ) if scheme_children else pd.DataFrame()
+        # The scheme array's own JSON key is unverified (see transform.py's
+        # module docstring), so candidates are still found by prefix alone --
+        # but a direct AA child is only kept if it actually carries a
+        # recognized scheme field. Without this, ANY unrelated AA child array
+        # (attachments, comments, ...) would match the empty keyword, get
+        # loaded as all-null scheme rows, and be marked consumed instead of
+        # reported unconsumed.
+        scheme_frames: list[pd.DataFrame] = []
+        scheme_children: list[str] = []
+        for name in _child_tables(tables, "aa", ""):
+            frame = _read(root, tables, name)
+            if set(frame.columns) & set(transform.AA_SCHEME_RENAMES):
+                scheme_frames.append(frame)
+                scheme_children.append(name)
+        scheme_frame = pd.concat(scheme_frames, ignore_index=True) if scheme_frames else pd.DataFrame()
         add_count("admin_approval_scheme", insert(con, "admin_approval_scheme", transform.admin_approval_scheme(
             scheme_frame, parent_row_ids, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))

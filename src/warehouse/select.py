@@ -84,6 +84,12 @@ def resolve_snapshots(
                 f"snapshot {snapshot_id!r} schema_version mismatch: "
                 f"registry declares {spec.schema_version!r}, manifest has {manifest['schema_version']!r}"
             )
+        if spec.schema_version != settings.schema_version:
+            raise SelectionError(
+                f"snapshot {snapshot_id!r} declares unsupported schema_version "
+                f"{spec.schema_version!r}; this warehouse build only supports "
+                f"{settings.schema_version!r}"
+            )
         if manifest["source"] != spec.source or manifest["run_id"] != spec.run_id:
             raise SelectionError(
                 f"snapshot {snapshot_id!r} identity mismatch against registry"
