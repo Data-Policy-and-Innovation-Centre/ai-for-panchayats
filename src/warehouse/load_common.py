@@ -857,8 +857,19 @@ def deterministic_provenance_id(
     fiscal_year: str | None = None,
     parent_row_id: str | None = None,
     position: int | None = None,
+    child_collection: str | None = None,
 ) -> str:
-    """Derive a stable row ID from the source identity and row location."""
+    """Derive a stable row ID from the source identity and row location.
+
+    ``source_run_id`` is validated but deliberately excluded from the hash:
+    replaying the same source file and row under a new run ID must not mint a
+    new identity (see ``src/pipeline/normalize.py``'s ``_provenance``, where
+    ``manifest.run_id`` is likewise recorded as metadata but never folded
+    into ``root_key``/child row IDs). ``child_collection`` mirrors that
+    module's ``_child_rows``, which folds the sanitized collection key into
+    each child's row ID so two collections don't collide at the same
+    position under the same parent.
+    """
 
     source_system = _required_text(source_system, field="source_system")
     source_run_id = _required_text(source_run_id, field="source_run_id")
@@ -868,6 +879,10 @@ def deterministic_provenance_id(
     fiscal_year = _optional_text(fiscal_year, field="fiscal_year") or ""
     parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
     position = _optional_position(position)
+    if position is not None:
+        child_collection = _required_text(child_collection, field="child_collection")
+    else:
+        child_collection = _optional_text(child_collection, field="child_collection")
     if (
         not isinstance(source_row_number, numbers.Integral)
         or isinstance(source_row_number, bool)
@@ -877,7 +892,6 @@ def deterministic_provenance_id(
     values = (
         "warehouse-loader-provenance-v1",
         source_system,
-        source_run_id,
         Path(source_file).as_posix(),
         source_kind,
         gp_code or "",
@@ -885,6 +899,7 @@ def deterministic_provenance_id(
         str(int(source_row_number)),
         parent_row_id or "",
         str(position) if position is not None else "",
+        child_collection or "",
     )
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -905,6 +920,7 @@ def row_provenance(
     source_record_id: str | None = None,
     parent_row_id: str | None = None,
     position: int | None = None,
+    child_collection: str | None = None,
     mapping_status: str = "mapped",
 ) -> dict[str, Any]:
     """Return a row matching the existing canonical provenance contract."""
@@ -920,6 +936,10 @@ def row_provenance(
     business_id = _safe_identifier(business_id, field="business_id")
     parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
     position = _optional_position(position)
+    if position is not None:
+        child_collection = _required_text(child_collection, field="child_collection")
+    else:
+        child_collection = _optional_text(child_collection, field="child_collection")
     mapping_status = _required_text(mapping_status, field="mapping_status")
     explicit_source_record_id = _optional_text(
         source_record_id, field="source_record_id"
@@ -950,6 +970,7 @@ def row_provenance(
         fiscal_year=fiscal_year,
         parent_row_id=parent_row_id,
         position=position,
+        child_collection=child_collection,
     )
     if explicit_source_record_id is not None:
         record_id = explicit_source_record_id

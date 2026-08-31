@@ -278,11 +278,87 @@ def test_child_provenance_has_distinct_row_id_but_root_source_record_id():
         fiscal_year="2021-2022",
         parent_row_id=root["row_id"],
         position=0,
+        child_collection="funds",
     )
 
     assert child["row_id"] != root["row_id"]
     assert child["parent_row_id"] == root["row_id"]
     assert child["source_record_id"] == root["source_record_id"]
+
+
+def test_row_id_is_stable_when_the_same_row_is_replayed_under_a_new_run_id():
+    """A rerun with a new run ID must not mint a new identity for the same row.
+
+    This mirrors the canonical invariant already exercised by
+    ``tests/test_normalize.py::
+    test_existing_snapshot_is_immutable_and_row_ids_are_cross_run_stable``:
+    ``source_run_id`` is provenance metadata, not part of a row's identity.
+    """
+
+    kwargs = {
+        "source_system": "egramswaraj",
+        "source_file": "2021-2022/PL.csv",
+        "source_row_number": 7,
+        "source_kind": "PL",
+        "gp_code": "0123",
+        "fiscal_year": "2021-2022",
+    }
+    first_run = deterministic_provenance_id(source_run_id="run-1", **kwargs)
+    replay_run = deterministic_provenance_id(source_run_id="run-2", **kwargs)
+    assert first_run == replay_run
+
+    first_row = row_provenance(source_run_id="run-1", **kwargs)
+    replay_row = row_provenance(source_run_id="run-2", **kwargs)
+    assert first_row["row_id"] == replay_row["row_id"]
+    assert first_row["source_record_id"] == replay_row["source_record_id"]
+    # The run ID is still recorded as metadata even though it no longer
+    # affects identity.
+    assert first_row["source_run_id"] == "run-1"
+    assert replay_row["source_run_id"] == "run-2"
+
+
+def test_child_row_ids_differ_across_sibling_collections_at_the_same_position():
+    """Position 0 of two different child collections must not collide.
+
+    Mirrors ``src/pipeline/normalize.py::_child_rows``, which folds the
+    sanitized collection key into the child row ID alongside position.
+    """
+
+    root = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+    )
+    fund_child = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+        parent_row_id=root["row_id"],
+        position=0,
+        child_collection="funds",
+    )
+    asset_child = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+        parent_row_id=root["row_id"],
+        position=0,
+        child_collection="assets",
+    )
+
+    assert fund_child["row_id"] != asset_child["row_id"]
 
 
 def test_add_provenance_advances_source_rows_and_does_not_mutate_input():
