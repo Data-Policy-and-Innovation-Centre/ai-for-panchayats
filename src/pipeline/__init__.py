@@ -10,9 +10,19 @@ from .manifest import (
 )
 from .settings import PipelineSettings, SettingsError, load_settings
 from .snapshots import SnapshotRegistry, SnapshotRegistryError, SnapshotSpec, load_snapshot_registry
+from .normalize import (
+    AtomicParquetPublication,
+    NormalizationError,
+    NormalizationResult,
+    normalize_egramswaraj,
+    normalize_run,
+)
 
 __all__ = [
     "ManifestError",
+    "AtomicParquetPublication",
+    "NormalizationError",
+    "NormalizationResult",
     "approve_run",
     "PipelineSettings",
     "RunManifest",
@@ -24,5 +34,7 @@ __all__ = [
     "ValidationReport",
     "load_settings",
     "load_snapshot_registry",
+    "normalize_egramswaraj",
+    "normalize_run",
     "validate_run",
 ]
