@@ -572,29 +572,49 @@ def _pl_child(
     per-row identity of its own, so a second line for the same activity is
     a genuine conflicting duplicate, quarantined by ``_dedupe`` like any
     other -- not a second legitimate row keyed on an invented row_id.
+
+    Strictly 1:1 cuts both ways: an activity with no asset/fund child array
+    element at all still needs a row here, synthesized all-null, exactly
+    like activity_delegation/activity_training/activity_community_service
+    (which get their one-row-per-activity guarantee for free, by reading
+    straight off the ``pl`` frame instead of a separate child array).
+    ``conformance.check_satellite_row_parity`` requires an exact
+    row-per-planned_activity match across all five satellites; a childless
+    activity silently dropped here would build successfully and then fail
+    that check.
     """
 
     keep = ["source_system", "source_run_id", "activity_code"] + columns
     if child.empty:
-        return pd.DataFrame(columns=keep)
-    out = child.rename(columns=renames)
-    identity = _base_identity(out)
-    for name, series in identity.items():
-        out[name] = series
-    out = _ensure_columns(out, keep)
-    frame = out[keep].copy()
-    frame["activity_code"] = to_code(frame["activity_code"])
-    for column in money_columns:
-        frame[column] = to_decimal_money(frame[column])
-    frame = frame.dropna(subset=["activity_code"])
-    frame = _dedupe(
-        frame, ["source_system", "source_run_id", "activity_code"], table, quarantine,
-        source_system=source_system, source_run_id=source_run_id,
-    )
-    return _restrict(
-        frame, table, "activity_code", activity_codes, quarantine,
-        source_system=source_system, source_run_id=source_run_id,
-    )
+        frame = pd.DataFrame(columns=keep)
+    else:
+        out = child.rename(columns=renames)
+        identity = _base_identity(out)
+        for name, series in identity.items():
+            out[name] = series
+        out = _ensure_columns(out, keep)
+        frame = out[keep].copy()
+        frame["activity_code"] = to_code(frame["activity_code"])
+        for column in money_columns:
+            frame[column] = to_decimal_money(frame[column])
+        frame = frame.dropna(subset=["activity_code"])
+        frame = _dedupe(
+            frame, ["source_system", "source_run_id", "activity_code"], table, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        frame = _restrict(
+            frame, table, "activity_code", activity_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+
+    missing = activity_codes - set(frame["activity_code"])
+    if missing:
+        filler = pd.DataFrame({"activity_code": sorted(missing)})
+        filler["source_system"] = source_system
+        filler["source_run_id"] = source_run_id
+        filler = _ensure_columns(filler, keep)[keep]
+        frame = pd.concat([frame, filler], ignore_index=True)
+    return frame
 
 
 def activity_asset(child: pd.DataFrame, activity_codes: set[str], quarantine: Quarantine,

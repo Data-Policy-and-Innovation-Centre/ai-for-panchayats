@@ -16,6 +16,7 @@ import duckdb
 import pytest
 
 from warehouse.build import BuildResult, build
+from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
 from warehouse.transform import RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
@@ -198,6 +199,57 @@ def test_activity_fund_second_line_for_same_activity_is_quarantined(tmp_path: Pa
             "SELECT reason_code FROM quarantine WHERE table_name = 'activity_fund'"
         ).fetchall()
         assert reasons == [("conflicting_duplicate_key",)]
+    finally:
+        con.close()
+
+
+def test_childless_activity_gets_synthesized_satellite_rows_and_passes_conformance(tmp_path: Path):
+    """A real gap between this PR's builder and the conformance rule it
+    ships alongside: activity 8 below has no ``fundList``/``assetDetails``
+    array at all (a perfectly valid activity -- e.g. a training-only line
+    with no planned asset or funding split), while activity 7 has both.
+    Before the fix, activity 8 would build successfully with zero
+    activity_asset/activity_fund rows and then fail
+    ``check_satellite_row_parity``, which requires exactly one row per
+    planned_activity. Both tables must now carry a synthesized all-null
+    row for activity 8, and the built warehouse must be conformant.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [
+                {
+                    "activityCd": 7, "planCode": "P1", "totalCost": 15000.50,
+                    "fundList": [{"schemeCode": "S1", "amountTotal": 5000.25}],
+                    "assetDetails": [{"astTyp": "well", "astUnitCost": 15000.50}],
+                },
+                {"activityCd": 8, "planCode": "P1", "totalCost": 200.0},
+            ],
+        },
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts["planned_activity"] == 2
+    assert result.counts["activity_asset"] == 2
+    assert result.counts["activity_fund"] == 2
+    assert result.quarantine_count == 0
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        childless_asset = con.execute(
+            "SELECT asset_type FROM activity_asset WHERE activity_code = '8'"
+        ).fetchone()
+        assert childless_asset == (None,)
+        childless_fund = con.execute(
+            "SELECT fund_scheme_code FROM activity_fund WHERE activity_code = '8'"
+        ).fetchone()
+        assert childless_fund == (None,)
+
+        assert check_satellite_row_parity(con) == []
+        assert not has_violations(check_conformance(con, skip_reconciliation=True))
     finally:
         con.close()
 
