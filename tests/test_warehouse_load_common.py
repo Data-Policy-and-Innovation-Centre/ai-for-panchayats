@@ -458,3 +458,38 @@ def test_provenance_normalizes_nullable_optional_fields_without_raw_type_error()
     assert row["fiscal_year"] is None
     assert row["parent_row_id"] is None
     assert row["pos"] is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Indian grouping. 1,00,000 is one lakh -- the dominant format in the
+        # source data, and the case a three-digit-only validator would reject.
+        ("1,00,000", Decimal("100000")),
+        ("12,34,567", Decimal("1234567")),
+        ("1,23,45,678", Decimal("12345678")),
+        ("1,00,000.50", Decimal("100000.50")),
+        ("-1,00,000", Decimal("-100000")),
+        ("Rs 1,00,000", Decimal("100000")),
+        # International grouping, still accepted.
+        ("1,000", Decimal("1000")),
+        ("12,345,678", Decimal("12345678")),
+        # Ungrouped values never reach the grouping check.
+        ("100000", Decimal("100000")),
+        ("1234.5", Decimal("1234.5")),
+    ],
+)
+def test_supported_digit_grouping_is_parsed(text: str, expected: Decimal) -> None:
+    assert parse_money(text, column="amount") == expected
+
+
+@pytest.mark.parametrize("text", ["1,2", "12,,34", "1,0000", "1,00,00", ",100", "100,"])
+def test_malformed_digit_grouping_raises_instead_of_corrupting(text: str) -> None:
+    """Stripping commas unconditionally turned these into plausible numbers.
+
+    "1,2" parsed as 12 and "12,,34" as 1234 -- a corrupted expenditure amount
+    reaching the warehouse with no error, which is exactly what this helper
+    promises cannot happen.
+    """
+    with pytest.raises(MoneyParseError):
+        parse_money(text, column="amount")

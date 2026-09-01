@@ -141,6 +141,26 @@ PROVENANCE_COLUMNS = (
 _INTEGER_DOT_ZERO = re.compile(r"^(-?\d+)\.0+$")
 _FISCAL_YEAR = re.compile(r"^(?P<start>\d{4})-(?P<end>\d{4})$")
 _CURRENCY_PREFIX = re.compile(r"(?i)^\s*(?:₹|rs\.?|inr)\s*")
+
+# Digit grouping this loader accepts, checked BEFORE the commas are stripped.
+#
+# Stripping unconditionally turns malformed input into a plausible number
+# rather than an error: "1,2" becomes 12 and "12,,34" becomes 1234, silently
+# corrupting an expenditure amount that the caller was promised would raise.
+#
+# Both conventions are permitted because this is Odisha government financial
+# data. Indian grouping puts the last three digits together and every group
+# before that in twos -- 1,00,000 is one lakh, NOT a malformed 100,000 -- so a
+# validator that only knows three-digit grouping would reject the real data
+# wholesale. That failure would be worse than the one being fixed: silent
+# corruption of some rows traded for rejection of nearly all of them.
+_MONEY_GROUPED = re.compile(
+    r"""^[+-]?(?:
+          \d{1,3}(?:,\d{3})*          # 1  123  1,234  12,345,678
+        | \d{1,2}(?:,\d{2})*,\d{3}    # 1,00,000  12,34,567  1,23,45,678
+    )(?:\.\d*)?$""",
+    re.X,
+)
 _NULL_TEXT = frozenset({"", "na", "n/a", "nan", "none", "null", "<na>", "-"})
 _IDENTIFIER_NULL_TEXT = frozenset({"", "nan", "none", "null", "<na>", "n/a"})
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -638,7 +658,18 @@ def _decimal_from_value(
         decimal_value = value
     else:
         text = str(value).strip()
-        text = _CURRENCY_PREFIX.sub("", text).replace(",", "")
+        text = _CURRENCY_PREFIX.sub("", text)
+        if "," in text:
+            # Only grouped values are checked; an ungrouped string falls
+            # through to Decimal() below, which rejects its own garbage.
+            if not _MONEY_GROUPED.match(text):
+                raise MoneyParseError(
+                    column=column,
+                    value=value,
+                    row=row,
+                    detail="has malformed digit grouping",
+                )
+            text = text.replace(",", "")
         if not text:
             if allow_null:
                 return None
