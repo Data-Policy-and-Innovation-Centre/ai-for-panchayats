@@ -6,8 +6,8 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-from pipeline.manifest import RunPublisher
-from pipeline.normalize import (
+from src.pipeline.manifest import RunPublisher
+from src.pipeline.normalize import (
     NormalizationError,
     _normalise_year,
     normalize_egramswaraj,
@@ -204,7 +204,7 @@ def test_failed_second_publication_preserves_previous_output(tmp_path: Path, mon
     old = rows(next((first_result.output_root / "pl").rglob("*.parquet")))
 
     second = make_run(tmp_path, "run-failing", {"2021_PL.json": [{"id": "new"}]})
-    import pipeline.normalize as module
+    import src.pipeline.normalize as module
 
     def fail(*args, **kwargs):
         raise OSError("synthetic parquet failure")

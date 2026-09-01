@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.cli import main
-from pipeline.manifest import ManifestError, RunPublisher, approve_run, validate_run
-from pipeline.settings import load_settings
-from pipeline.snapshots import load_snapshot_registry
+from src.pipeline.cli import main
+from src.pipeline.manifest import ManifestError, RunPublisher, approve_run, validate_run
+from src.pipeline.settings import load_settings
+from src.pipeline.snapshots import load_snapshot_registry
 
 
 def test_settings_are_validated_without_creating_directories(tmp_path: Path):
