@@ -131,6 +131,13 @@ def populate(
     counts: dict[str, int] = {}
     consumed: dict[str, tuple[str, ...]] = {}
     unconsumed: dict[str, tuple[str, ...]] = {}
+    # activity_expenditure.expenditure_id and activity_nsap.nsap_id are
+    # INTEGER surrogates with no source-field spelling (see
+    # transform.activity_expenditure / transform.activity_nsap); each
+    # counter is advanced by however many rows each snapshot contributes so
+    # ids stay unique across every snapshot loaded into this one build.
+    next_expenditure_id = 1
+    next_nsap_id = 1
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -181,9 +188,12 @@ def populate(
                 con, "activity_community_service", transform.activity_community_service(
                     pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
                 ), batch_size=batch_size))
-            add_count("activity_nsap", insert(con, "activity_nsap", transform.activity_nsap(
+            nsap_rows = transform.activity_nsap(
                 pl, activity_codes, source_system=source_system, source_run_id=source_run_id,
-            ), batch_size=batch_size))
+                start_id=next_nsap_id,
+            )
+            add_count("activity_nsap", insert(con, "activity_nsap", nsap_rows, batch_size=batch_size))
+            next_nsap_id += len(nsap_rows)
 
             asset_children = _child_tables(tables, "pl", "asset")
             asset_frame = pd.concat(
@@ -242,10 +252,12 @@ def populate(
             pp, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
 
-        add_count("recommended_expenditure", insert(con, "recommended_expenditure", transform.recommended_expenditure(
+        expenditures = transform.activity_expenditure(
             re, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
-            resolutions=resolutions,
-        ), batch_size=batch_size))
+            resolutions=resolutions, start_id=next_expenditure_id,
+        )
+        add_count("activity_expenditure", insert(con, "activity_expenditure", expenditures, batch_size=batch_size))
+        next_expenditure_id += len(expenditures)
 
         consumed[f"{source_system}/{source_run_id}"] = tuple(sorted(used))
         leftover = tuple(sorted(set(tables) - set(used) - {"quarantine"}))

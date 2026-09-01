@@ -94,23 +94,31 @@ def test_activity_fund_preserves_identifier_columns_not_just_money():
     fund_component_code via a bare ``startswith("fund_")`` filter, routing
     them through decimal parsing and silently nulling every scheme code.
     Confirmed failing before the fix (values were None), passing after.
+
+    Uses two different activities (not two lines for the same activity):
+    activity_fund is strictly 1:1 with planned_activity (see schema.py), so
+    two lines for one activity are a conflicting duplicate, not a valid
+    fixture for this identifier-preservation check.
     """
 
     child = pd.DataFrame([
-        _row(row_id="r0", schemeCode="S1", componentCode="C1", amountTotal=5000.25),
-        _row(row_id="r1", schemeCode="S2", componentCode="C2", amountTotal=250.10),
+        _row(row_id="r0", business_id="7", schemeCode="S1", componentCode="C1", amountTotal=5000.25),
+        _row(row_id="r1", business_id="8", schemeCode="S2", componentCode="C2", amountTotal=250.10),
     ])
     quarantine = t.Quarantine()
-    out = t.activity_fund(child, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_fund(child, {"7", "8"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     assert list(out["fund_scheme_code"]) == ["S1", "S2"]
     assert list(out["fund_component_code"]) == ["C1", "C2"]
     assert list(out["fund_amount_total"]) == [Decimal("5000.25"), Decimal("250.10")]
 
 
-def test_activity_fund_is_one_to_many_not_collapsed_by_activity_code():
-    """Two fund lines for the same activity are both kept: PR #9 modeled this
-    1:1 by activity_code, which would quarantine the second line as a
-    conflicting duplicate. It is a genuine repeat, not a conflict.
+def test_activity_fund_is_one_to_one_second_line_is_quarantined():
+    """activity_asset/activity_fund are strictly 1:1 with planned_activity
+    (see schema.py's activity_asset/activity_fund comments): the real
+    tables carry no row_id, so a second fund line for the same activity is
+    a conflicting duplicate, not a legitimate second row. An earlier
+    revision of this module modeled these as one-to-many child tables keyed
+    by an invented row_id; that design is reversed here.
     """
 
     child = pd.DataFrame([
@@ -119,17 +127,62 @@ def test_activity_fund_is_one_to_many_not_collapsed_by_activity_code():
     ])
     quarantine = t.Quarantine()
     out = t.activity_fund(child, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
-    assert len(out) == 2
-    assert quarantine.total() == 0
+    assert len(out) == 1
+    assert list(out["fund_scheme_code"]) == ["S1"]
+    assert quarantine.total("activity_fund") == 1
+    assert quarantine.records[0]["reason_code"] == "conflicting_duplicate_key"
 
 
 def test_activity_asset_orphan_activity_code_is_quarantined():
+    """"99" is quarantined as an orphan; "7" has no asset line at all here,
+    so it is synthesized as an all-null row rather than silently omitted
+    -- see the childless-activity synthesis test below.
+    """
+
     child = pd.DataFrame([_row(row_id="r0", business_id="99", astTyp="well")])
     quarantine = t.Quarantine()
     out = t.activity_asset(child, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
-    assert out.empty
+    assert list(out["activity_code"]) == ["7"]
+    assert out["asset_type"].iloc[0] is None or pd.isna(out["asset_type"].iloc[0])
     assert quarantine.total("activity_asset") == 1
     assert quarantine.records[0]["reason_code"] == "orphan_reference"
+
+
+def test_activity_asset_synthesizes_null_row_for_childless_activity():
+    """A planning activity with no asset child array at all (activity "8"
+    below, alongside "7" which does have one) still gets exactly one
+    activity_asset row -- an all-null one -- so the table stays strictly
+    1:1 with planned_activity, matching activity_delegation/
+    activity_training/activity_community_service and satisfying
+    ``conformance.check_satellite_row_parity``.
+    """
+
+    child = pd.DataFrame([_row(row_id="r0", business_id="7", astTyp="well")])
+    quarantine = t.Quarantine()
+    out = t.activity_asset(
+        child, {"7", "8"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+    )
+    assert sorted(out["activity_code"]) == ["7", "8"]
+    childless = out.loc[out["activity_code"] == "8"].iloc[0]
+    assert pd.isna(childless["asset_type"])
+    assert childless["source_system"] == "egramSwaraj"
+    assert childless["source_run_id"] == "run-1"
+    assert quarantine.total("activity_asset") == 0
+
+
+def test_activity_fund_synthesizes_null_row_when_no_fund_children_at_all():
+    """The whole-snapshot-empty case: no fund child array exists anywhere
+    in this pl payload (``child`` is empty), yet every activity in
+    ``activity_codes`` still needs its one row.
+    """
+
+    child = pd.DataFrame()
+    quarantine = t.Quarantine()
+    out = t.activity_fund(
+        child, {"7", "8"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+    )
+    assert sorted(out["activity_code"]) == ["7", "8"]
+    assert out["fund_amount_total"].isna().all()
 
 
 # --------------------------------------------------------------------- activity_nsap grain
@@ -144,34 +197,88 @@ def test_activity_nsap_one_row_per_nonzero_category():
     )])
     out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
     rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
-    assert rows[("old_age", "lt80", "male")] == Decimal("3.00")
+    # beneficiary_count is a COUNT, not money (see schema.py's activity_nsap
+    # DDL): an integer, never decimal.Decimal.
+    assert rows[("old_age", "lt80", "male")] == 3
+    assert not isinstance(rows[("old_age", "lt80", "male")], Decimal)
     assert ("old_age", "lt80", "female") not in rows  # zero counts are dropped
-    assert rows[("widow", "na", "female")] == Decimal("2.00")
+    assert rows[("widow", "na", "female")] == 2
 
 
-# --------------------------------------------------------------------- recommended_expenditure identity
+def test_activity_nsap_assigns_nsap_id_starting_at_start_id():
+    """nsap_id is a real, published column and the table's actual primary
+    key (confirmed against the real table header -- see schema.py), not an
+    invented row_id. It must be assigned the same way
+    activity_expenditure.expenditure_id is: densely, starting at the
+    caller-supplied start_id, 1:1 with the rows actually returned."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male=3,
+        activityNsap_old_age_below_eighty_female=0,
+        activityNsap_widow_female=2,
+    )])
+    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1", start_id=101)
+    assert len(out) == 2  # two non-zero categories survive
+    assert list(out["nsap_id"]) == [101, 102]  # dense, starting at start_id
 
 
-def test_recommended_expenditure_identity_and_orphan_gp():
+def test_activity_nsap_empty_frame_has_nsap_id_column():
+    """The table is legitimately empty in every real build to date (all
+    source NSAP/PMAY-G columns are null in the real planning file); the
+    empty-frame path must still declare the nsap_id column so downstream
+    code (e.g. warehouse.load.insert's column reindex) never sees a
+    missing column."""
+
+    pl = pd.DataFrame([_row(row_id="r0", business_id="7")])  # no NSAP columns at all
+    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    assert out.empty
+    assert "nsap_id" in out.columns
+
+
+# --------------------------------------------------------------------- activity_expenditure identity
+
+
+def test_activity_expenditure_identity_and_orphan_gp():
     re_frame = pd.DataFrame([
         _row(row_id="r0", planCode="P1", sNo=1, totalExpenditure=500, gp_code="123"),
         _row(row_id="r1", planCode="P1", sNo=1, totalExpenditure=500, gp_code="999"),  # orphan GP
     ])
     quarantine = t.Quarantine()
-    out = t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     assert len(out) == 1
     assert list(out["s_no"]) == ["1"]
-    assert quarantine.total("recommended_expenditure") == 1
+    assert quarantine.total("activity_expenditure") == 1
     assert quarantine.records[0]["reason_code"] == "orphan_gp"
 
 
-def test_recommended_expenditure_conflicting_serial_number_is_quarantined():
+def test_activity_expenditure_assigns_expenditure_id_starting_at_start_id():
+    """expenditure_id is the table's actual primary key (an INTEGER
+    surrogate the source data has no spelling for at all); it must be
+    assigned densely starting at the caller-supplied start_id, 1:1 with the
+    rows that actually survive quarantine/orphan filtering -- not with the
+    rows in the input frame."""
+
+    re_frame = pd.DataFrame([
+        _row(row_id="r0", planCode="P1", sNo=1, totalExpenditure=500, gp_code="123"),
+        _row(row_id="r1", planCode="P1", sNo=2, totalExpenditure=700, gp_code="999"),  # orphan GP, dropped
+        _row(row_id="r2", planCode="P1", sNo=3, totalExpenditure=900, gp_code="123"),
+    ])
+    quarantine = t.Quarantine()
+    out = t.activity_expenditure(
+        re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1", start_id=41,
+    )
+    assert len(out) == 2  # the orphan-GP row was dropped
+    assert list(out["expenditure_id"]) == [41, 42]  # dense, starting at start_id
+
+
+def test_activity_expenditure_conflicting_serial_number_is_quarantined():
     re_frame = pd.DataFrame([
         _row(row_id="r0", planCode="P1", sNo=1, totalExpenditure=500),
         _row(row_id="r1", planCode="P1", sNo=1, totalExpenditure=999),
     ])
     quarantine = t.Quarantine()
-    out = t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     assert len(out) == 1
     assert quarantine.records[-1]["reason_code"] == "conflicting_duplicate_key"
 
@@ -179,7 +286,7 @@ def test_recommended_expenditure_conflicting_serial_number_is_quarantined():
 # ------------------------------------------------------ RE field alias resolution
 
 
-def test_recommended_expenditure_raises_when_required_field_has_no_candidate():
+def test_activity_expenditure_raises_when_required_field_has_no_candidate():
     """s_no is part of the documented identity; if the source frame has none
     of its candidate spellings, ``_first_present`` used to hand back a
     silent all-null column. It must now fail loudly and name the field, the
@@ -188,22 +295,22 @@ def test_recommended_expenditure_raises_when_required_field_has_no_candidate():
     re_frame = pd.DataFrame([_row(row_id="r0", planCode="P1", totalExpenditure=500)])  # no sNo/s_no/etc.
     quarantine = t.Quarantine()
     with pytest.raises(t.RequiredFieldUnresolved) as excinfo:
-        t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+        t.activity_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     message = str(excinfo.value)
     assert "s_no" in message
     assert "sNo" in message  # a candidate that was tried
     assert "planCode" in message  # a column that was actually present
 
 
-def test_recommended_expenditure_raises_when_plan_code_has_no_candidate():
+def test_activity_expenditure_raises_when_plan_code_has_no_candidate():
     re_frame = pd.DataFrame([_row(row_id="r0", sNo=1, totalExpenditure=500)])  # no planCode/plan_code
     quarantine = t.Quarantine()
     with pytest.raises(t.RequiredFieldUnresolved) as excinfo:
-        t.recommended_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+        t.activity_expenditure(re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
     assert "plan_code" in str(excinfo.value)
 
 
-def test_recommended_expenditure_optional_field_with_no_candidate_resolves_null_and_is_recorded():
+def test_activity_expenditure_optional_field_with_no_candidate_resolves_null_and_is_recorded():
     """approved_cost_action_plan is genuinely optional: a missing alias must
     not raise, but the null resolution must be recorded rather than merely
     commented, per the module docstring's promise."""
@@ -211,7 +318,7 @@ def test_recommended_expenditure_optional_field_with_no_candidate_resolves_null_
     re_frame = pd.DataFrame([_row(row_id="r0", planCode="P1", sNo=1, totalExpenditure=500)])
     quarantine = t.Quarantine()
     resolutions = t.FieldResolutions()
-    out = t.recommended_expenditure(
+    out = t.activity_expenditure(
         re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
         resolutions=resolutions,
     )
@@ -221,14 +328,14 @@ def test_recommended_expenditure_optional_field_with_no_candidate_resolves_null_
     assert all(r.matched_candidate is None for r in resolutions.unresolved())
 
 
-def test_recommended_expenditure_non_first_candidate_resolves_and_is_recorded():
+def test_activity_expenditure_non_first_candidate_resolves_and_is_recorded():
     """A later-listed spelling (not the first candidate) must still resolve
     correctly, and the specific candidate that matched must be recorded."""
 
     re_frame = pd.DataFrame([_row(row_id="r0", plan_code="P1", sno=1, totalExpenditure=500)])
     quarantine = t.Quarantine()
     resolutions = t.FieldResolutions()
-    out = t.recommended_expenditure(
+    out = t.activity_expenditure(
         re_frame, {"123"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
         resolutions=resolutions,
     )
