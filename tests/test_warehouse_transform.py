@@ -195,7 +195,7 @@ def test_activity_nsap_one_row_per_nonzero_category():
         activityNsap_old_age_below_eighty_female=0,
         activityNsap_widow_female=2,
     )])
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_nsap(pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1")
     rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
     # beneficiary_count is a COUNT, not money (see schema.py's activity_nsap
     # DDL): an integer, never decimal.Decimal.
@@ -218,7 +218,9 @@ def test_activity_nsap_assigns_nsap_id_starting_at_start_id():
         activityNsap_old_age_below_eighty_female=0,
         activityNsap_widow_female=2,
     )])
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1", start_id=101)
+    out = t.activity_nsap(
+        pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1", start_id=101,
+    )
     assert len(out) == 2  # two non-zero categories survive
     assert list(out["nsap_id"]) == [101, 102]  # dense, starting at start_id
 
@@ -231,9 +233,32 @@ def test_activity_nsap_empty_frame_has_nsap_id_column():
     missing column."""
 
     pl = pd.DataFrame([_row(row_id="r0", business_id="7")])  # no NSAP columns at all
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_nsap(pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1")
     assert out.empty
     assert "nsap_id" in out.columns
+
+
+def test_activity_nsap_fractional_count_is_quarantined_not_rounded():
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male=1.5,
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
+
+
+def test_activity_nsap_whole_number_float_is_accepted():
+    pl = pd.DataFrame([_row(row_id="r0", business_id="7", activityNsap_widow_female=2.0)])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    assert list(out["beneficiary_count"]) == [2]
+    assert quarantine.frame().empty
 
 
 # --------------------------------------------------------------------- activity_expenditure identity

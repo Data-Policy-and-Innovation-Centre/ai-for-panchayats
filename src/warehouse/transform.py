@@ -465,7 +465,7 @@ def activity_community_service(pl: pd.DataFrame, activity_codes: set[str], quara
     )
 
 
-def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
+def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quarantine,
                    *, source_system: str, source_run_id: str, start_id: int = 1) -> pd.DataFrame:
     """Wide NSAP beneficiary columns to one row per non-zero category.
 
@@ -478,6 +478,8 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
     step, so ids are 1:1 with the rows actually returned. The caller
     (``build.populate``) advances ``start_id`` by the number of rows
     returned before calling this again for the next snapshot.
+
+    Fractional counts are quarantined, not rounded.
     """
 
     columns = ["nsap_id", "source_system", "source_run_id", "activity_code", "category",
@@ -497,6 +499,20 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
     # beneficiary_count is a COUNT, not money: parsed as a nullable integer
     # (see warehouse.schema's activity_nsap DDL), never routed through
     # decimal money parsing.
+    numeric = pd.to_numeric(
+        melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    fractional = numeric.notna() & (numeric != numeric.round())
+    if fractional.any():
+        # A fractional count (e.g. 1.5) is malformed, not roundable.
+        quarantine.add(
+            "activity_nsap", "fractional_beneficiary_count",
+            "beneficiary_count is fractional",
+            "activity_code", melted.loc[fractional, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    melted = melted[~fractional]
     melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
