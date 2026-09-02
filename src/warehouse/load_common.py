@@ -671,11 +671,7 @@ def _decimal_from_value(
                 )
             text = text.replace(",", "")
         if not text:
-            # By this point, a genuine blank has already been caught above
-            # (before prefix stripping). Reaching here means a currency
-            # prefix (₹, Rs., INR) stripped the value down to nothing —
-            # that's a malformed value, not a missing one, so it always
-            # raises regardless of allow_null.
+            # A currency prefix alone (no digits) is malformed, not blank.
             raise MoneyParseError(
                 column=column,
                 value=value,

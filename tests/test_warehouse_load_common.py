@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import pandas as pd
-from pandas._libs.missing import NAType
 import pytest
 
 from warehouse.load_common import (
@@ -173,7 +171,7 @@ def test_unparseable_money_raises_instead_of_becoming_zero():
     "value",
     ["1.001", Decimal("1.001"), "-0.001"],
 )
-def test_money_with_more_fractional_digits_fails_closed(value: Decimal | Literal['1.001'] | Literal['-0.001']):
+def test_money_with_more_fractional_digits_fails_closed(value: str | Decimal) -> None:
     with pytest.raises(MoneyParseError, match="fractional digits"):
         parse_money(value, column="amount", places=2)
 
@@ -220,7 +218,7 @@ def test_identifier_cleaning_preserves_leading_zeroes_and_strips_float_artifact(
 @pytest.mark.parametrize(
     "value", ["", "nan", "NaN", "none", "NULL", "<NA>", None, pd.NA]
 )
-def test_identifier_missing_sentinels_normalize_to_none(value: None | NAType | Literal[''] | Literal['nan'] | Literal['NaN'] | Literal['none'] | Literal['NULL'] | Literal['<NA>']):
+def test_identifier_missing_sentinels_normalize_to_none(value: object) -> None:
     assert clean_identifier(value) is None
 
 
@@ -233,7 +231,7 @@ def test_nonfinite_numeric_identifier_raises_typed_error(value: float | np.float
 
 
 @pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
-def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value: np.bool[Literal[True]] | np.bool[Literal[False]] | bool):
+def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value: bool) -> None:
     with pytest.raises(IdentifierError, match="boolean"):
         clean_identifier(value)
 
@@ -436,7 +434,7 @@ def test_add_provenance_empty_frame_still_declares_contract_columns():
         },
     ],
 )
-def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs: dict[str, str] | dict[str, str | NAType]):
+def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs: dict) -> None:
     with pytest.raises(ProvenanceError):
         ProvenanceSpec(**kwargs)
 
