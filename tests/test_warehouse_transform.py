@@ -253,6 +253,22 @@ def test_activity_nsap_fractional_count_is_quarantined_not_rounded():
     assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
 
 
+def test_activity_nsap_subfloat_precision_fraction_is_still_quarantined():
+    """1.00000000000000001 rounds to the float 1.0 before any comparison
+    can see it's fractional -- exact-decimal detection must catch it
+    where a float-based check would miss it entirely."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="1.00000000000000001",
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    assert out.empty
+    assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
+
+
 def test_activity_nsap_whole_number_float_is_accepted():
     pl = pd.DataFrame([_row(row_id="r0", business_id="7", activityNsap_widow_female=2.0)])
     quarantine = t.Quarantine()

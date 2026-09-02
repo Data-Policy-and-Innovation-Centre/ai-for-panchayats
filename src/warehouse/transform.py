@@ -46,6 +46,7 @@ conflicting duplicate: quarantined, not kept as a second row.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 import pandas as pd
@@ -499,11 +500,18 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
     # beneficiary_count is a COUNT, not money: parsed as a nullable integer
     # (see warehouse.schema's activity_nsap DDL), never routed through
     # decimal money parsing.
-    numeric = pd.to_numeric(
-        melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip(),
-        errors="coerce",
-    )
-    fractional = numeric.notna() & (numeric != numeric.round())
+    cleaned = melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip()
+
+    def _is_fractional(text: object) -> bool:
+        if pd.isna(text) or text == "":
+            return False
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return False
+        return value != value.to_integral_value()
+
+    fractional = cleaned.map(_is_fractional)
     if fractional.any():
         # A fractional count (e.g. 1.5) is malformed, not roundable.
         quarantine.add(
