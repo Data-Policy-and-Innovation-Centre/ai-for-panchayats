@@ -671,13 +671,12 @@ def _decimal_from_value(
                 )
             text = text.replace(",", "")
         if not text:
-            if allow_null:
-                return None
+            # A currency prefix alone (no digits) is malformed, not blank.
             raise MoneyParseError(
                 column=column,
                 value=value,
                 row=row,
-                detail="is blank but null is not allowed",
+                detail="is a currency prefix with no amount",
             )
         try:
             decimal_value = Decimal(text)
