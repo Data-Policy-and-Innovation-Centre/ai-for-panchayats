@@ -195,19 +195,26 @@ def populate(
             add_count("activity_nsap", insert(con, "activity_nsap", nsap_rows, batch_size=batch_size))
             next_nsap_id += len(nsap_rows)
 
-            asset_children = _child_tables(tables, "pl", "asset")
-            asset_frame = pd.concat(
-                [_read(root, tables, name) for name in asset_children], ignore_index=True,
-            ) if asset_children else pd.DataFrame()
+            asset_frames: list[pd.DataFrame] = []
+            asset_children: list[str] = []
+            fund_frames: list[pd.DataFrame] = []
+            fund_children: list[str] = []
+            for name in _child_tables(tables, "pl", ""):
+                frame = _read(root, tables, name)
+                if set(frame.columns) & set(transform.ASSET_CHILD_RENAMES):
+                    asset_frames.append(frame)
+                    asset_children.append(name)
+                elif set(frame.columns) & set(transform.FUND_CHILD_RENAMES):
+                    fund_frames.append(frame)
+                    fund_children.append(name)
+
+            asset_frame = pd.concat(asset_frames, ignore_index=True) if asset_frames else pd.DataFrame()
             add_count("activity_asset", insert(con, "activity_asset", transform.activity_asset(
                 asset_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
             ), batch_size=batch_size))
             used.extend(asset_children)
 
-            fund_children = _child_tables(tables, "pl", "fund")
-            fund_frame = pd.concat(
-                [_read(root, tables, name) for name in fund_children], ignore_index=True,
-            ) if fund_children else pd.DataFrame()
+            fund_frame = pd.concat(fund_frames, ignore_index=True) if fund_frames else pd.DataFrame()
             add_count("activity_fund", insert(con, "activity_fund", transform.activity_fund(
                 fund_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
             ), batch_size=batch_size))
