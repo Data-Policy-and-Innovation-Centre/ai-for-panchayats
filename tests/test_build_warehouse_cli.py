@@ -49,3 +49,15 @@ def test_cli_reaches_business_logic_not_an_import_error():
     result = _run_cli("build", "--snapshot-id", "does-not-exist")
     assert "ModuleNotFoundError" not in result.stderr
     assert "unknown approved snapshot" in result.stderr
+
+
+def test_cli_unknown_snapshot_id_exits_controlled_not_traceback():
+    """SnapshotRegistry.get() raises SnapshotRegistryError, uncaught before
+    the fix -- reaching the CLI as a traceback and exit 1 instead of the
+    controlled exit 2 every other invalid-selection case already used.
+    """
+
+    result = _run_cli("build", "--snapshot-id", "does-not-exist")
+    assert result.returncode == 2
+    assert "unknown approved snapshot: does-not-exist" in result.stderr
+    assert "Traceback" not in result.stderr

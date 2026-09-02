@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Mapping
 
 from src.pipeline.normalize import NormalizationError, validate_canonical_manifest
-from src.pipeline.snapshots import SnapshotRegistry, SnapshotSpec, load_snapshot_registry
+from src.pipeline.snapshots import (
+    SnapshotRegistry,
+    SnapshotRegistryError,
+    SnapshotSpec,
+    load_snapshot_registry,
+)
 
 from .config import WarehouseSettings
 from .load import discover_tables
@@ -65,7 +70,11 @@ def resolve_snapshots(
     resolved: list[SelectedSnapshot] = []
     seen: set[tuple[str, str]] = set()
     for snapshot_id in snapshot_ids:
-        spec = active_registry.get(snapshot_id)
+        try:
+            spec = active_registry.get(snapshot_id)
+        except SnapshotRegistryError as exc:
+            # Unknown/stale ids fail like every other selection problem here.
+            raise SelectionError(str(exc)) from exc
         if spec.status != "approved":
             raise SelectionError(f"snapshot {snapshot_id!r} is not approved")
         key = (spec.source, spec.run_id)
