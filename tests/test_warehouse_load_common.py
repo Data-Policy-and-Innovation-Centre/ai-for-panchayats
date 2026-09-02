@@ -11,7 +11,7 @@ import pandas as pd
 from pandas._libs.missing import NAType
 import pytest
 
-from ..warehouse.load_common import (
+from warehouse.load_common import (
     CsvSchemaError,
     DateParseError,
     FiscalYearError,
