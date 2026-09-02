@@ -269,6 +269,27 @@ def test_activity_nsap_subfloat_precision_fraction_is_still_quarantined():
     assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
 
 
+def test_activity_nsap_nan_and_infinity_are_treated_as_missing_not_fractional():
+    """sNaN raises InvalidOperation on any operation, even outside
+    construction -- is_finite() must guard the comparison itself, not just
+    the Decimal(text) call, or the whole build aborts. Quiet NaN and
+    Infinity must be treated as missing, not fractional, matching the old
+    pd.to_numeric(..., errors="coerce") behavior this replaced."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="NaN",
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert quarantine.frame().empty
+
+
 def test_activity_nsap_whole_number_float_is_accepted():
     pl = pd.DataFrame([_row(row_id="r0", business_id="7", activityNsap_widow_female=2.0)])
     quarantine = t.Quarantine()

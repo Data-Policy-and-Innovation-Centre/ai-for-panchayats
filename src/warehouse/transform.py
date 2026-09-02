@@ -509,6 +509,8 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
             value = Decimal(text)
         except InvalidOperation:
             return False
+        if not value.is_finite():
+            return False
         return value != value.to_integral_value()
 
     fractional = cleaned.map(_is_fractional)
