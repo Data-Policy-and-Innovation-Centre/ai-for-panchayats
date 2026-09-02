@@ -374,6 +374,9 @@ def test_cross_source_activity_code_collision_fails_build_by_design(tmp_path: Pa
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source PK collision,
+            # not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 
@@ -403,6 +406,9 @@ def test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes(tm
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source GP
+            # conformance, not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 

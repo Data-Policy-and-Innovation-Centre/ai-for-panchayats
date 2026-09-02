@@ -102,6 +102,14 @@ def resolve_snapshots(
                 f"snapshot {snapshot_id!r} declares unrecognized dataset(s) {unknown}; "
                 "teach warehouse.schema.KIND_TABLES about them before building"
             )
+        missing_kinds = tuple(kind for kind in KNOWN_KIND_PREFIXES if kind not in tables)
+        if missing_kinds:
+            # A kind absent entirely (never requested at normalization time)
+            # is not the same as a kind present with zero rows.
+            raise SelectionError(
+                f"snapshot {snapshot_id!r} is missing required source-kind dataset(s) "
+                f"{missing_kinds}; a partial normalization cannot be built"
+            )
         resolved.append(SelectedSnapshot(
             spec=spec, snapshot_root=snapshot_root, manifest=manifest, tables=tables,
         ))
