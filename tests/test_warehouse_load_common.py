@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
+from pandas._libs.missing import NAType
 import pytest
 
-from warehouse.load_common import (
+from ..warehouse.load_common import (
     CsvSchemaError,
     DateParseError,
     FiscalYearError,
@@ -171,7 +173,7 @@ def test_unparseable_money_raises_instead_of_becoming_zero():
     "value",
     ["1.001", Decimal("1.001"), "-0.001"],
 )
-def test_money_with_more_fractional_digits_fails_closed(value):
+def test_money_with_more_fractional_digits_fails_closed(value: Decimal | Literal['1.001'] | Literal['-0.001']):
     with pytest.raises(MoneyParseError, match="fractional digits"):
         parse_money(value, column="amount", places=2)
 
@@ -187,7 +189,7 @@ def test_money_with_more_fractional_digits_fails_closed(value):
         np.float32("nan"),
     ],
 )
-def test_nonfinite_money_values_raise_typed_error(value):
+def test_nonfinite_money_values_raise_typed_error(value: Decimal | float | np.floating):
     with pytest.raises(MoneyParseError):
         parse_money(value, column="amount")
 
@@ -218,20 +220,20 @@ def test_identifier_cleaning_preserves_leading_zeroes_and_strips_float_artifact(
 @pytest.mark.parametrize(
     "value", ["", "nan", "NaN", "none", "NULL", "<NA>", None, pd.NA]
 )
-def test_identifier_missing_sentinels_normalize_to_none(value):
+def test_identifier_missing_sentinels_normalize_to_none(value: None | NAType | Literal[''] | Literal['nan'] | Literal['NaN'] | Literal['none'] | Literal['NULL'] | Literal['<NA>']):
     assert clean_identifier(value) is None
 
 
 @pytest.mark.parametrize(
     "value", [float("nan"), float("inf"), np.float32("nan"), Decimal("NaN")]
 )
-def test_nonfinite_numeric_identifier_raises_typed_error(value):
+def test_nonfinite_numeric_identifier_raises_typed_error(value: float | np.floating | Decimal):
     with pytest.raises(IdentifierError):
         clean_identifier(value)
 
 
 @pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
-def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value):
+def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value: np.bool[Literal[True]] | np.bool[Literal[False]] | bool):
     with pytest.raises(IdentifierError, match="boolean"):
         clean_identifier(value)
 
@@ -434,7 +436,7 @@ def test_add_provenance_empty_frame_still_declares_contract_columns():
         },
     ],
 )
-def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs):
+def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs: dict[str, str] | dict[str, str | NAType]):
     with pytest.raises(ProvenanceError):
         ProvenanceSpec(**kwargs)
 
@@ -493,3 +495,17 @@ def test_malformed_digit_grouping_raises_instead_of_corrupting(text: str) -> Non
     """
     with pytest.raises(MoneyParseError):
         parse_money(text, column="amount")
+
+@pytest.mark.parametrize("text", ["₹", "Rs.", "Rs ", "INR "])
+def test_bare_currency_prefix_raises_even_with_allow_null(text: str) -> None:
+    with pytest.raises(MoneyParseError):
+        parse_money(text, column="amount", allow_null=True)
+
+
+@pytest.mark.parametrize("text", ["", "NA", "-"])
+def test_genuine_blank_still_returns_none_under_allow_null(text: str) -> None:
+    assert parse_money(text, column="amount", allow_null=True) is None
+
+
+def test_none_still_returns_none_under_allow_null() -> None:
+    assert parse_money(None, column="amount", allow_null=True) is None
