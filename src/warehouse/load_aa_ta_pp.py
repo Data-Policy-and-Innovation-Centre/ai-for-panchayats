@@ -1286,12 +1286,16 @@ def load_aa_ta_pp(
 
     allowed = _ensure_activity_set(activity_codes)
     assert allowed is not None
+    # Materialised once, like activity_codes above: a one-shot iterable
+    # (generator, DB cursor) passed straight through would be drained by the
+    # AA loader, leaving TA with an empty set and quarantining every TA row.
+    allowed_gps = _ensure_activity_set(gp_codes, column="gp_lgd_code")
     aa_audit = LoaderAudit()
     aa, parent_index = load_admin_approval_with_index(
         aa_path,
         aa_spec,
         activity_codes=allowed,
-        gp_codes=gp_codes,
+        gp_codes=allowed_gps,
         chunksize=chunksize,
         audit=aa_audit,
         on_error=on_error,
@@ -1310,7 +1314,7 @@ def load_aa_ta_pp(
         ta_path,
         ta_spec,
         activity_codes=allowed,
-        gp_codes=gp_codes,
+        gp_codes=allowed_gps,
         chunksize=chunksize,
         audit=ta_audit,
         on_error=on_error,

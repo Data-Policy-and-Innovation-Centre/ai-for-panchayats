@@ -26,6 +26,7 @@ from warehouse.load_aa_ta_pp import (
     iter_admin_approval,
     load_admin_approval,
     load_admin_approval_scheme,
+    load_aa_ta_pp,
     load_admin_approval_with_index,
     load_physical_progress,
     load_technical_approval,
@@ -747,3 +748,37 @@ def test_quarantine_aggregation_counts_and_preserves_first_seen_order(
         "aa-3",
     ]
     assert [record.row_count for record in audit.quarantined] == [2, 1, 3]
+
+
+def test_bundle_materializes_gp_codes_once_for_every_loader(tmp_path: Path):
+    # A one-shot gp_codes iterable must not be drained by the AA loader.
+    # TA runs second, so a generator passed straight through would leave it
+    # with an empty set and quarantine (or reject) every TA row.
+    # activity_codes is already materialised once; gp_codes must be too.
+    aa_path = tmp_path / "aa.csv"
+    scheme_path = tmp_path / "aa-scheme.csv"
+    ta_path = tmp_path / "ta.csv"
+    pp_path = tmp_path / "pp.csv"
+    _write_csv(aa_path, AA_SOURCE_COLUMNS, [_aa_row("aa-1", "activity-1")])
+    _write_csv(
+        scheme_path, AA_SCHEME_SOURCE_COLUMNS, [_scheme_row("s-1", "aa-1", "activity-1")]
+    )
+    _write_csv(ta_path, TA_SOURCE_COLUMNS, [_ta_row("ta-1", "activity-1")])
+    _write_csv(pp_path, PP_UPLOAD_SOURCE_COLUMNS, [_pp_row("pp-1", "activity-1")])
+
+    bundle = load_aa_ta_pp(
+        aa_path=aa_path,
+        aa_scheme_path=scheme_path,
+        ta_path=ta_path,
+        pp_upload_path=pp_path,
+        aa_spec=_spec("AA", "aa.csv"),
+        aa_scheme_spec=_spec("AA", "aa-scheme.csv"),
+        ta_spec=_spec("TA", "ta.csv"),
+        pp_spec=_spec("PP", "pp.csv"),
+        activity_codes={"activity-1"},
+        gp_codes=(code for code in ["0012"]),
+    )
+
+    # TA is loaded after AA; if the iterable were drained this would be 0.
+    assert len(bundle.tables["technical_approval"]) == 1
+    assert not bundle.audits["technical_approval"].quarantined
