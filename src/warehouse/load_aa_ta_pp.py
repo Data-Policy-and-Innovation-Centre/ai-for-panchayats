@@ -260,6 +260,7 @@ class LoaderAudit:
     _REASONS: ClassVar[dict[str, str]] = {
         "duplicate_row_id": "row_id is duplicated or collides with a parent identity",
         "orphan_activity": "activity_code does not resolve to planned_activity",
+        "orphan_gp": "gp_lgd_code does not resolve to gram_panchayat",
         "orphan_parent_row_id": "parent_row_id does not resolve to admin_approval",
         "parent_activity_mismatch": "activity_code does not match the parent activity",
     }
@@ -268,30 +269,37 @@ class LoaderAudit:
     rows_loaded: int = 0
     quarantined: list[QuarantineRecord] = field(default_factory=list)
     row_ids: set[str] = field(default_factory=set)
+    # Every row_id ever seen in this stream, whether or not it was accepted.
+    # ``row_ids`` above stays "accepted" identities only (it feeds downstream
+    # FK indexes like ApprovalParentIndex); duplicate detection must instead
+    # be checked against every observed id so a quarantined-then-repeated
+    # row_id is still reported as a duplicate.
+    observed_row_ids: set[str] = field(default_factory=set)
     activity_codes: set[str] = field(default_factory=set)
     activity_by_row_id: dict[str, str] = field(default_factory=dict)
+    _quarantine_index: dict[tuple[str, str, str, str], int] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def add_quarantine(
         self, *, table: str, reason_code: str, key_column: str, key_value: object
     ) -> None:
         reason = self._REASONS.get(reason_code, "row rejected by source validation")
         rendered = "<null>" if key_value is None else str(key_value)
-        for index, record in enumerate(self.quarantined):
-            if (
-                record.table == table
-                and record.reason_code == reason_code
-                and record.key_column == key_column
-                and record.key_value == rendered
-            ):
-                self.quarantined[index] = QuarantineRecord(
-                    table=record.table,
-                    reason_code=record.reason_code,
-                    reason=record.reason,
-                    key_column=record.key_column,
-                    key_value=record.key_value,
-                    row_count=record.row_count + 1,
-                )
-                return
+        key = (table, reason_code, key_column, rendered)
+        index = self._quarantine_index.get(key)
+        if index is not None:
+            record = self.quarantined[index]
+            self.quarantined[index] = QuarantineRecord(
+                table=record.table,
+                reason_code=record.reason_code,
+                reason=record.reason,
+                key_column=record.key_column,
+                key_value=record.key_value,
+                row_count=record.row_count + 1,
+            )
+            return
+        self._quarantine_index[key] = len(self.quarantined)
         self.quarantined.append(
             QuarantineRecord(
                 table=table,
@@ -490,15 +498,25 @@ def _check_unique_root_rows(
     activity_column: str,
     on_error: ErrorMode,
     activity_codes: set[str] | None,
+    gp_column: str | None = None,
+    gp_codes: set[str] | None = None,
 ) -> pd.Series:
-    """Validate row identities and optional activity membership.
+    """Validate row identities and optional activity/GP membership.
 
     ``activity_code`` is deliberately *not* a uniqueness key here.  The
     warehouse only declares ``row_id`` as the primary key for these tables,
     and the same activity can legitimately occur more than once (for example
     when an activity has multiple PP uploads).  Treating a bare activity code
     as globally unique would also be wrong across GPs and plan years.  The
-    activity set, when supplied, is an FK-style membership check only.
+    activity/GP sets, when supplied, are FK-style membership checks only.
+
+    Duplicate detection is checked against ``audit.observed_row_ids``, which
+    is updated for every row regardless of whether it is later quarantined
+    for an orphan activity/GP.  Checking against ``audit.row_ids`` (accepted
+    rows only) would make the result depend on row order: a row_id whose
+    first occurrence was quarantined would never be recorded, so a later
+    occurrence with a valid activity would load without ever reporting the
+    duplicate.
     """
 
     keep = pd.Series(True, index=frame.index)
@@ -506,8 +524,9 @@ def _check_unique_root_rows(
         row_id = row["row_id"]
         activity = row[activity_column]
         try:
-            if row_id in audit.row_ids:
+            if row_id in audit.observed_row_ids:
                 raise DuplicateKeyError(table=table, key_column="row_id", value=row_id)
+            audit.observed_row_ids.add(row_id)
             if activity_codes is not None and activity not in activity_codes:
                 raise OrphanReferenceError(
                     table=table,
@@ -515,21 +534,40 @@ def _check_unique_root_rows(
                     value=activity,
                     parent="planned_activity",
                 )
+            if gp_codes is not None and row[gp_column] not in gp_codes:
+                raise OrphanReferenceError(
+                    table=table,
+                    key_column=gp_column,
+                    value=row[gp_column],
+                    parent="gram_panchayat",
+                )
         except ApprovalLoaderError as exc:
+            is_gp_orphan = (
+                isinstance(exc, OrphanReferenceError) and exc.key_column == gp_column
+            )
+            reason_code = (
+                "duplicate_row_id"
+                if isinstance(exc, DuplicateKeyError) and exc.key_column == "row_id"
+                else "orphan_gp"
+                if is_gp_orphan
+                else "orphan_activity"
+            )
             keep.loc[index] = _handle_relationship_failure(
                 exc,
                 audit=audit,
                 on_error=on_error,
                 table=table,
-                reason_code=(
-                    "duplicate_row_id"
-                    if isinstance(exc, DuplicateKeyError) and exc.key_column == "row_id"
-                    else "orphan_activity"
-                ),
+                reason_code=reason_code,
                 key_column=exc.key_column
                 if isinstance(exc, (DuplicateKeyError, OrphanReferenceError))
                 else activity_column,
-                key_value=activity if isinstance(exc, OrphanReferenceError) else row_id,
+                key_value=(
+                    row[gp_column]
+                    if is_gp_orphan
+                    else activity
+                    if isinstance(exc, OrphanReferenceError)
+                    else row_id
+                ),
             )
             continue
         audit.row_ids.add(row_id)
@@ -560,6 +598,7 @@ def iter_admin_approval(
     spec: ProvenanceSpec,
     *,
     activity_codes: Iterable[object] | None = None,
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     audit: LoaderAudit | None = None,
     on_error: ErrorMode = "raise",
@@ -571,6 +610,7 @@ def iter_admin_approval(
         raise ValueError("on_error must be 'raise' or 'quarantine'")
     audit = audit or LoaderAudit()
     allowed_activities = _ensure_activity_set(activity_codes)
+    allowed_gps = _ensure_activity_set(gp_codes, column="gp_lgd_code")
     for raw in _read_source_chunks(
         path, expected_columns=AA_SOURCE_COLUMNS, chunksize=chunksize
     ):
@@ -579,17 +619,23 @@ def iter_admin_approval(
         activity = _required_ids(
             raw["activityCd"], table="admin_approval", column="activityCd"
         )
+        gp_lgd_code = _required_ids(
+            raw["lgd_code"], table="admin_approval", column="lgd_code"
+        )
         parent = pd.Series(pd.NA, index=raw.index, dtype="string")
         pos = pd.Series(pd.NA, index=raw.index, dtype="Int64")
         keep = _check_unique_root_rows(
             pd.DataFrame(
-                {"row_id": row_id, "activity_code": activity}, index=raw.index
+                {"row_id": row_id, "activity_code": activity, "gp_lgd_code": gp_lgd_code},
+                index=raw.index,
             ),
             table="admin_approval",
             audit=audit,
             activity_column="activity_code",
             on_error=on_error,
             activity_codes=allowed_activities,
+            gp_column="gp_lgd_code",
+            gp_codes=allowed_gps,
         )
         date = parse_date_series(
             raw["wrkAdmApprSnctnOrdrDt"],
@@ -617,9 +663,7 @@ def iter_admin_approval(
             source_file=_text_series(raw["source_file"], fallback=spec.source_file),
         )
         out = lineage.assign(
-            gp_lgd_code=_required_ids(
-                raw["lgd_code"], table="admin_approval", column="lgd_code"
-            ),
+            gp_lgd_code=gp_lgd_code,
             gp_name=_text_series(raw["gram_panchayat_name"]),
             plan_year=_normalize_year_series(raw["plan_year"], column="plan_year"),
             activity_code=activity,
@@ -695,12 +739,13 @@ def iter_admin_approval_scheme(
             index=raw.index,
         ).iterrows():
             try:
-                if row["row_id"] in audit.row_ids:
+                if row["row_id"] in audit.observed_row_ids:
                     raise DuplicateKeyError(
                         table="admin_approval_scheme",
                         key_column="row_id",
                         value=row["row_id"],
                     )
+                audit.observed_row_ids.add(row["row_id"])
                 if row["row_id"] in parent_ids:
                     # A child row ID colliding with an AA parent would make
                     # the two source domains indistinguishable at the
@@ -805,6 +850,7 @@ def iter_technical_approval(
     spec: ProvenanceSpec,
     *,
     activity_codes: Iterable[object] | None = None,
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     audit: LoaderAudit | None = None,
     on_error: ErrorMode = "raise",
@@ -816,6 +862,7 @@ def iter_technical_approval(
         raise ValueError("on_error must be 'raise' or 'quarantine'")
     audit = audit or LoaderAudit()
     allowed_activities = _ensure_activity_set(activity_codes)
+    allowed_gps = _ensure_activity_set(gp_codes, column="gp_lgd_code")
     for raw in _read_source_chunks(
         path, expected_columns=TA_SOURCE_COLUMNS, chunksize=chunksize
     ):
@@ -826,15 +873,21 @@ def iter_technical_approval(
         activity = _required_ids(
             raw["activityCd"], table="technical_approval", column="activityCd"
         )
+        gp_lgd_code = _required_ids(
+            raw["lgd_code"], table="technical_approval", column="lgd_code"
+        )
         keep = _check_unique_root_rows(
             pd.DataFrame(
-                {"row_id": row_id, "activity_code": activity}, index=raw.index
+                {"row_id": row_id, "activity_code": activity, "gp_lgd_code": gp_lgd_code},
+                index=raw.index,
             ),
             table="technical_approval",
             audit=audit,
             activity_column="activity_code",
             on_error=on_error,
             activity_codes=allowed_activities,
+            gp_column="gp_lgd_code",
+            gp_codes=allowed_gps,
         )
         required = _text_series(raw["wrkTecApprReqFlg"])
         bad_required = ~required.isin(["R", "N"])
@@ -920,9 +973,7 @@ def iter_technical_approval(
             source_file=_text_series(raw["source_file"], fallback=spec.source_file),
         )
         out = lineage.assign(
-            gp_lgd_code=_required_ids(
-                raw["lgd_code"], table="technical_approval", column="lgd_code"
-            ),
+            gp_lgd_code=gp_lgd_code,
             gp_name=_text_series(raw["gram_panchayat_name"]),
             plan_year=_normalize_year_series(raw["plan_year"], column="plan_year"),
             activity_code=activity,
@@ -1084,6 +1135,7 @@ def load_admin_approval(
     spec: ProvenanceSpec,
     *,
     activity_codes: Iterable[object] | None = None,
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     audit: LoaderAudit | None = None,
     on_error: ErrorMode = "raise",
@@ -1095,6 +1147,7 @@ def load_admin_approval(
             path,
             spec,
             activity_codes=activity_codes,
+            gp_codes=gp_codes,
             chunksize=chunksize,
             audit=audit,
             on_error=on_error,
@@ -1108,6 +1161,7 @@ def load_admin_approval_with_index(
     spec: ProvenanceSpec,
     *,
     activity_codes: Iterable[object] | None = None,
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     audit: LoaderAudit | None = None,
     on_error: ErrorMode = "raise",
@@ -1119,6 +1173,7 @@ def load_admin_approval_with_index(
         path,
         spec,
         activity_codes=activity_codes,
+        gp_codes=gp_codes,
         chunksize=chunksize,
         audit=audit,
         on_error=on_error,
@@ -1158,6 +1213,7 @@ def load_technical_approval(
     spec: ProvenanceSpec,
     *,
     activity_codes: Iterable[object] | None = None,
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     audit: LoaderAudit | None = None,
     on_error: ErrorMode = "raise",
@@ -1169,6 +1225,7 @@ def load_technical_approval(
             path,
             spec,
             activity_codes=activity_codes,
+            gp_codes=gp_codes,
             chunksize=chunksize,
             audit=audit,
             on_error=on_error,
@@ -1212,6 +1269,7 @@ def load_aa_ta_pp(
     ta_spec: ProvenanceSpec,
     pp_spec: ProvenanceSpec,
     activity_codes: Iterable[object],
+    gp_codes: Iterable[object] | None = None,
     chunksize: int = 100_000,
     on_error: ErrorMode = "raise",
 ) -> AATAPPBundle:
@@ -1221,7 +1279,9 @@ def load_aa_ta_pp(
     writes batches should call the four ``iter_*`` functions instead, first
     exhausting AA into a source-payload-free :class:`ApprovalParentIndex`,
     then streaming the child and the two activity-referencing sources.  The
-    parent index grows with the number of unique parent keys.
+    parent index grows with the number of unique parent keys.  ``gp_codes``
+    is optional; when omitted, GP membership is not checked (matching every
+    existing caller's behaviour).
     """
 
     allowed = _ensure_activity_set(activity_codes)
@@ -1231,6 +1291,7 @@ def load_aa_ta_pp(
         aa_path,
         aa_spec,
         activity_codes=allowed,
+        gp_codes=gp_codes,
         chunksize=chunksize,
         audit=aa_audit,
         on_error=on_error,
@@ -1249,6 +1310,7 @@ def load_aa_ta_pp(
         ta_path,
         ta_spec,
         activity_codes=allowed,
+        gp_codes=gp_codes,
         chunksize=chunksize,
         audit=ta_audit,
         on_error=on_error,

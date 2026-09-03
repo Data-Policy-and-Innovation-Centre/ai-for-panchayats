@@ -603,3 +603,147 @@ def test_empty_child_with_valid_parent_index_has_stable_columns(tmp_path: Path):
     )
     assert list(frame.columns) == list(ADMIN_APPROVAL_SCHEME_COLUMNS)
     assert frame.empty
+
+
+def test_admin_duplicate_detection_is_order_independent_when_quarantining(
+    tmp_path: Path,
+):
+    # First occurrence of "aa-1" is itself rejected (orphan activity) and
+    # must never be quarantined for row_id, so the row_id is never recorded
+    # as accepted. A duplicate-detection check keyed off *accepted* rows
+    # would then let the second "aa-1" (a valid activity) load silently.
+    path = tmp_path / "aa-order.csv"
+    _write_csv(
+        path,
+        AA_SOURCE_COLUMNS,
+        [
+            _aa_row("aa-1", "orphan-activity"),
+            _aa_row("aa-1", "good-activity"),
+        ],
+    )
+    audit = LoaderAudit()
+    frame = load_admin_approval(
+        path,
+        _spec("AA", "aa-order.csv"),
+        activity_codes={"good-activity"},
+        audit=audit,
+        on_error="quarantine",
+    )
+    assert frame.empty
+    assert {record.reason_code for record in audit.quarantined} == {
+        "orphan_activity",
+        "duplicate_row_id",
+    }
+
+
+def test_scheme_duplicate_detection_is_order_independent_when_quarantining(
+    tmp_path: Path,
+):
+    # Same ordering hazard as above, for the admin_approval_scheme child
+    # loader's own inline duplicate check (orphan parent first, then a
+    # same-id row that would otherwise pass).
+    path = tmp_path / "aa-scheme-order.csv"
+    _write_csv(
+        path,
+        AA_SCHEME_SOURCE_COLUMNS,
+        [
+            _scheme_row("child-1", "missing-parent", "activity-1"),
+            _scheme_row("child-1", "aa-1", "activity-1"),
+        ],
+    )
+    audit = LoaderAudit()
+    frame = load_admin_approval_scheme(
+        path,
+        _spec("AA", "aa-scheme-order.csv"),
+        parent_index={"aa-1": "activity-1"},
+        audit=audit,
+        on_error="quarantine",
+    )
+    assert frame.empty
+    assert {record.reason_code for record in audit.quarantined} == {
+        "orphan_parent_row_id",
+        "duplicate_row_id",
+    }
+
+
+def test_admin_gp_not_in_known_set_is_typed(tmp_path: Path):
+    path = tmp_path / "aa-gp.csv"
+    _write_csv(path, AA_SOURCE_COLUMNS, [_aa_row("aa-1", "activity-1")])
+
+    with pytest.raises(OrphanReferenceError, match="gram_panchayat"):
+        load_admin_approval(
+            path,
+            _spec("AA", "aa-gp.csv"),
+            activity_codes={"activity-1"},
+            gp_codes={"other-gp"},
+        )
+
+    audit = LoaderAudit()
+    frame = load_admin_approval(
+        path,
+        _spec("AA", "aa-gp.csv"),
+        activity_codes={"activity-1"},
+        gp_codes={"other-gp"},
+        audit=audit,
+        on_error="quarantine",
+    )
+    assert frame.empty
+    assert audit.quarantined[0].reason_code == "orphan_gp"
+    assert audit.quarantined[0].key_value == "0012"
+
+
+def test_ta_gp_not_in_known_set_is_typed(tmp_path: Path):
+    path = tmp_path / "ta-gp.csv"
+    _write_csv(path, TA_SOURCE_COLUMNS, [_ta_row("ta-1", "activity-1")])
+
+    with pytest.raises(OrphanReferenceError, match="gram_panchayat"):
+        load_technical_approval(
+            path,
+            _spec("TA", "ta-gp.csv"),
+            activity_codes={"activity-1"},
+            gp_codes={"other-gp"},
+        )
+
+
+def test_admin_gp_defaults_to_unchecked(tmp_path: Path):
+    # No caller passes gp_codes today; the parameter must default to "no
+    # check" so every existing loader call keeps loading unknown GPs.
+    path = tmp_path / "aa-gp-unchecked.csv"
+    _write_csv(path, AA_SOURCE_COLUMNS, [_aa_row("aa-1", "activity-1", gp="9999")])
+    frame = load_admin_approval(
+        path, _spec("AA", "aa-gp-unchecked.csv"), activity_codes={"activity-1"}
+    )
+    assert list(frame["gp_lgd_code"]) == ["9999"]
+
+
+def test_quarantine_aggregation_counts_and_preserves_first_seen_order(
+    tmp_path: Path,
+):
+    # LoaderAudit.add_quarantine used to linearly scan the accumulated list
+    # to find a matching record on every rejection (O(n) per call, O(n^2)
+    # overall for n distinct rejected keys). This pins the *behaviour* that
+    # scan was providing -- correct per-key counts, first-seen order -- so a
+    # regression to an unordered or miscounted aggregation would fail here.
+    path = tmp_path / "aa-many-duplicates.csv"
+    rows: list[dict[str, object]] = []
+    for row_id, extra_duplicates in [("aa-1", 2), ("aa-2", 1), ("aa-3", 3)]:
+        for _ in range(1 + extra_duplicates):
+            rows.append(_aa_row(row_id, "activity-1"))
+    _write_csv(path, AA_SOURCE_COLUMNS, rows)
+
+    audit = LoaderAudit()
+    frame = load_admin_approval(
+        path,
+        _spec("AA", "aa-many-duplicates.csv"),
+        activity_codes={"activity-1"},
+        audit=audit,
+        on_error="quarantine",
+    )
+
+    assert len(frame) == 3
+    assert [record.key_value for record in audit.quarantined] == [
+        "aa-1",
+        "aa-2",
+        "aa-3",
+    ]
+    assert [record.row_count for record in audit.quarantined] == [2, 1, 3]
