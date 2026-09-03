@@ -290,6 +290,25 @@ def test_activity_nsap_nan_and_infinity_are_treated_as_missing_not_fractional():
     assert quarantine.frame().empty
 
 
+def test_activity_nsap_infinity_is_treated_as_missing_not_fractional():
+    """Infinity is_finite()=False like sNaN/NaN, but to_int's astype("Int64")
+    silently corrupts it to -9223372036854775808 instead of raising -- it
+    must never reach to_int at all."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="Infinity",
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert quarantine.frame().empty
+
+
 def test_activity_nsap_whole_number_float_is_accepted():
     pl = pd.DataFrame([_row(row_id="r0", business_id="7", activityNsap_widow_female=2.0)])
     quarantine = t.Quarantine()

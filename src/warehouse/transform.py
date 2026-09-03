@@ -513,7 +513,17 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
             return False
         return value != value.to_integral_value()
 
+    def _is_non_finite(text: object) -> bool:
+        if pd.isna(text) or text == "":
+            return False
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return False
+        return not value.is_finite()
+
     fractional = cleaned.map(_is_fractional)
+    non_finite = cleaned.map(_is_non_finite)
     if fractional.any():
         # A fractional count (e.g. 1.5) is malformed, not roundable.
         quarantine.add(
@@ -522,7 +532,8 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
             "activity_code", melted.loc[fractional, "activity_code"],
             source_system=source_system, source_run_id=source_run_id,
         )
-    melted = melted[~fractional]
+    # NaN/Infinity are non-fractional but still unparseable by to_int.
+    melted = melted[~fractional & ~non_finite]
     melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
