@@ -1123,7 +1123,17 @@ class _PLState:
         result["source_row_number"] = row_number
         return result
 
-    def _child_provenance(self, root: Mapping[str, object], *, position: int = 0) -> dict[str, object]:
+    def _child_provenance(
+        self, root: Mapping[str, object], *, position: int = 0, child_collection: str
+    ) -> dict[str, object]:
+        # ``child_collection`` mirrors normalize.py's sanitized JSON array
+        # key: it folds the collection identity into the row ID so two
+        # collections don't collide at the same position under the same
+        # parent activity. PL source rows are a flat CSV rather than nested
+        # JSON, so there is no literal source array key to sanitize; the
+        # destination table name already uniquely names each nested entity
+        # group (asset/fund/training/delegation/community/nsap) per
+        # activity, so it is used as the collection key directly.
         result = row_provenance(
             source_system=self.spec.source_system,
             source_run_id=self.spec.source_run_id,
@@ -1137,6 +1147,7 @@ class _PLState:
             business_id=root.get("business_id"),
             parent_row_id=root.get("row_id"),
             position=position,
+            child_collection=child_collection,
             mapping_status="mapped",
         )
         result["source_row_number"] = root["source_row_number"]
@@ -1315,7 +1326,7 @@ class _PLState:
                 ("activity_delegation", DELEGATION_COLUMNS[3:]),
                 ("activity_community_service", COMMUNITY_COLUMNS[3:]),
             ):
-                child = self._child_provenance(root)
+                child = self._child_provenance(root, child_collection=table_name)
                 child.update({
                     "source_system": self.spec.source_system,
                     "source_run_id": self.spec.source_run_id,
@@ -1343,7 +1354,9 @@ class _PLState:
                 self.nsap_positive_or_nonzero = True
                 if value == 0:
                     continue
-                child = self._child_provenance(root, position=nsap_position)
+                child = self._child_provenance(
+                    root, position=nsap_position, child_collection="activity_nsap"
+                )
                 child.update({
                     "source_system": self.spec.source_system,
                     "source_run_id": self.spec.source_run_id,

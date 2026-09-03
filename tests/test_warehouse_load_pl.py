@@ -174,6 +174,34 @@ def test_pl_csv_loads_all_tables_and_preserves_extensions(tmp_path: Path):
     assert set(extensions["mapping_status"]) == {"unmapped"}
 
 
+def test_satellite_child_row_ids_do_not_collide_across_tables(tmp_path: Path):
+    path = tmp_path / "PL.csv"
+    _write_pl(path, _rows())
+
+    result = load_pl_csv(path, spec=_spec(), chunk_size=2)
+
+    asset = result["activity_asset"]
+    fund = result["activity_fund"]
+    training = result["activity_training"]
+    delegation = result["activity_delegation"]
+    community = result["activity_community_service"]
+
+    # Every satellite shares the same parent activity and position (0) for
+    # the first row; only the child_collection key differs, so row_id must
+    # differ too or two collections would collide at the same position
+    # under the same parent (the bug child_collection exists to prevent).
+    row_ids = [
+        asset.loc[0, "row_id"],
+        fund.loc[0, "row_id"],
+        training.loc[0, "row_id"],
+        delegation.loc[0, "row_id"],
+        community.loc[0, "row_id"],
+    ]
+    assert len(set(row_ids)) == len(row_ids)
+    assert asset.loc[0, "parent_row_id"] == fund.loc[0, "parent_row_id"]
+    assert asset.loc[0, "pos"] == fund.loc[0, "pos"] == 0
+
+
 def test_pl_csv_output_is_chunk_size_invariant(tmp_path: Path):
     path = tmp_path / "PL.csv"
     _write_pl(path, _rows())
