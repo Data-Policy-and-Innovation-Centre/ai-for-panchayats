@@ -100,6 +100,24 @@ def test_schema_version_mismatch_is_rejected(tmp_path: Path):
         resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
 
 
+def test_snapshot_declaring_unsupported_schema_version_is_rejected(tmp_path: Path):
+    """Registry and manifest can agree on a version and still be wrong: both
+    might declare a newer schema (e.g. ``"2"``) that this warehouse build --
+    pinned to ``WarehouseSettings.schema_version`` (``"1"``) -- does not know
+    how to consume. Without this check that agreement alone was enough to
+    pass selection, letting version-1 transforms misread a version-2 layout.
+    """
+
+    settings = make_settings(tmp_path)
+    write_manual_snapshot(
+        settings.canonical_root, source="othersystem", run_id="run-x", schema_version="2",
+        tables={},
+    )
+    spec_registry = registry(approved("snap-x", "othersystem", "run-x", schema_version="2"))
+    with pytest.raises(SelectionError, match="unsupported schema_version"):
+        resolve_snapshots(settings, ("snap-x",), registry=spec_registry)
+
+
 def test_duplicate_source_run_selection_is_rejected(tmp_path: Path):
     settings = _minimal_pl_run(tmp_path)
     spec_registry = registry(
@@ -119,6 +137,30 @@ def test_unrecognized_top_level_dataset_is_rejected(tmp_path: Path):
     spec_registry = registry(approved("snap-x", "othersystem", "run-x"))
     with pytest.raises(SelectionError, match="unrecognized dataset"):
         resolve_snapshots(settings, ("snap-x",), registry=spec_registry)
+
+
+def test_truncated_snapshot_missing_a_kind_is_rejected(tmp_path: Path):
+    """kinds={"PL"} produces a manifest with no aa/ta/pp/re entry at all --
+    a truncated build, not a real dataset that happened to be empty."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100, kinds={"PL"})
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
+
+
+def test_snapshot_with_all_kinds_explicitly_empty_is_still_accepted(tmp_path: Path):
+    """A kind requested but producing zero rows is not the same as a kind
+    never requested -- this must still resolve cleanly."""
+
+    settings = _minimal_pl_run(tmp_path)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    resolved = resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
+    assert len(resolved) == 1
 
 
 def test_valid_selection_resolves_and_revalidates(tmp_path: Path):

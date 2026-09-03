@@ -89,6 +89,38 @@ def test_file_like_payloads_are_streamed_in_bounded_chunks(tmp_path: Path):
     assert (path / "payloads" / "stream.bin").read_bytes() == b"streamed"
 
 
+def test_write_payload_removes_partial_temp_file_after_stream_failure(tmp_path: Path):
+    """A stream that raises mid-read must not leave a partial temp file.
+
+    Codex review (PR #64, manifest.py:281): the temp file is created with
+    delete=False; if the file-like payload's read() raises after yielding
+    some chunks and the caller catches the exception, the old code left that
+    partial temp file behind in payloads/. publish() would then inventory
+    and publish it under its random temp name, corrupting the run.
+    """
+
+    class FailingStream(io.BytesIO):
+        def read(self, size=-1):
+            chunk = super().read(size)
+            if chunk == b"":
+                return chunk
+            if self.tell() > 4:
+                raise OSError("synthetic mid-stream failure")
+            return chunk
+
+    with RunPublisher(tmp_path / "raw", "synthetic", "fail-stream") as publisher:
+        staging_payloads = list((tmp_path / "raw" / "synthetic").glob(".fail-stream.staging-*"))[0] / "payloads"
+        with pytest.raises(OSError, match="synthetic mid-stream failure"):
+            publisher.write_payload("stream.bin", FailingStream(b"streamed-data"))
+        # No stray temp file left behind in payloads/.
+        assert list(staging_payloads.iterdir()) == []
+        run_path = publisher.publish()
+
+    # The partial payload never made it into the published, hash-verified run.
+    assert list((run_path / "payloads").iterdir()) == []
+    assert validate_run(run_path)
+
+
 def test_snapshot_registry_resolves_an_exact_run_id(tmp_path: Path):
     registry_file = tmp_path / "snapshots.yaml"
     registry_file.write_text(

@@ -46,6 +46,7 @@ conflicting duplicate: quarantined, not kept as a second row.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 import pandas as pd
@@ -465,7 +466,7 @@ def activity_community_service(pl: pd.DataFrame, activity_codes: set[str], quara
     )
 
 
-def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
+def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quarantine,
                    *, source_system: str, source_run_id: str, start_id: int = 1) -> pd.DataFrame:
     """Wide NSAP beneficiary columns to one row per non-zero category.
 
@@ -478,6 +479,8 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
     step, so ids are 1:1 with the rows actually returned. The caller
     (``build.populate``) advances ``start_id`` by the number of rows
     returned before calling this again for the next snapshot.
+
+    Fractional counts are quarantined, not rounded.
     """
 
     columns = ["nsap_id", "source_system", "source_run_id", "activity_code", "category",
@@ -497,6 +500,40 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str],
     # beneficiary_count is a COUNT, not money: parsed as a nullable integer
     # (see warehouse.schema's activity_nsap DDL), never routed through
     # decimal money parsing.
+    cleaned = melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip()
+
+    def _is_fractional(text: object) -> bool:
+        if pd.isna(text) or text == "":
+            return False
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return False
+        if not value.is_finite():
+            return False
+        return value != value.to_integral_value()
+
+    def _is_non_finite(text: object) -> bool:
+        if pd.isna(text) or text == "":
+            return False
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return False
+        return not value.is_finite()
+
+    fractional = cleaned.map(_is_fractional)
+    non_finite = cleaned.map(_is_non_finite)
+    if fractional.any():
+        # A fractional count (e.g. 1.5) is malformed, not roundable.
+        quarantine.add(
+            "activity_nsap", "fractional_beneficiary_count",
+            "beneficiary_count is fractional",
+            "activity_code", melted.loc[fractional, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    # NaN/Infinity are non-fractional but still unparseable by to_int.
+    melted = melted[~fractional & ~non_finite]
     melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
@@ -572,29 +609,49 @@ def _pl_child(
     per-row identity of its own, so a second line for the same activity is
     a genuine conflicting duplicate, quarantined by ``_dedupe`` like any
     other -- not a second legitimate row keyed on an invented row_id.
+
+    Strictly 1:1 cuts both ways: an activity with no asset/fund child array
+    element at all still needs a row here, synthesized all-null, exactly
+    like activity_delegation/activity_training/activity_community_service
+    (which get their one-row-per-activity guarantee for free, by reading
+    straight off the ``pl`` frame instead of a separate child array).
+    ``conformance.check_satellite_row_parity`` requires an exact
+    row-per-planned_activity match across all five satellites; a childless
+    activity silently dropped here would build successfully and then fail
+    that check.
     """
 
     keep = ["source_system", "source_run_id", "activity_code"] + columns
     if child.empty:
-        return pd.DataFrame(columns=keep)
-    out = child.rename(columns=renames)
-    identity = _base_identity(out)
-    for name, series in identity.items():
-        out[name] = series
-    out = _ensure_columns(out, keep)
-    frame = out[keep].copy()
-    frame["activity_code"] = to_code(frame["activity_code"])
-    for column in money_columns:
-        frame[column] = to_decimal_money(frame[column])
-    frame = frame.dropna(subset=["activity_code"])
-    frame = _dedupe(
-        frame, ["source_system", "source_run_id", "activity_code"], table, quarantine,
-        source_system=source_system, source_run_id=source_run_id,
-    )
-    return _restrict(
-        frame, table, "activity_code", activity_codes, quarantine,
-        source_system=source_system, source_run_id=source_run_id,
-    )
+        frame = pd.DataFrame(columns=keep)
+    else:
+        out = child.rename(columns=renames)
+        identity = _base_identity(out)
+        for name, series in identity.items():
+            out[name] = series
+        out = _ensure_columns(out, keep)
+        frame = out[keep].copy()
+        frame["activity_code"] = to_code(frame["activity_code"])
+        for column in money_columns:
+            frame[column] = to_decimal_money(frame[column])
+        frame = frame.dropna(subset=["activity_code"])
+        frame = _dedupe(
+            frame, ["source_system", "source_run_id", "activity_code"], table, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        frame = _restrict(
+            frame, table, "activity_code", activity_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        )
+
+    missing = activity_codes - set(frame["activity_code"])
+    if missing:
+        filler = pd.DataFrame({"activity_code": sorted(missing)})
+        filler["source_system"] = source_system
+        filler["source_run_id"] = source_run_id
+        filler = _ensure_columns(filler, keep)[keep]
+        frame = pd.concat([frame, filler], ignore_index=True)
+    return frame
 
 
 def activity_asset(child: pd.DataFrame, activity_codes: set[str], quarantine: Quarantine,
