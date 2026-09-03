@@ -139,6 +139,30 @@ def test_unrecognized_top_level_dataset_is_rejected(tmp_path: Path):
         resolve_snapshots(settings, ("snap-x",), registry=spec_registry)
 
 
+def test_truncated_snapshot_missing_a_kind_is_rejected(tmp_path: Path):
+    """kinds={"PL"} produces a manifest with no aa/ta/pp/re entry at all --
+    a truncated build, not a real dataset that happened to be empty."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100, kinds={"PL"})
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
+
+
+def test_snapshot_with_all_kinds_explicitly_empty_is_still_accepted(tmp_path: Path):
+    """A kind requested but producing zero rows is not the same as a kind
+    never requested -- this must still resolve cleanly."""
+
+    settings = _minimal_pl_run(tmp_path)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    resolved = resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
+    assert len(resolved) == 1
+
+
 def test_valid_selection_resolves_and_revalidates(tmp_path: Path):
     settings = _minimal_pl_run(tmp_path)
     spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))

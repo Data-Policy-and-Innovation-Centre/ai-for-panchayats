@@ -374,6 +374,9 @@ def test_cross_source_activity_code_collision_fails_build_by_design(tmp_path: Pa
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source PK collision,
+            # not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 
@@ -403,6 +406,9 @@ def test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes(tm
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source GP
+            # conformance, not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 
@@ -544,6 +550,29 @@ def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
     assert result.counts.get("admin_approval_scheme", 0) == 0
     assert "aa__admapprovalattachments" not in result.consumed_tables["egramSwaraj/run-1"]
     assert result.unconsumed_tables["egramSwaraj/run-1"] == ("aa__admapprovalattachments",)
+
+
+def test_unrelated_pl_child_array_is_not_loaded_as_asset_or_fund(tmp_path: Path):
+    """A direct PL child array whose key merely contains "asset" or "fund"
+    but has none of the recognized fields must not be swept into
+    activity_asset/activity_fund just by name substring."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{
+            "activityCd": 7, "totalCost": 100,
+            "assetAttachments": [
+                {"fileName": "doc1.pdf", "uploadedBy": "clerk1"},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts.get("activity_asset", 0) == 1
+    assert "pl__assetattachments" not in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("pl__assetattachments",)
 
 
 def test_scheme_and_unrelated_aa_children_are_both_handled_correctly(tmp_path: Path):
