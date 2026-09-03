@@ -354,6 +354,61 @@ def test_nested_revision_is_explicit_and_streamed_separately(tmp_path: Path):
     assert report.total_amount == Decimal("12.75")
 
 
+def test_nested_payment_and_receipt_at_same_index_get_distinct_provenance(tmp_path: Path):
+    # Same GP/fiscal-year, both arrays have an item at index zero: the
+    # payment and receipt rows must not collide on source_record_id even
+    # though their raw within-array position is identical.
+    path = tmp_path / "GP-1_2021-2022.json"
+    payload = {
+        "gp_lgd_code": "0012",
+        "gp_name": "Synthetic GP",
+        "years": {
+            "2021-2022": {
+                "payment_count": 1,
+                "receipt_count": 1,
+                "total_payments": "10.25",
+                "total_receipts": "2.50",
+                "payments": [
+                    {
+                        "amount": "10.25",
+                        "date": "02/03/2021",
+                        "month": "March",
+                        "type": "Expenditures",
+                        "voucher_id": "7",
+                        "voucher_no": "P-1",
+                    }
+                ],
+                "receipts": [
+                    {
+                        "amount": "2.50",
+                        "date": "03/03/2021",
+                        "month": "Mar",
+                        "type": "Direct Receipts",
+                        "voucher_id": "7",
+                        "voucher_no": "R-1",
+                    }
+                ],
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with VoucherLoader() as loader:
+        batches = list(
+            loader.load_nested_json(
+                [path],
+                source_system="egramswaraj",
+                source_run_id="nested-run",
+                batch_size=100,
+            )
+        )
+
+    frame = pd.concat(batches, ignore_index=True)
+    payment_id = frame.loc[frame["direction"] == "payment", "source_record_id"].iloc[0]
+    receipt_id = frame.loc[frame["direction"] == "receipt", "source_record_id"].iloc[0]
+    assert payment_id != receipt_id
+
+
 def test_nested_revision_rejects_annual_total_mismatch(tmp_path: Path):
     path = tmp_path / "bad.json"
     path.write_text(

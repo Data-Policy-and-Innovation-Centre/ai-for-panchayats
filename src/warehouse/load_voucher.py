@@ -179,6 +179,11 @@ class _VoucherInput:
     source_file: str
     source_row_number: int
     source_position: int | None
+    # The source JSON array a nested row came from ("payments" or
+    # "receipts"), or None for the flat CSV revision which has no parent
+    # array.  Required by deterministic_provenance_id whenever
+    # source_position is not None; see _output_batch.
+    source_collection: str | None
     # Annual values are retained only in the validation pass.  They are not
     # included in the target-shaped output.
     receipt_count: int
@@ -351,7 +356,6 @@ def _parse_flat_chunk(
         amount = _parse_money_field(
             row["amount"], column="amount", row=logical_row, enforce_decimal_16_2=True
         )
-        source_position = None
         records.append(
             _VoucherInput(
                 gp_lgd_code=gp,
@@ -366,7 +370,8 @@ def _parse_flat_chunk(
                 amount=amount,
                 source_file=source_file,
                 source_row_number=logical_row,
-                source_position=source_position,
+                source_position=None,
+                source_collection=None,
                 receipt_count=receipt_count,
                 payment_count=payment_count,
                 total_receipts=total_receipts,
@@ -519,9 +524,12 @@ def _parse_nested_file(
                     amount=amount,
                     source_file=source_file,
                     source_row_number=index + 2,
-                    # Receipt/payment positions must differ even when both
-                    # arrays have an item at index zero in the same file.
-                    source_position=index * 2 + (0 if direction == "receipt" else 1),
+                    # position is the row's index within its own source
+                    # array; child_collection (the sanitized array name) is
+                    # what keeps payments[0] and receipts[0] from colliding,
+                    # mirroring normalize.py's _child_rows convention.
+                    source_position=index,
+                    source_collection=array_name,
                     receipt_count=receipt_count,
                     payment_count=payment_count,
                     total_receipts=total_receipts,
@@ -1017,6 +1025,7 @@ class VoucherLoader:
                 gp_code=record.gp_lgd_code,
                 fiscal_year=record.fiscal_year,
                 position=position,
+                child_collection=record.source_collection,
             )
             rows.append(
                 {
