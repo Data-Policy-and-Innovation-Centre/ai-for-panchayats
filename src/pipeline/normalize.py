@@ -288,34 +288,43 @@ def _scalar(value: Any) -> Any:
     return str(value)
 
 
-def to_records(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
+def to_records(payload: Any) -> tuple[Iterable[dict[str, Any]], str | None]:
     """Return records and a reason code for malformed payloads.
 
     Only named, known envelopes are unwrapped.  Unknown mapping keys remain a
     domain record so a domain array is never silently promoted to top-level
     rows.  Empty known envelopes are valid and return zero records.
+
+    The records are a lazy generator rather than a materialized list: the
+    caller (`json.loads(path.read_text(...))`) already holds the whole
+    parsed payload in memory, and eagerly building a second list of merged
+    records here would double that for the duration of processing one file.
+    Yielding lazily means at most one merged record is alive on top of the
+    parsed payload at a time. This does not bound memory to chunk_size (the
+    full payload is still parsed up front -- true streaming would need an
+    incremental JSON parser), but it removes the extra full-size copy.
     """
 
     if isinstance(payload, list):
         if all(isinstance(item, Mapping) for item in payload):
-            return [dict(item) for item in payload], None
-        return [], "malformed_root_array"
+            return (dict(item) for item in payload), None
+        return (), "malformed_root_array"
     if not isinstance(payload, Mapping):
-        return [], "malformed_root_value"
+        return (), "malformed_root_value"
     present = [key for key in payload if key in KNOWN_ENVELOPE_KEYS]
     if any(not isinstance(payload[key], list) for key in present):
-        return [], "malformed_known_envelope"
+        return (), "malformed_known_envelope"
     named = present
     if len(named) == 1:
         values = payload[named[0]]
         if not values:
-            return [], None
+            return (), None
         if not all(isinstance(item, Mapping) for item in values):
-            return [], "malformed_known_envelope"
+            return (), "malformed_known_envelope"
         header = {key: value for key, value in payload.items()
                   if key != named[0] and not isinstance(value, (list, dict))}
-        return [{**header, **dict(item)} for item in values], None
-    return [dict(payload)], None
+        return ({**header, **dict(item)} for item in values), None
+    return (dict(payload),), None
 
 
 def _file_context(path: Path, payload_root: Path) -> tuple[str, str | None, str | None]:
@@ -389,6 +398,26 @@ def _provenance(
     }
 
 
+def _record_identity(record: Mapping[str, Any], business_id: str | None) -> str:
+    """A stable, content-derived identity for a top-level record.
+
+    Prefers a business identifier (e.g. activityCd) when present. Falling
+    back to array position would let two records swap identities (and all
+    child links) if the source ever returns them in a different order across
+    runs, so the fallback instead hashes the record's own scalar content.
+    Genuine duplicates (identical business_id or identical content) are
+    disambiguated deterministically by their order of appearance within the
+    same file, not by raw array position.
+    """
+    if business_id is not None:
+        return f"id:{business_id}"
+    content = json.dumps(
+        _flatten_scalars(record), sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), default=str,
+    )
+    return "content:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def _record_rows(
     record: Mapping[str, Any],
     *,
@@ -398,20 +427,20 @@ def _record_rows(
     year: str | None,
     gp_code: str | None,
     gp_name: str | None,
-    root_pos: int,
+    identity_key: str,
     table_name: str,
 ):
     root_key = "|".join(
-        (manifest.source, source_kind, source_file, gp_code or "", year or "", str(root_pos))
+        (manifest.source, source_kind, source_file, gp_code or "", year or "", identity_key)
     )
     root_key = hashlib.sha256(root_key.encode("utf-8")).hexdigest()
     business_id = _business_id(record)
-    parent = _provenance(
+    parent = _flatten_scalars(record)
+    parent.update(_provenance(
         manifest=manifest, source_file=source_file, source_kind=source_kind,
         year=year, gp_code=gp_code, gp_name=gp_name, row_id=root_key,
         source_record_id=root_key, parent_row_id=None, pos=None, business_id=business_id,
-    )
-    parent.update(_flatten_scalars(record))
+    ))
     yield table_name, parent
     yield from _child_rows(
         record, parent_row_id=root_key, source_record_id=root_key, row_id_prefix=root_key,
@@ -445,14 +474,20 @@ def _child_rows(
             business_id = (
                 _business_id(element) if isinstance(element, Mapping) else None
             ) or inherited_business_id
-            row = _provenance(
+            provenance = _provenance(
                 manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,
                 source_record_id=source_record_id, parent_row_id=parent_row_id,
                 pos=position, business_id=business_id,
             )
             if isinstance(element, Mapping):
-                row.update(_flatten_scalars(element))
+                # Apply provenance AFTER flattening source fields: a source
+                # record containing a reserved name (row_id, source_file, ...)
+                # must not silently overwrite the generated provenance value,
+                # or child rows would reference an ID the parent no longer
+                # exposes.
+                row = _flatten_scalars(element)
+                row.update(provenance)
                 yield child_table, row
                 yield from _child_rows(
                     element, parent_row_id=row_id, source_record_id=source_record_id,
@@ -462,6 +497,7 @@ def _child_rows(
                     inherited_business_id=business_id,
                 )
             else:
+                row = dict(provenance)
                 row.update({"value": element, "value_kind": "scalar"})
                 yield child_table, row
 
@@ -479,10 +515,16 @@ def _iter_run_items(
 
     for path in sorted(payload_root.rglob("*.json")):
         source_file, source_kind, year = _file_context(path, payload_root)
-        if source_kind not in wanted:
+        if source_kind is None:
             yield None, QuarantineRecord(
                 source_file, "unknown_source_kind", "filename does not identify a supported kind"
             )
+            continue
+        if source_kind not in wanted:
+            # A recognized kind that simply was not requested (e.g. --kinds
+            # PL excluding AA/TA/PP/RE) is an intentional exclusion, not a
+            # malformed input -- skip it silently rather than quarantining a
+            # perfectly valid file.
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -495,10 +537,16 @@ def _iter_run_items(
             continue
         gp_code, gp_name = _gp_context(path, payload_root)
         table_name = source_kind.lower()
-        for position, record in enumerate(records):
+        identity_counts: dict[str, int] = {}
+        for record in records:
+            business_id = _business_id(record)
+            identity = _record_identity(record, business_id)
+            occurrence = identity_counts.get(identity, 0)
+            identity_counts[identity] = occurrence + 1
+            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
             yield from _record_rows(
                 record, manifest=manifest, source_file=source_file, source_kind=source_kind,
-                year=year, gp_code=gp_code, gp_name=gp_name, root_pos=position,
+                year=year, gp_code=gp_code, gp_name=gp_name, identity_key=identity_key,
                 table_name=table_name,
             )
 

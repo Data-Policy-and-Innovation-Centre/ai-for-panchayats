@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Mapping
 
 from src.pipeline.normalize import NormalizationError, validate_canonical_manifest
-from src.pipeline.snapshots import SnapshotRegistry, SnapshotSpec, load_snapshot_registry
+from src.pipeline.snapshots import (
+    SnapshotRegistry,
+    SnapshotRegistryError,
+    SnapshotSpec,
+    load_snapshot_registry,
+)
 
 from .config import WarehouseSettings
 from .load import discover_tables
@@ -65,7 +70,11 @@ def resolve_snapshots(
     resolved: list[SelectedSnapshot] = []
     seen: set[tuple[str, str]] = set()
     for snapshot_id in snapshot_ids:
-        spec = active_registry.get(snapshot_id)
+        try:
+            spec = active_registry.get(snapshot_id)
+        except SnapshotRegistryError as exc:
+            # Unknown/stale ids fail like every other selection problem here.
+            raise SelectionError(str(exc)) from exc
         if spec.status != "approved":
             raise SelectionError(f"snapshot {snapshot_id!r} is not approved")
         key = (spec.source, spec.run_id)
@@ -84,6 +93,12 @@ def resolve_snapshots(
                 f"snapshot {snapshot_id!r} schema_version mismatch: "
                 f"registry declares {spec.schema_version!r}, manifest has {manifest['schema_version']!r}"
             )
+        if spec.schema_version != settings.schema_version:
+            raise SelectionError(
+                f"snapshot {snapshot_id!r} declares unsupported schema_version "
+                f"{spec.schema_version!r}; this warehouse build only supports "
+                f"{settings.schema_version!r}"
+            )
         if manifest["source"] != spec.source or manifest["run_id"] != spec.run_id:
             raise SelectionError(
                 f"snapshot {snapshot_id!r} identity mismatch against registry"
@@ -95,6 +110,14 @@ def resolve_snapshots(
             raise SelectionError(
                 f"snapshot {snapshot_id!r} declares unrecognized dataset(s) {unknown}; "
                 "teach warehouse.schema.KIND_TABLES about them before building"
+            )
+        missing_kinds = tuple(kind for kind in KNOWN_KIND_PREFIXES if kind not in tables)
+        if missing_kinds:
+            # A kind absent entirely (never requested at normalization time)
+            # is not the same as a kind present with zero rows.
+            raise SelectionError(
+                f"snapshot {snapshot_id!r} is missing required source-kind dataset(s) "
+                f"{missing_kinds}; a partial normalization cannot be built"
             )
         resolved.append(SelectedSnapshot(
             spec=spec, snapshot_root=snapshot_root, manifest=manifest, tables=tables,

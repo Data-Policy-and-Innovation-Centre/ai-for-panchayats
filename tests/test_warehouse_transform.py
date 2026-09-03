@@ -134,12 +134,55 @@ def test_activity_fund_is_one_to_one_second_line_is_quarantined():
 
 
 def test_activity_asset_orphan_activity_code_is_quarantined():
+    """"99" is quarantined as an orphan; "7" has no asset line at all here,
+    so it is synthesized as an all-null row rather than silently omitted
+    -- see the childless-activity synthesis test below.
+    """
+
     child = pd.DataFrame([_row(row_id="r0", business_id="99", astTyp="well")])
     quarantine = t.Quarantine()
     out = t.activity_asset(child, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
-    assert out.empty
+    assert list(out["activity_code"]) == ["7"]
+    assert out["asset_type"].iloc[0] is None or pd.isna(out["asset_type"].iloc[0])
     assert quarantine.total("activity_asset") == 1
     assert quarantine.records[0]["reason_code"] == "orphan_reference"
+
+
+def test_activity_asset_synthesizes_null_row_for_childless_activity():
+    """A planning activity with no asset child array at all (activity "8"
+    below, alongside "7" which does have one) still gets exactly one
+    activity_asset row -- an all-null one -- so the table stays strictly
+    1:1 with planned_activity, matching activity_delegation/
+    activity_training/activity_community_service and satisfying
+    ``conformance.check_satellite_row_parity``.
+    """
+
+    child = pd.DataFrame([_row(row_id="r0", business_id="7", astTyp="well")])
+    quarantine = t.Quarantine()
+    out = t.activity_asset(
+        child, {"7", "8"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+    )
+    assert sorted(out["activity_code"]) == ["7", "8"]
+    childless = out.loc[out["activity_code"] == "8"].iloc[0]
+    assert pd.isna(childless["asset_type"])
+    assert childless["source_system"] == "egramSwaraj"
+    assert childless["source_run_id"] == "run-1"
+    assert quarantine.total("activity_asset") == 0
+
+
+def test_activity_fund_synthesizes_null_row_when_no_fund_children_at_all():
+    """The whole-snapshot-empty case: no fund child array exists anywhere
+    in this pl payload (``child`` is empty), yet every activity in
+    ``activity_codes`` still needs its one row.
+    """
+
+    child = pd.DataFrame()
+    quarantine = t.Quarantine()
+    out = t.activity_fund(
+        child, {"7", "8"}, quarantine, source_system="egramSwaraj", source_run_id="run-1",
+    )
+    assert sorted(out["activity_code"]) == ["7", "8"]
+    assert out["fund_amount_total"].isna().all()
 
 
 # --------------------------------------------------------------------- activity_nsap grain
@@ -152,7 +195,7 @@ def test_activity_nsap_one_row_per_nonzero_category():
         activityNsap_old_age_below_eighty_female=0,
         activityNsap_widow_female=2,
     )])
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_nsap(pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1")
     rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
     # beneficiary_count is a COUNT, not money (see schema.py's activity_nsap
     # DDL): an integer, never decimal.Decimal.
@@ -175,7 +218,9 @@ def test_activity_nsap_assigns_nsap_id_starting_at_start_id():
         activityNsap_old_age_below_eighty_female=0,
         activityNsap_widow_female=2,
     )])
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1", start_id=101)
+    out = t.activity_nsap(
+        pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1", start_id=101,
+    )
     assert len(out) == 2  # two non-zero categories survive
     assert list(out["nsap_id"]) == [101, 102]  # dense, starting at start_id
 
@@ -188,9 +233,88 @@ def test_activity_nsap_empty_frame_has_nsap_id_column():
     missing column."""
 
     pl = pd.DataFrame([_row(row_id="r0", business_id="7")])  # no NSAP columns at all
-    out = t.activity_nsap(pl, {"7"}, source_system="egramSwaraj", source_run_id="run-1")
+    out = t.activity_nsap(pl, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1")
     assert out.empty
     assert "nsap_id" in out.columns
+
+
+def test_activity_nsap_fractional_count_is_quarantined_not_rounded():
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male=1.5,
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
+
+
+def test_activity_nsap_subfloat_precision_fraction_is_still_quarantined():
+    """1.00000000000000001 rounds to the float 1.0 before any comparison
+    can see it's fractional -- exact-decimal detection must catch it
+    where a float-based check would miss it entirely."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="1.00000000000000001",
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    assert out.empty
+    assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
+
+
+def test_activity_nsap_nan_and_infinity_are_treated_as_missing_not_fractional():
+    """sNaN raises InvalidOperation on any operation, even outside
+    construction -- is_finite() must guard the comparison itself, not just
+    the Decimal(text) call, or the whole build aborts. Quiet NaN and
+    Infinity must be treated as missing, not fractional, matching the old
+    pd.to_numeric(..., errors="coerce") behavior this replaced."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="NaN",
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert quarantine.frame().empty
+
+
+def test_activity_nsap_infinity_is_treated_as_missing_not_fractional():
+    """Infinity is_finite()=False like sNaN/NaN, but to_int's astype("Int64")
+    silently corrupts it to -9223372036854775808 instead of raising -- it
+    must never reach to_int at all."""
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="Infinity",
+        activityNsap_widow_female=2,
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 2
+    assert quarantine.frame().empty
+
+
+def test_activity_nsap_whole_number_float_is_accepted():
+    pl = pd.DataFrame([_row(row_id="r0", business_id="7", activityNsap_widow_female=2.0)])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+    assert list(out["beneficiary_count"]) == [2]
+    assert quarantine.frame().empty
 
 
 # --------------------------------------------------------------------- activity_expenditure identity

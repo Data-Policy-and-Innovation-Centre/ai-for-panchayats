@@ -30,7 +30,10 @@ ALLOWLIST = REPO_ROOT / ".secretsallow"
 
 # Paths whose contents are checksums or vendored metadata, not credentials.
 SKIP = re.compile(
-    r"(^|/)(uv\.lock|dvc\.lock|poetry\.lock|package-lock\.json)$"
+    # Lockfiles are inventories of content digests. Every entry is a 64-hex
+    # literal by construction, so scanning them yields only false positives.
+    r"(^|/)(uv\.lock|dvc\.lock|poetry\.lock|package-lock\.json"
+    r"|\.terraform\.lock\.hcl)$"
     r"|(^|/)\.dvc/|\.dvc$"
     r"|(^|/)\.secretsallow$"
     r"|(^|/)scripts/scan_secrets\.py$"
@@ -87,6 +90,100 @@ RULES = [
     ),
 ]
 
+# A content digest is structurally the opposite of a credential: publishing it
+# is the entire point, and it cannot be rotated. But it is 64 hex characters,
+# which is also what an issued API secret looks like, so `bare-sha256-literal`
+# cannot tell them apart on shape alone.
+#
+# Baselining each one in .secretsallow does not work here. The fingerprint is
+# sha256(path\0value), so a NEW digest is a NEW fingerprint: every snapshot
+# republish would open a pull request that is red by construction and needs a
+# hand-written allow-list line. An allow-list that grows on every routine
+# release stops being read, and an unread allow-list is where a real credential
+# goes to hide.
+#
+# So the exemption is structural instead: it must match BOTH a path and a field
+# name. A 64-hex literal in any other file is still a finding, and a 64-hex
+# literal in a credential-shaped field of a manifest is still a finding -- only
+# the digest field of a snapshot manifest is exempt.
+@dataclass(frozen=True)
+class Exemption:
+    name: str
+    path: re.Pattern
+    # Must capture the exempt value in group 1: the span of that group is what
+    # gets compared against findings, so a rule firing on the same characters
+    # is suppressed while one firing elsewhere in the file is not.
+    pattern: re.Pattern
+    why: str
+
+
+EXEMPTIONS = [
+    Exemption(
+        # Same shape of problem as the snapshot manifest, in a different file:
+        # pinning a base image by digest (#84) writes 64 hex characters into
+        # the Dockerfile, and a digest is the opposite of a credential --
+        # publishing it is the point, and it cannot be rotated.
+        #
+        # The field half is strong here: nothing but a base image can appear
+        # after `FROM <ref>@sha256:`, so this cannot be widened into hiding a
+        # secret. Any Dockerfile qualifies rather than one path, because a
+        # second Dockerfile would hit the identical false positive and the
+        # field constraint is what does the work.
+        "container-base-image-digest",
+        # Both spellings: `Dockerfile`, `Dockerfile.prod`, and the
+        # `api.Dockerfile` convention. A second digest-pinned image file that
+        # did not match would fail the scan with no way out but a .secretsallow
+        # entry -- which goes stale on the next bump, and is the exact thing
+        # #80 removed.
+        re.compile(r"(^|/)(Dockerfile[^/]*|[^/]*\.Dockerfile)$"),
+        # (?i:FROM) scopes case-insensitivity to the KEYWORD only. A blanket
+        # re.I would also loosen [0-9a-f] and start exempting uppercase values,
+        # which is the opposite of what the digest class is for.
+        #
+        # (?:--\S+\s+)* admits `FROM --platform=$BUILDPLATFORM ...`, which this
+        # repository will reach for the moment it builds both architectures in
+        # one Dockerfile; without it a legitimate pin turns CI red.
+        #
+        # Lowercase digest only: OCI digests are lowercase hex by
+        # specification, so an uppercase value there is not a digest this
+        # project would build from. Same reasoning as the manifest exemption.
+        re.compile(r"^[ \t]*(?i:FROM)\s+(?:--\S+\s+)*\S+@sha256:([0-9a-f]{64})", re.M),
+        "the content digest of a pinned container base image",
+    ),
+    Exemption(
+        "snapshot-manifest-digest",
+        # Anchored at the repository root: a vendored or copied tree that
+        # happens to contain infra/snapshots/*.json is not this project's
+        # manifest and gets no exemption.
+        re.compile(r"^infra/snapshots/[^/]+\.json$"),
+        # Lowercase only, matching SnapshotManifest.__post_init__, which
+        # rejects anything but 64 lowercase hex ("sha256 must be 64 lowercase
+        # hexadecimal characters"). An uppercase value in this field can never
+        # be a digest this project would deploy, so exempting it would only
+        # ever hide a misplaced secret. Fail closed on what the manifest
+        # itself refuses.
+        re.compile(r'"sha256"\s*:\s*"([0-9a-f]{64})"'),
+        "the content digest of a published snapshot artifact",
+    ),
+]
+
+
+def exempt_spans(text: str, path: str) -> list[tuple[int, int]]:
+    """Character ranges in this file that are known not to be credentials.
+
+    Scoped by path AND by the field the value is assigned to. Both must match,
+    so renaming the field or moving the file re-arms the scanner rather than
+    silently keeping the exemption.
+    """
+    spans = []
+    for exemption in EXEMPTIONS:
+        if not exemption.path.search(path):
+            continue
+        for match in exemption.pattern.finditer(text):
+            spans.append(match.span(1))
+    return spans
+
+
 # Values that are obviously not credentials, so contributors are not forced to
 # baseline every example. Keep this list short and literal.
 PLACEHOLDERS = re.compile(
@@ -118,8 +215,15 @@ def fingerprint(path: str, value: str) -> str:
 
 def scan_text(text: str, path: str, commit: str = "worktree") -> list[Finding]:
     findings: dict[str, Finding] = {}
+    exempt = exempt_spans(text, path)
     for rule in RULES:
         for match in rule.pattern.finditer(text):
+            span = match.span(1) if rule.pattern.groups else match.span(0)
+            # Containment, not equality: a rule whose group covers part of an
+            # exempt value is describing the same characters, and a substring
+            # of a published digest is not a credential either.
+            if any(start <= span[0] and span[1] <= end for start, end in exempt):
+                continue
             value = (match.group(1) if rule.pattern.groups else match.group(0)).strip()
             if PLACEHOLDERS.match(value):
                 continue
