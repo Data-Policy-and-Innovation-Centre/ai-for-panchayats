@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .manifest import ManifestError, RunPublisher, validate_run
 from .normalize import normalize_egramswaraj
+from .settings import load_settings
 
 
 class Stage(StrEnum):
@@ -246,7 +247,12 @@ def _normalize(args: argparse.Namespace) -> int:
     # Built before the heading is printed, so a failure here cannot leave a
     # "paste this" banner with nothing under it.
     stanza = _registry_stanza(result.output_root)
-    print("\nTo build from this snapshot, add to config/snapshots.yaml "
+    # The registry path, not a hardcoded one: PIPELINE_SNAPSHOTS points a
+    # staging run at config/snapshots.staging.yaml, and telling that run to
+    # paste into the production registry is how a sample gets approved for a
+    # production build.
+    registry_path = load_settings().snapshots_path
+    print(f"\nTo build from this snapshot, add to {registry_path} "
           "under `snapshots:` --\n")
     print(stanza)
     return 0

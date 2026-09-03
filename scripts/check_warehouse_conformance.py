@@ -35,6 +35,13 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-reconciliation", action="store_true",
         help="omit the exact reference-build reconciliation totals (use for synthetic fixtures)",
     )
+    parser.add_argument(
+        "--skip-geography", action="store_true",
+        help="omit full-state geography coverage (use for synthetic fixtures). Separate "
+             "from --skip-reconciliation on purpose: every real build skips the totals "
+             "today (#46, #48, #129), and folding the two together meant no real build "
+             "ever checked its own scale",
+    )
     args = parser.parse_args(argv)
 
     if not args.database.exists():
@@ -43,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 
     con = duckdb.connect(str(args.database), read_only=True)
     try:
-        findings = check_conformance(con, skip_reconciliation=args.skip_reconciliation)
+        findings = check_conformance(con, skip_reconciliation=args.skip_reconciliation,
+                             skip_geography=args.skip_geography)
     finally:
         con.close()
 
