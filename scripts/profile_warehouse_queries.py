@@ -38,10 +38,27 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import duckdb
 
 DATA_ALIAS = "analytics"
+
+
+class Probe(NamedTuple):
+    """One timed query.
+
+    ``scalar`` marks a probe whose answer is the single value it returns, not
+    the size of its result set. A ``SELECT count(*)`` always returns exactly
+    one row, so reporting the result-set length would print "1" for every one
+    of them -- which is useless for the base-versus-view cardinality
+    comparison this script exists to make, and is how a 44-row fan-out in
+    v_activity went unnoticed here until it was chased with a separate query.
+    """
+
+    name: str
+    sql: str
+    scalar: bool = False
 
 # Verbatim from the consumer's query_router/entity_validator.py `_DB_SOURCES`
 # and `_RANKED_SOURCES` (Odisha_PRDW @ master). These run at startup to build
@@ -50,43 +67,43 @@ DATA_ALIAS = "analytics"
 #
 # Re-check these against the consumer if the router changes; they are copied,
 # not imported, because that repo is not a dependency of this one.
-ENTITY_PROBES: tuple[tuple[str, str], ...] = (
-    ("entity.district", "SELECT DISTINCT zp_name FROM gram_panchayat WHERE zp_name IS NOT NULL"),
-    ("entity.block", "SELECT DISTINCT block_name FROM gram_panchayat WHERE block_name IS NOT NULL"),
-    ("entity.gp", "SELECT DISTINCT gp_name FROM gram_panchayat WHERE gp_name IS NOT NULL"),
-    ("entity.fiscal_year",
+ENTITY_PROBES: tuple[Probe, ...] = (
+    Probe("entity.district", "SELECT DISTINCT zp_name FROM gram_panchayat WHERE zp_name IS NOT NULL"),
+    Probe("entity.block", "SELECT DISTINCT block_name FROM gram_panchayat WHERE block_name IS NOT NULL"),
+    Probe("entity.gp", "SELECT DISTINCT gp_name FROM gram_panchayat WHERE gp_name IS NOT NULL"),
+    Probe("entity.fiscal_year",
      "SELECT DISTINCT fiscal_year FROM planned_activity WHERE fiscal_year IS NOT NULL"),
-    ("entity.scheme",
+    Probe("entity.scheme",
      "SELECT DISTINCT scheme_name FROM activity_expenditure WHERE scheme_name IS NOT NULL"),
-    ("entity.status [view]",
+    Probe("entity.status [view]",
      "SELECT DISTINCT status_label FROM v_activity WHERE status_label IS NOT NULL"),
-    ("entity.asset_category [view]",
+    Probe("entity.asset_category [view]",
      "SELECT DISTINCT asset_category_label FROM v_asset WHERE asset_category_label IS NOT NULL"),
-    ("entity.asset_subcategory [view]",
+    Probe("entity.asset_subcategory [view]",
      "SELECT DISTINCT asset_subcategory_label FROM v_asset "
      "WHERE asset_subcategory_label IS NOT NULL"),
-    ("entity.focus_area_ranked [view]",
+    Probe("entity.focus_area_ranked [view]",
      "SELECT focus_area_name FROM v_activity WHERE focus_area_name IS NOT NULL "
      "GROUP BY focus_area_name ORDER BY COUNT(*) DESC"),
-    ("roster.gp",
+    Probe("roster.gp",
      "SELECT gp_lgd_code, gp_name, block_name, zp_name FROM gram_panchayat "
      "WHERE gp_lgd_code IS NOT NULL"),
 )
 
 # The view chain itself, and the same questions asked of base tables, so the
 # cost of the views is separable from the cost of the data.
-VIEW_PROBES: tuple[tuple[str, str], ...] = (
-    ("view.v_activity count", "SELECT count(*) FROM v_activity"),
-    ("view.v_asset count", "SELECT count(*) FROM v_asset"),
-    ("view.v_progress count", "SELECT count(*) FROM v_progress"),
-    ("view.v_plan count", "SELECT count(*) FROM v_plan"),
-    ("base.planned_activity count", "SELECT count(*) FROM planned_activity"),
-    ("base.activity_asset count", "SELECT count(*) FROM activity_asset"),
+VIEW_PROBES: tuple[Probe, ...] = (
+    Probe("view.v_activity count", "SELECT count(*) FROM v_activity", scalar=True),
+    Probe("view.v_asset count", "SELECT count(*) FROM v_asset", scalar=True),
+    Probe("view.v_progress count", "SELECT count(*) FROM v_progress", scalar=True),
+    Probe("view.v_plan count", "SELECT count(*) FROM v_plan", scalar=True),
+    Probe("base.planned_activity count", "SELECT count(*) FROM planned_activity", scalar=True),
+    Probe("base.activity_asset count", "SELECT count(*) FROM activity_asset", scalar=True),
     # A representative catalogue shape: group by geography, which is what most
     # of the template catalogue does.
-    ("query.spend by district [view]",
+    Probe("query.spend by district [view]",
      "SELECT district_name, SUM(total_expenditure) FROM v_activity GROUP BY district_name"),
-    ("query.spend by district [base]",
+    Probe("query.spend by district [base]",
      "SELECT g.zp_name, SUM(e.total_expenditure) FROM planned_activity a "
      "JOIN gram_panchayat g ON g.gp_lgd_code = a.gp_lgd_code "
      "LEFT JOIN activity_expenditure e ON e.activity_code = a.activity_code "
@@ -128,18 +145,25 @@ def connect(db_path: Path, views_sql: str | None, *, memory_limit: str,
     return con
 
 
-def time_probe(con, sql: str, repeat: int) -> tuple[float | None, int | str]:
+def time_probe(con, probe: Probe, repeat: int) -> tuple[float | None, int | str]:
+    """Median wall clock, and the probe's answer.
+
+    For a ``scalar`` probe the answer is the value returned; otherwise it is
+    the number of rows. Returns ``(None, <exception name>)`` on failure, which
+    the caller must treat as a failed run rather than a missing line.
+    """
+
     timings: list[float] = []
-    rows: int | str = 0
+    answer: int | str = 0
     for _ in range(repeat):
         started = time.perf_counter()
         try:
-            result = con.execute(sql).fetchall()
+            result = con.execute(probe.sql).fetchall()
         except Exception as exc:  # noqa: BLE001 - a probe that fails is a finding
             return None, type(exc).__name__
         timings.append(time.perf_counter() - started)
-        rows = len(result)
-    return statistics.median(timings), rows
+        answer = result[0][0] if probe.scalar and result else len(result)
+    return statistics.median(timings), answer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -186,28 +210,42 @@ def main(argv: list[str] | None = None) -> int:
 
     probes = list(ENTITY_PROBES) + list(VIEW_PROBES)
     if not views_sql and args.materialized is None:
-        probes = [p for p in probes if "[view]" not in p[0] and not p[0].startswith("view.")]
+        probes = [p for p in probes
+                  if "[view]" not in p.name and not p.name.startswith("view.")]
 
-    width = max(len(name) for name, _ in probes)
-    print(f"{'probe':<{width}}  {'median':>12}  {'rows':>10}")
-    print("-" * (width + 26))
+    width = max(len(probe.name) for probe in probes)
+    print(f"{'probe':<{width}}  {'median':>12}  {'rows/value':>12}")
+    print("-" * (width + 28))
     total = 0.0
-    for name, sql in probes:
-        elapsed, rows = time_probe(con, sql, args.repeat)
+    failed: list[str] = []
+    for probe in probes:
+        elapsed, answer = time_probe(con, probe, args.repeat)
         if elapsed is None:
-            print(f"{name:<{width}}  {'FAILED':>12}  {rows:>10}")
+            failed.append(f"{probe.name} ({answer})")
+            print(f"{probe.name:<{width}}  {'FAILED':>12}  {answer:>12}")
             continue
         total += elapsed
-        print(f"{name:<{width}}  {elapsed * 1000:>9,.0f} ms  {rows:>10,}")
-    print("-" * (width + 26))
-    print(f"{'total':<{width}}  {total * 1000:>9,.0f} ms")
+        print(f"{probe.name:<{width}}  {elapsed * 1000:>9,.0f} ms  {answer:>12,}")
+    print("-" * (width + 28))
+    label_total = "total" if not failed else f"total ({len(failed)} probe(s) FAILED, excluded)"
+    print(f"{label_total:<{width}}  {total * 1000:>9,.0f} ms")
 
     if args.explain:
-        for name, sql in probes:
-            if args.explain.lower() in name.lower():
-                print(f"\n===== EXPLAIN ANALYZE: {name} =====")
-                print(con.execute(f"EXPLAIN ANALYZE {sql}").fetchall()[0][1])
+        for probe in probes:
+            if args.explain.lower() in probe.name.lower():
+                print(f"\n===== EXPLAIN ANALYZE: {probe.name} =====")
+                print(con.execute(f"EXPLAIN ANALYZE {probe.sql}").fetchall()[0][1])
     con.close()
+
+    if failed:
+        # A partial profile that exits 0 is worse than no profile: a caller --
+        # or a reader of the subtotal above -- takes an incomplete comparison
+        # for the whole one.
+        print(f"\nerror: {len(failed)} probe(s) failed, so this profile is incomplete:",
+              file=sys.stderr)
+        for entry in failed:
+            print(f"  - {entry}", file=sys.stderr)
+        return 1
     return 0
 
 
