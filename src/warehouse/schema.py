@@ -18,8 +18,7 @@ This change was scoped to six specific, explicitly enumerated divergences
 between the prior DDL and the spec (see the accompanying report). Beyond
 those six, the spec's full column lists for several tables mention fields
 that are not present here and that this module does NOT add:
-``gram_panchayat.{state_code,state_name,district_code,zp_name,block_code,
-block_name}``; ``activity_asset.{main_asset_category,main_asset_subcategory,
+``activity_asset.{main_asset_category,main_asset_subcategory,
 main_asset_unit_type,main_asset_unit_count,asset_details_raw,
 asset_loc_overflow_json}`` (the four ``main_asset_*`` fields already exist
 on ``planned_activity`` in this codebase, not on ``activity_asset``);
@@ -33,6 +32,11 @@ reason: none of them has any corresponding source-field mapping in
 all-NULL column with no working loader. That is loader work belonging with
 the relevant source adapter, not schema work, and is deliberately deferred
 rather than faked with an all-NULL column.
+
+``gram_panchayat``'s six geography columns were on that deferred list until
+their loader arrived (#61). They are present now because
+``transform.gram_panchayat`` populates them from the LGD reference tree --
+column and loader together, which is the bar the paragraph above sets.
 
 PRIMARY KEYS -- single run per build
 ---------------------------------------------------------------------------
@@ -130,10 +134,20 @@ PLANNING_MONEY = "DOUBLE"
 LEDGER_MONEY = "DECIMAL(16,2)"
 
 DDL: dict[str, str] = {
+    # Geography is populated from the LGD reference tree, not from the
+    # canonical snapshots: the normalizer only recovers (code, name) from the
+    # scraper's folder name. See warehouse.geography for why that is a
+    # conformed reference join rather than a source kind.
     "gram_panchayat": """
         CREATE TABLE gram_panchayat (
-            gp_lgd_code VARCHAR PRIMARY KEY,
-            gp_name     VARCHAR
+            gp_lgd_code   VARCHAR PRIMARY KEY,
+            gp_name       VARCHAR,
+            state_code    VARCHAR,
+            state_name    VARCHAR,
+            district_code VARCHAR,
+            zp_name       VARCHAR,
+            block_code    VARCHAR,
+            block_name    VARCHAR
         )""",
     "plan": """
         CREATE TABLE plan (

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import duckdb
 
 from .schema import FACT_TABLES, NO_LINEAGE_TABLES
+from .geography import GEOGRAPHY_COLUMNS, gp_geography
 from .select import SelectedSnapshot
 
 
@@ -153,6 +154,53 @@ def check_counts(con: duckdb.DuckDBPyConnection, counts: dict[str, int]) -> list
     return checks
 
 
+def check_geography(con: duckdb.DuckDBPyConnection) -> list[Check]:
+    """Every GP the LGD reference tree knows must carry its geography.
+
+    Scope note, because the obvious check is the wrong one. A blank-*fraction*
+    check cannot work here: a synthetic fixture legitimately uses a GP code
+    like ``123`` that is not a real Odisha GP, so it resolves against nothing
+    and would fail a fraction test at 100% while the loader is perfectly fine.
+    An unresolved code is unknown geography, not a broken join.
+
+    So the denominator is the GPs the tree actually covers. That makes this an
+    invariant guard -- ``geography.gp_geography`` builds all six columns
+    together, so an in-tree code can never be partially blank today, and this
+    check exists to keep that true through future edits to the join in
+    ``transform.gram_panchayat``.
+
+    It deliberately does NOT assert scale. "Are all 6,794 GPs here, in 30
+    districts and 314 blocks?" is a statement about the reference build, not
+    about any database, and it lives in
+    ``conformance.check_geography_completeness`` where the expected
+    cardinality is known. #61 asked for both, and they are different checks.
+    """
+
+    total = _scalar(con, "SELECT count(*) FROM gram_panchayat")
+    if not total:
+        return [Check("gram_panchayat geography", True, "no rows to check")]
+    known = set(gp_geography())
+    # Every geography column, driven off the canonical tuple rather than a
+    # hand-picked subset. An earlier revision of this check listed three of
+    # the six by name and passed a table whose district_code and state_code
+    # were 100% NULL -- the #61 failure mode, surviving its own guard.
+    columns = ", ".join(GEOGRAPHY_COLUMNS)
+    rows = con.execute(f"SELECT gp_lgd_code, {columns} FROM gram_panchayat").fetchall()
+    resolvable = [row for row in rows if row[0] in known]
+    blank = [row[0] for row in resolvable if any(value is None for value in row[1:])]
+    unresolved = len(rows) - len(resolvable)
+    detail = (
+        f"{len(resolvable)} of {total} row(s) are in the LGD reference tree; "
+        f"{len(blank)} of those are missing at least one of {columns}"
+    )
+    if unresolved:
+        # Reported, never fatal: a GP code absent from the tree means the tree
+        # needs refreshing (or the fixture is synthetic), and the full-state
+        # conformance check is what turns that into a ship-blocking number.
+        detail += f"; {unresolved} row(s) not in the tree"
+    return [Check("gram_panchayat geography", not blank, detail)]
+
+
 def run_checks(
     con: duckdb.DuckDBPyConnection, counts: dict[str, int], selected: tuple[SelectedSnapshot, ...],
 ) -> list[Check]:
@@ -161,4 +209,5 @@ def run_checks(
         *check_orphans(con),
         *check_provenance(con, selected),
         *check_counts(con, counts),
+        *check_geography(con),
     ]

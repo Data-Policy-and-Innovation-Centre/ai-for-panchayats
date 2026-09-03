@@ -32,6 +32,7 @@ import pandas as pd
 
 from . import transform
 from .config import WarehouseSettings, load_settings
+from .geography import gp_geography
 from .load import DEFAULT_BATCH_SIZE, insert, read_table
 from .schema import CREATE_ORDER, DDL, RESET_ORDER
 from .select import SelectedSnapshot, resolve_snapshots
@@ -138,6 +139,11 @@ def populate(
     # ids stay unique across every snapshot loaded into this one build.
     next_expenditure_id = 1
     next_nsap_id = 1
+    # The LGD reference tree is static, so it is resolved once for the build
+    # and shared by every snapshot's gram_panchayat contribution. Reading it
+    # here rather than in transform keeps that module free of file system
+    # access (see its docstring).
+    geography = gp_geography()
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -162,6 +168,7 @@ def populate(
         gp_frame = transform.gram_panchayat(
             [frame for frame in top_level.values() if not frame.empty], quarantine,
             source_system=source_system, source_run_id=source_run_id,
+            geography=geography,
         )
         add_count("gram_panchayat", _merge_gram_panchayat(
             con, gp_frame, quarantine, source_system=source_system,
