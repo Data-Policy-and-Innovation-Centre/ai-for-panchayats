@@ -409,6 +409,63 @@ def test_nested_payment_and_receipt_at_same_index_get_distinct_provenance(tmp_pa
     assert payment_id != receipt_id
 
 
+def test_flat_source_mutated_after_validation_is_rejected(tmp_path: Path):
+    # load_flat_csv validates the whole file before returning the batch
+    # iterator, but the iterator re-reads the file when consumed.  A source
+    # rewritten in that window must not be silently emitted unvalidated.
+    path = _write_csv(tmp_path, [_voucher(voucher_no="V-1", amount="10.00")])
+
+    with VoucherLoader() as loader:
+        batches = loader.load_flat_csv(
+            path,
+            source_system="egramswaraj",
+            source_run_id="synthetic-run",
+        )
+        _write_csv(tmp_path, [_voucher(voucher_no="V-1", amount="999.00")])
+        with pytest.raises(VoucherSourceSchemaError, match="changed after validation"):
+            list(batches)
+
+
+def test_nested_source_mutated_after_validation_is_rejected(tmp_path: Path):
+    path = tmp_path / "GP-1_2021-2022.json"
+    payload = {
+        "gp_lgd_code": "0012",
+        "gp_name": "Synthetic GP",
+        "years": {
+            "2021-2022": {
+                "payment_count": 1,
+                "receipt_count": 0,
+                "total_payments": "10.25",
+                "total_receipts": "0.00",
+                "payments": [
+                    {
+                        "amount": "10.25",
+                        "date": "02/03/2021",
+                        "month": "March",
+                        "type": "Expenditures",
+                        "voucher_id": "7",
+                        "voucher_no": "P-1",
+                    }
+                ],
+                "receipts": [],
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with VoucherLoader() as loader:
+        batches = loader.load_nested_json(
+            [path],
+            source_system="egramswaraj",
+            source_run_id="nested-run",
+        )
+        mutated = dict(payload)
+        mutated["years"]["2021-2022"]["payments"][0]["amount"] = "999.99"
+        path.write_text(json.dumps(mutated), encoding="utf-8")
+        with pytest.raises(VoucherSourceSchemaError, match="changed after validation"):
+            list(batches)
+
+
 def test_nested_revision_rejects_annual_total_mismatch(tmp_path: Path):
     path = tmp_path / "bad.json"
     path.write_text(

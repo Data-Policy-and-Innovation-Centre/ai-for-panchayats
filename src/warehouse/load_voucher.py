@@ -120,6 +120,13 @@ NESTED_VOUCHER_ROW_COLUMNS: tuple[str, ...] = (
 
 _DIRECTIONS = frozenset({"payment", "receipt"})
 _COUNT_RE = re.compile(r"^[0-9]+$")
+
+# A (size, mtime) pair, not a content hash: these sources are production
+# scale and the point of the two-pass design is bounded memory without
+# re-reading more than once per pass.  Cheap enough to be worth taking even
+# though it cannot catch an in-place edit that preserves both.
+_SourceFingerprint = tuple[int, int]
+
 # DuckDB DECIMAL(16,2) has fourteen integer digits and two fractional digits.
 # Rejecting an otherwise parseable larger Decimal here keeps a future insert
 # from failing only after the loader has emitted a partial batch.
@@ -194,6 +201,26 @@ class _VoucherInput:
     @property
     def natural_key(self) -> tuple[str, str, str]:
         return self.gp_lgd_code, self.fiscal_year, self.voucher_no
+
+
+def _fingerprint(path: Path) -> _SourceFingerprint:
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _check_fingerprint(path: Path, expected: _SourceFingerprint) -> None:
+    """Reject emission if a source changed since the validation pass saw it.
+
+    The validation pass and the emission pass each read the source
+    independently; without this check a file rewritten in between would be
+    emitted without ever being validated, silently voiding the two-pass
+    guarantee.
+    """
+
+    if _fingerprint(path) != expected:
+        raise VoucherSourceSchemaError(
+            f"{path.name} changed after validation; re-run the loader against a stable source"
+        )
 
 
 def _required_text(value: object, *, field: str, row: object | None = None) -> str:
@@ -916,9 +943,12 @@ class VoucherLoader:
             state=state,
             chunk_size=chunk_size,
         )
+        fingerprint = _fingerprint(source_path)
         state.finish()
         self._report = state.report()
-        return self._emit_flat(source_path, state=state, chunk_size=chunk_size)
+        return self._emit_flat(
+            source_path, state=state, chunk_size=chunk_size, fingerprint=fingerprint
+        )
 
     def _flat_chunks(self, path: Path, *, chunk_size: int) -> Iterator[pd.DataFrame]:
         yield from read_csv_chunks(
@@ -942,8 +972,17 @@ class VoucherLoader:
             offset += len(frame)
 
     def _emit_flat(
-        self, path: Path, *, state: _VoucherState, chunk_size: int
+        self,
+        path: Path,
+        *,
+        state: _VoucherState,
+        chunk_size: int,
+        fingerprint: _SourceFingerprint,
     ) -> Iterator[pd.DataFrame]:
+        # Checked here rather than in load_flat_csv: this body only runs once
+        # the caller starts consuming the returned generator, so a source
+        # rewritten before consumption begins is still caught.
+        _check_fingerprint(path, fingerprint)
         offset = 0
         for frame in self._flat_chunks(path, chunk_size=chunk_size):
             records = _parse_flat_chunk(
@@ -983,22 +1022,38 @@ class VoucherLoader:
             source_revision=source_revision,
             pk_start=pk_start,
         )
-        self._scan_nested(source_paths, state=state)
+        fingerprints = self._scan_nested(source_paths, state=state)
         state.finish()
         self._report = state.report()
-        return self._emit_nested(source_paths, state=state, batch_size=batch_size)
+        return self._emit_nested(
+            source_paths, state=state, batch_size=batch_size, fingerprints=fingerprints
+        )
 
-    def _scan_nested(self, paths: Sequence[Path], *, state: _VoucherState) -> None:
+    def _scan_nested(
+        self, paths: Sequence[Path], *, state: _VoucherState
+    ) -> dict[Path, _SourceFingerprint]:
+        fingerprints: dict[Path, _SourceFingerprint] = {}
         for path in paths:
+            fingerprints[path] = _fingerprint(path)
             for record in _parse_nested_file(path, annual_callback=state.declare_annual):
                 state.accept(record)
             state.commit()
+        return fingerprints
 
     def _emit_nested(
-        self, paths: Sequence[Path], *, state: _VoucherState, batch_size: int
+        self,
+        paths: Sequence[Path],
+        *,
+        state: _VoucherState,
+        batch_size: int,
+        fingerprints: Mapping[Path, _SourceFingerprint],
     ) -> Iterator[pd.DataFrame]:
         pending: list[_VoucherInput] = []
         for path in paths:
+            # Checked per file as the loop reaches it, not once up front:
+            # emission of an earlier file must not hold a stale generator
+            # open across an arbitrarily long consumption of later files.
+            _check_fingerprint(path, fingerprints[path])
             for record in _parse_nested_file(path):
                 pending.append(record)
                 if len(pending) >= batch_size:
