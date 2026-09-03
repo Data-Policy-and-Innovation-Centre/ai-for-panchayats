@@ -47,11 +47,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import pandas as pd
 
 from .clean import strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int
+from .geography import GEOGRAPHY_COLUMNS
 
 # --------------------------------------------------------------------- quarantine
 
@@ -271,13 +272,26 @@ def _base_identity(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def gram_panchayat(root_frames: list[pd.DataFrame], quarantine: Quarantine,
-                    *, source_system: str, source_run_id: str) -> pd.DataFrame:
+                    *, source_system: str, source_run_id: str,
+                    geography: Mapping[str, Mapping[str, str]] | None = None) -> pd.DataFrame:
     """One row per LGD code, built from every kind's own provenance.
 
     Every kind independently records the GP it was scraped for; unioning
     them is the "proven mapping" -- the folder-name regex is the same
     parser for every kind, unlike a business field whose spelling can differ
     kind to kind.
+
+    ``geography`` is the ``{gp_lgd_code: {column: value}}`` lookup from
+    :mod:`warehouse.geography`, left-joined on to fill the block/district/
+    state columns the folder name cannot carry (#61). It is passed in rather
+    than read here because every function in this module is pure -- see the
+    module docstring. Omitting it leaves those columns null, which is what
+    the callers that only care about the dimension's identity (tests, and
+    any future caller building a code-only roster) want.
+
+    The join is on ``gp_lgd_code`` and never on ``gp_name``: 505 GP names are
+    shared by more than one GP, so a name join would quietly hand some GPs
+    another GP's district.
     """
 
     parts = []
@@ -288,13 +302,20 @@ def gram_panchayat(root_frames: list[pd.DataFrame], quarantine: Quarantine,
             "gp_lgd_code": to_code(raw["gp_code"]),
             "gp_name": raw["gram_panchayat_name"].astype("string"),
         }))
+    columns = ["gp_lgd_code", "gp_name", *GEOGRAPHY_COLUMNS]
     if not parts:
-        return pd.DataFrame(columns=["gp_lgd_code", "gp_name"])
+        return pd.DataFrame(columns=columns)
     combined = pd.concat(parts, ignore_index=True).dropna(subset=["gp_lgd_code"])
-    return _dedupe(
+    deduped = _dedupe(
         combined, ["gp_lgd_code"], "gram_panchayat", quarantine,
         source_system=source_system, source_run_id=source_run_id,
     )
+    lookup = geography or {}
+    for column in GEOGRAPHY_COLUMNS:
+        deduped[column] = deduped["gp_lgd_code"].map(
+            lambda code, _c=column: lookup.get(code, {}).get(_c)
+        ).astype("string")
+    return deduped
 
 
 # --------------------------------------------------------------------- PL: plan + planned_activity + satellites

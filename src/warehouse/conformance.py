@@ -171,6 +171,19 @@ FISCAL_YEAR_PATTERN = r"^[0-9]{4}-[0-9]{4}$"
 DIM_CODE_TABLE = "dim_code"
 DIM_CODE_COLUMNS: tuple[str, str] = ("variable", "code")
 
+# Odisha's administrative cardinality, from the LGD reference tree that
+# populates these columns (30 zillas / 314 blocks / 6,794 GPs -- counted, not
+# quoted). Asserted rather than eyeballed, per #61: a geography backfill that
+# joins on the wrong key still produces non-null columns, and the only thing
+# that catches it is the shape of the result.
+GRAM_PANCHAYAT_TABLE = "gram_panchayat"
+GEOGRAPHY_COLUMNS: tuple[str, ...] = (
+    "state_code", "state_name", "district_code", "zp_name", "block_code", "block_name",
+)
+EXPECTED_GP_COUNT = 6794
+EXPECTED_DISTRICT_COUNT = 30
+EXPECTED_BLOCK_COUNT = 314
+
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
 # decimal arithmetic, never binary float ``==``.
@@ -628,6 +641,73 @@ def check_dim_code_uniqueness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     )]
 
 
+def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """Section 6: gram_panchayat carries geography for every GP in the state.
+
+    Gated with the reconciliation totals rather than run always, for the same
+    reason: these are assertions about the *reference build*, and a synthetic
+    fixture holding three GPs is not wrong for having three districts.
+
+    #61 shipped 6,794 rows with no district behind a green build, because
+    nothing checked. Completeness and cardinality are both asserted: a table
+    can be fully populated and still be a partial state, or have the right
+    row count and no geography.
+
+    What cardinality does NOT catch is a *mis-join*. Keying the join on
+    ``gp_name`` instead of ``gp_lgd_code`` still yields 30 distinct
+    ``zp_name`` and 314 distinct ``block_code`` -- just attached to the wrong
+    GPs. That hazard is pinned by
+    ``test_repeated_gp_name_gets_different_geography``, not from here.
+    """
+
+    table = GRAM_PANCHAYAT_TABLE
+    if table not in _existing_tables(con):
+        return []  # already reported by check_table_existence
+    columns = _columns(con, table)
+    missing = tuple(col for col in GEOGRAPHY_COLUMNS if col not in columns)
+    if missing:
+        return [Finding(
+            check="geography.columns", severity="violation",
+            expected=f"{table} has {list(GEOGRAPHY_COLUMNS)}",
+            actual=f"missing {list(missing)}",
+        )]
+
+    findings: list[Finding] = []
+    total = _row_count(con, table)
+    if total != EXPECTED_GP_COUNT:
+        findings.append(Finding(
+            check="geography.gp_count", severity="violation",
+            expected=str(EXPECTED_GP_COUNT), actual=str(total),
+        ))
+    # Every geography column, not a hand-picked subset: listing three of the
+    # six by name let a table with 100% NULL district_code and state_code pass
+    # this check clean, which is the exact condition #61 is named for.
+    predicate = " OR ".join(f"{col} IS NULL" for col in GEOGRAPHY_COLUMNS)
+    blank = con.execute(
+        f"SELECT count(*) FROM {table} WHERE {predicate}"
+    ).fetchone()[0]
+    if blank:
+        findings.append(Finding(
+            check="geography.populated", severity="violation",
+            expected=f"every row has all of {', '.join(GEOGRAPHY_COLUMNS)}",
+            actual=f"{blank} row(s) blank",
+        ))
+    for name, column, expected in (
+        ("districts", "zp_name", EXPECTED_DISTRICT_COUNT),
+        ("blocks", "block_code", EXPECTED_BLOCK_COUNT),
+    ):
+        actual = con.execute(
+            f"SELECT count(DISTINCT {column}) FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchone()[0]
+        if actual != expected:
+            findings.append(Finding(
+                check=f"geography.{name}", severity="violation",
+                expected=str(expected), actual=str(actual),
+                detail=f"distinct {column}",
+            ))
+    return findings
+
+
 def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """Section 6: the exact published totals from the reference build.
 
@@ -687,14 +767,16 @@ def check_conformance(
     """Run every check and return the combined findings, in a stable order.
 
     ``skip_reconciliation=True`` omits Section 6 (the exact reference-build
-    totals) -- use this for synthetic fixtures that were never meant to
-    match the real published totals.
+    totals, and the full-state geography cardinality) -- use this for
+    synthetic fixtures that were never meant to match the real published
+    totals or to contain all 6,794 GPs.
     """
 
     findings: list[Finding] = []
     for check in ALL_CHECKS:
         findings.extend(check(con))
     if not skip_reconciliation:
+        findings.extend(check_geography_completeness(con))
         findings.extend(check_reconciliation_totals(con))
     return findings
 

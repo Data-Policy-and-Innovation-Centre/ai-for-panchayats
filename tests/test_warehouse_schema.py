@@ -42,9 +42,9 @@ def test_primary_key_rejects_duplicate(tmp_path: Path):
     con = duckdb.connect(str(tmp_path / "schema.duckdb"))
     try:
         _create_all(con)
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         with pytest.raises(duckdb.ConstraintException):
-            con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Different Name')")
+            con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Different Name')")
     finally:
         con.close()
 
@@ -111,7 +111,7 @@ def test_activity_nsap_keys_on_nsap_id_not_the_business_tuple(tmp_path: Path):
         _create_all(con)
         columns = [row[1] for row in con.execute("PRAGMA table_info('activity_nsap')").fetchall()]
         assert columns[0] == "nsap_id"
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         con.execute(
             "INSERT INTO plan VALUES (NULL, NULL, 'P1', '123', '2021-2022', NULL, NULL, NULL)"
         )
@@ -147,7 +147,7 @@ def test_activity_asset_and_fund_have_no_row_id_and_key_on_activity_code(tmp_pat
         for table in ("activity_asset", "activity_fund"):
             columns = {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
             assert "row_id" not in columns, f"{table} should not have a row_id column"
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         con.execute(
             "INSERT INTO plan VALUES (NULL, NULL, 'P1', '123', '2021-2022', NULL, NULL, NULL)"
         )
@@ -180,7 +180,7 @@ def test_voucher_unique_constraint_rejects_duplicate_business_key(tmp_path: Path
     con = duckdb.connect(str(tmp_path / "schema.duckdb"))
     try:
         _create_all(con)
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         con.execute(
             "INSERT INTO voucher VALUES (1, '123', '2021-2022', 'V1', 'X1', "
             "'payment', NULL, NULL, NULL, 100.00)"
@@ -198,7 +198,7 @@ def test_voucher_direction_check_constraint_rejects_other_values(tmp_path: Path)
     con = duckdb.connect(str(tmp_path / "schema.duckdb"))
     try:
         _create_all(con)
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         with pytest.raises(duckdb.ConstraintException):
             con.execute(
                 "INSERT INTO voucher VALUES (1, '123', '2021-2022', 'V1', 'X1', "
@@ -216,7 +216,7 @@ def test_activity_voucher_allows_null_voucher_pk():
     con = duckdb.connect(":memory:")
     try:
         _create_all(con)
-        con.execute("INSERT INTO gram_panchayat VALUES ('123', 'Test GP')")
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
         con.execute(
             "INSERT INTO plan VALUES (NULL, NULL, 'P1', '123', '2021-2022', NULL, NULL, NULL)"
         )

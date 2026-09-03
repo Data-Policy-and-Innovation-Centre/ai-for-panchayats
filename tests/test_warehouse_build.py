@@ -615,3 +615,34 @@ def test_unrecognized_child_table_is_tracked_not_silently_dropped(tmp_path: Path
     result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
     unconsumed = result.unconsumed_tables["egramSwaraj/run-1"]
     assert "pl__fundlist__lineitems" in unconsumed
+
+
+def test_geography_reaches_the_built_table(tmp_path: Path):
+    """End-to-end (#61): a real LGD folder name arrives with its district and
+    block, joined from the reference tree rather than from the folder name --
+    which only ever carried the code and the name.
+
+    Uses LGD_115550_Angarbandha, a real Odisha GP, because that is the whole
+    point: the other fixtures here use LGD_123_Test_GP, which resolves against
+    nothing and would prove nothing about the join.
+    """
+
+    settings = make_settings(tmp_path)
+    run = publish_raw_run(tmp_path, "run-geo", {
+        "LGD_115550_Angarbandha/2021_PL.json": {
+            "data": [{"activityCd": 7, "planCode": "P1", "totalCost": 100}],
+        },
+    })
+    normalize(run, settings.canonical_root, chunk_size=100)
+    build(snapshot_ids=("snap-geo",), settings=settings,
+          registry=registry(approved("snap-geo", "egramSwaraj", "run-geo")))
+
+    con = duckdb.connect(str(settings.db_path), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT gp_lgd_code, gp_name, state_code, state_name, district_code, "
+            "zp_name, block_code, block_name FROM gram_panchayat"
+        ).fetchall()
+    finally:
+        con.close()
+    assert row == [("115550", "Angarbandha", "21", "Odisha", "303", "Anugul", "3639", "Anugul")]

@@ -16,6 +16,8 @@ from decimal import Decimal
 
 import duckdb
 
+from warehouse.geography import gp_geography
+
 from warehouse.conformance import (
     EXPECTED_ACTIVITY_EXPENDITURE_TOTAL,
     EXPECTED_PLANNED_COST_TOTAL,
@@ -27,6 +29,7 @@ from warehouse.conformance import (
     check_business_key_types,
     check_conformance,
     check_dim_code_uniqueness,
+    check_geography_completeness,
     check_fiscal_year_format,
     check_money_types,
     check_primary_keys,
@@ -46,7 +49,11 @@ from warehouse.conformance import (
 # piece of this to prove the corresponding check fires.
 FULL_DDL: dict[str, str] = {
     "gram_panchayat": """
-        CREATE TABLE gram_panchayat (gp_lgd_code VARCHAR PRIMARY KEY, gp_name VARCHAR)
+        CREATE TABLE gram_panchayat (
+            gp_lgd_code VARCHAR PRIMARY KEY, gp_name VARCHAR,
+            state_code VARCHAR, state_name VARCHAR, district_code VARCHAR,
+            zp_name VARCHAR, block_code VARCHAR, block_name VARCHAR
+        )
     """,
     "plan": """
         CREATE TABLE plan (
@@ -586,7 +593,7 @@ def test_satellite_row_parity_flags_orphan_and_missing_rows(tmp_path):
 def test_voucher_direction_passes_on_valid_values(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    con.execute("INSERT INTO gram_panchayat VALUES ('GP1', 'Test GP')")
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
     con.execute("""
         INSERT INTO voucher VALUES
             (1, 'GP1', '2025-2026', 'V1', 100.00, 'payment'),
@@ -599,7 +606,7 @@ def test_voucher_direction_passes_on_valid_values(tmp_path):
 def test_voucher_direction_flags_invalid_value(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    con.execute("INSERT INTO gram_panchayat VALUES ('GP1', 'Test GP')")
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
     con.execute("""
         INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', 100.00, 'refund')
     """)
@@ -678,7 +685,7 @@ def test_dim_code_uniqueness_flags_duplicate_pair(tmp_path):
 def test_reconciliation_totals_pass_when_exact(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    con.execute("INSERT INTO gram_panchayat VALUES ('GP1', 'Test GP')")
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
     con.execute(
         "INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', ?, 'payment')",
         [EXPECTED_VOUCHER_AMOUNT_TOTAL],
@@ -698,7 +705,7 @@ def test_reconciliation_totals_pass_when_exact(tmp_path):
 def test_reconciliation_totals_flag_delta_to_the_paisa(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    con.execute("INSERT INTO gram_panchayat VALUES ('GP1', 'Test GP')")
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
     off_by = EXPECTED_VOUCHER_AMOUNT_TOTAL + Decimal("0.01")
     con.execute(
         "INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', ?, 'payment')",
@@ -742,16 +749,106 @@ def test_reconciliation_included_by_default_and_fails_on_empty_fixture(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# Geography (#61)
+# ---------------------------------------------------------------------------
+
+def test_geography_completeness_flags_a_partial_state(tmp_path):
+    """One GP with perfect geography is still not Odisha. #61 shipped 6,794
+    blank rows behind a green build; the count is what catches it."""
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.execute(
+        "INSERT INTO gram_panchayat (gp_lgd_code, gp_name, state_code, state_name, "
+        "district_code, zp_name, block_code, block_name) "
+        "VALUES ('115550', 'Angarbandha', '21', 'Odisha', '303', 'Anugul', '3639', 'Anugul')"
+    )
+    findings = check_geography_completeness(con)
+    checks = {f.check for f in findings}
+    assert "geography.gp_count" in checks
+    assert "geography.districts" in checks
+    assert "geography.blocks" in checks
+    assert all(f.severity == "violation" for f in findings)
+    con.close()
+
+
+def test_geography_completeness_flags_blank_rows(tmp_path):
+    """The condition #61 is named for: rows present, geography absent."""
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.executemany(
+        "INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES (?, ?)",
+        [(code, f"GP {code}") for code in gp_geography()],
+    )
+    findings = check_geography_completeness(con)
+    blank = [f for f in findings if f.check == "geography.populated"]
+    assert len(blank) == 1
+    assert blank[0].actual == "6794 row(s) blank"
+    # The GP count is right, so only the geography checks fire -- which is
+    # exactly the shape of the shipped full-state snapshot.
+    assert "geography.gp_count" not in {f.check for f in findings}
+    con.close()
+
+
+def test_geography_completeness_flags_missing_columns(tmp_path):
+    """The pre-#61 shape: the columns were never created at all. Built as a
+    bare table rather than by dropping a column, because the 19-table fixture
+    has foreign keys pointing at this one."""
+
+    con = _connect(tmp_path)
+    con.execute("CREATE TABLE gram_panchayat (gp_lgd_code VARCHAR PRIMARY KEY, gp_name VARCHAR)")
+    findings = check_geography_completeness(con)
+    assert [f.check for f in findings] == ["geography.columns"]
+    assert "zp_name" in findings[0].actual
+    con.close()
+
+
+def test_geography_completeness_skipped_for_synthetic_fixtures(tmp_path):
+    """A three-GP fixture is not wrong for having one district, so the
+    cardinality assertions ride with the reconciliation gate."""
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    findings = check_conformance(con, skip_reconciliation=True)
+    assert not any(f.check.startswith("geography.") for f in findings)
+    con.close()
+
+
+# ---------------------------------------------------------------------------
 # Aggregation and reporting
 # ---------------------------------------------------------------------------
+
+def _seed_full_state_geography(con):
+    """Insert all 6,794 real GPs with their real geography.
+
+    ``check_geography_completeness`` asserts the reference build's actual
+    cardinality (6,794 GPs / 30 districts / 314 blocks), so a fixture that
+    claims to be *fully* conformant has to carry it. Seeding from the same
+    reference tree the loader reads keeps the two from drifting, and makes
+    this test fail if the geography join is ever broken.
+    """
+
+    rows = [
+        (code, f"GP {code}", geo["state_code"], geo["state_name"],
+         geo["district_code"], geo["zp_name"], geo["block_code"], geo["block_name"])
+        for code, geo in gp_geography().items()
+    ]
+    con.executemany(
+        "INSERT INTO gram_panchayat (gp_lgd_code, gp_name, state_code, state_name, "
+        "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    return rows[0][0]
+
 
 def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    con.execute("INSERT INTO gram_panchayat VALUES ('GP1', 'Test GP')")
+    gp_code = _seed_full_state_geography(con)
     con.execute(
-        "INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', ?, 'payment')",
-        [EXPECTED_VOUCHER_AMOUNT_TOTAL],
+        "INSERT INTO voucher VALUES (1, ?, '2025-2026', 'V1', ?, 'payment')",
+        [gp_code, EXPECTED_VOUCHER_AMOUNT_TOTAL],
     )
     con.execute(
         "INSERT INTO activity_expenditure VALUES (1, 'A1', ?, NULL)",
