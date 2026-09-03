@@ -189,7 +189,7 @@ def populate(
                     pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
                 ), batch_size=batch_size))
             nsap_rows = transform.activity_nsap(
-                pl, activity_codes, source_system=source_system, source_run_id=source_run_id,
+                pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
                 start_id=next_nsap_id,
             )
             add_count("activity_nsap", insert(con, "activity_nsap", nsap_rows, batch_size=batch_size))
