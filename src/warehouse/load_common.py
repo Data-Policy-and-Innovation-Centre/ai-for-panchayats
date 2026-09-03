@@ -141,6 +141,26 @@ PROVENANCE_COLUMNS = (
 _INTEGER_DOT_ZERO = re.compile(r"^(-?\d+)\.0+$")
 _FISCAL_YEAR = re.compile(r"^(?P<start>\d{4})-(?P<end>\d{4})$")
 _CURRENCY_PREFIX = re.compile(r"(?i)^\s*(?:₹|rs\.?|inr)\s*")
+
+# Digit grouping this loader accepts, checked BEFORE the commas are stripped.
+#
+# Stripping unconditionally turns malformed input into a plausible number
+# rather than an error: "1,2" becomes 12 and "12,,34" becomes 1234, silently
+# corrupting an expenditure amount that the caller was promised would raise.
+#
+# Both conventions are permitted because this is Odisha government financial
+# data. Indian grouping puts the last three digits together and every group
+# before that in twos -- 1,00,000 is one lakh, NOT a malformed 100,000 -- so a
+# validator that only knows three-digit grouping would reject the real data
+# wholesale. That failure would be worse than the one being fixed: silent
+# corruption of some rows traded for rejection of nearly all of them.
+_MONEY_GROUPED = re.compile(
+    r"""^[+-]?(?:
+          \d{1,3}(?:,\d{3})*          # 1  123  1,234  12,345,678
+        | \d{1,2}(?:,\d{2})*,\d{3}    # 1,00,000  12,34,567  1,23,45,678
+    )(?:\.\d*)?$""",
+    re.X,
+)
 _NULL_TEXT = frozenset({"", "na", "n/a", "nan", "none", "null", "<na>", "-"})
 _IDENTIFIER_NULL_TEXT = frozenset({"", "nan", "none", "null", "<na>", "n/a"})
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -638,15 +658,25 @@ def _decimal_from_value(
         decimal_value = value
     else:
         text = str(value).strip()
-        text = _CURRENCY_PREFIX.sub("", text).replace(",", "")
+        text = _CURRENCY_PREFIX.sub("", text)
+        if "," in text:
+            # Only grouped values are checked; an ungrouped string falls
+            # through to Decimal() below, which rejects its own garbage.
+            if not _MONEY_GROUPED.match(text):
+                raise MoneyParseError(
+                    column=column,
+                    value=value,
+                    row=row,
+                    detail="has malformed digit grouping",
+                )
+            text = text.replace(",", "")
         if not text:
-            if allow_null:
-                return None
+            # A currency prefix alone (no digits) is malformed, not blank.
             raise MoneyParseError(
                 column=column,
                 value=value,
                 row=row,
-                detail="is blank but null is not allowed",
+                detail="is a currency prefix with no amount",
             )
         try:
             decimal_value = Decimal(text)
@@ -857,8 +887,19 @@ def deterministic_provenance_id(
     fiscal_year: str | None = None,
     parent_row_id: str | None = None,
     position: int | None = None,
+    child_collection: str | None = None,
 ) -> str:
-    """Derive a stable row ID from the source identity and row location."""
+    """Derive a stable row ID from the source identity and row location.
+
+    ``source_run_id`` is validated but deliberately excluded from the hash:
+    replaying the same source file and row under a new run ID must not mint a
+    new identity (see ``src/pipeline/normalize.py``'s ``_provenance``, where
+    ``manifest.run_id`` is likewise recorded as metadata but never folded
+    into ``root_key``/child row IDs). ``child_collection`` mirrors that
+    module's ``_child_rows``, which folds the sanitized collection key into
+    each child's row ID so two collections don't collide at the same
+    position under the same parent.
+    """
 
     source_system = _required_text(source_system, field="source_system")
     source_run_id = _required_text(source_run_id, field="source_run_id")
@@ -868,6 +909,10 @@ def deterministic_provenance_id(
     fiscal_year = _optional_text(fiscal_year, field="fiscal_year") or ""
     parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
     position = _optional_position(position)
+    if position is not None:
+        child_collection = _required_text(child_collection, field="child_collection")
+    else:
+        child_collection = _optional_text(child_collection, field="child_collection")
     if (
         not isinstance(source_row_number, numbers.Integral)
         or isinstance(source_row_number, bool)
@@ -877,7 +922,6 @@ def deterministic_provenance_id(
     values = (
         "warehouse-loader-provenance-v1",
         source_system,
-        source_run_id,
         Path(source_file).as_posix(),
         source_kind,
         gp_code or "",
@@ -885,6 +929,7 @@ def deterministic_provenance_id(
         str(int(source_row_number)),
         parent_row_id or "",
         str(position) if position is not None else "",
+        child_collection or "",
     )
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -905,6 +950,7 @@ def row_provenance(
     source_record_id: str | None = None,
     parent_row_id: str | None = None,
     position: int | None = None,
+    child_collection: str | None = None,
     mapping_status: str = "mapped",
 ) -> dict[str, Any]:
     """Return a row matching the existing canonical provenance contract."""
@@ -920,6 +966,10 @@ def row_provenance(
     business_id = _safe_identifier(business_id, field="business_id")
     parent_row_id = _optional_text(parent_row_id, field="parent_row_id")
     position = _optional_position(position)
+    if position is not None:
+        child_collection = _required_text(child_collection, field="child_collection")
+    else:
+        child_collection = _optional_text(child_collection, field="child_collection")
     mapping_status = _required_text(mapping_status, field="mapping_status")
     explicit_source_record_id = _optional_text(
         source_record_id, field="source_record_id"
@@ -950,6 +1000,7 @@ def row_provenance(
         fiscal_year=fiscal_year,
         parent_row_id=parent_row_id,
         position=position,
+        child_collection=child_collection,
     )
     if explicit_source_record_id is not None:
         record_id = explicit_source_record_id

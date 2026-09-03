@@ -171,7 +171,7 @@ def test_unparseable_money_raises_instead_of_becoming_zero():
     "value",
     ["1.001", Decimal("1.001"), "-0.001"],
 )
-def test_money_with_more_fractional_digits_fails_closed(value):
+def test_money_with_more_fractional_digits_fails_closed(value: str | Decimal) -> None:
     with pytest.raises(MoneyParseError, match="fractional digits"):
         parse_money(value, column="amount", places=2)
 
@@ -187,7 +187,7 @@ def test_money_with_more_fractional_digits_fails_closed(value):
         np.float32("nan"),
     ],
 )
-def test_nonfinite_money_values_raise_typed_error(value):
+def test_nonfinite_money_values_raise_typed_error(value: Decimal | float | np.floating):
     with pytest.raises(MoneyParseError):
         parse_money(value, column="amount")
 
@@ -218,20 +218,20 @@ def test_identifier_cleaning_preserves_leading_zeroes_and_strips_float_artifact(
 @pytest.mark.parametrize(
     "value", ["", "nan", "NaN", "none", "NULL", "<NA>", None, pd.NA]
 )
-def test_identifier_missing_sentinels_normalize_to_none(value):
+def test_identifier_missing_sentinels_normalize_to_none(value: object) -> None:
     assert clean_identifier(value) is None
 
 
 @pytest.mark.parametrize(
     "value", [float("nan"), float("inf"), np.float32("nan"), Decimal("NaN")]
 )
-def test_nonfinite_numeric_identifier_raises_typed_error(value):
+def test_nonfinite_numeric_identifier_raises_typed_error(value: float | np.floating | Decimal):
     with pytest.raises(IdentifierError):
         clean_identifier(value)
 
 
 @pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
-def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value):
+def test_boolean_identifiers_are_rejected_for_python_and_numpy_scalars(value: bool) -> None:
     with pytest.raises(IdentifierError, match="boolean"):
         clean_identifier(value)
 
@@ -278,11 +278,87 @@ def test_child_provenance_has_distinct_row_id_but_root_source_record_id():
         fiscal_year="2021-2022",
         parent_row_id=root["row_id"],
         position=0,
+        child_collection="funds",
     )
 
     assert child["row_id"] != root["row_id"]
     assert child["parent_row_id"] == root["row_id"]
     assert child["source_record_id"] == root["source_record_id"]
+
+
+def test_row_id_is_stable_when_the_same_row_is_replayed_under_a_new_run_id():
+    """A rerun with a new run ID must not mint a new identity for the same row.
+
+    This mirrors the canonical invariant already exercised by
+    ``tests/test_normalize.py::
+    test_existing_snapshot_is_immutable_and_row_ids_are_cross_run_stable``:
+    ``source_run_id`` is provenance metadata, not part of a row's identity.
+    """
+
+    kwargs = {
+        "source_system": "egramswaraj",
+        "source_file": "2021-2022/PL.csv",
+        "source_row_number": 7,
+        "source_kind": "PL",
+        "gp_code": "0123",
+        "fiscal_year": "2021-2022",
+    }
+    first_run = deterministic_provenance_id(source_run_id="run-1", **kwargs)
+    replay_run = deterministic_provenance_id(source_run_id="run-2", **kwargs)
+    assert first_run == replay_run
+
+    first_row = row_provenance(source_run_id="run-1", **kwargs)
+    replay_row = row_provenance(source_run_id="run-2", **kwargs)
+    assert first_row["row_id"] == replay_row["row_id"]
+    assert first_row["source_record_id"] == replay_row["source_record_id"]
+    # The run ID is still recorded as metadata even though it no longer
+    # affects identity.
+    assert first_row["source_run_id"] == "run-1"
+    assert replay_row["source_run_id"] == "run-2"
+
+
+def test_child_row_ids_differ_across_sibling_collections_at_the_same_position():
+    """Position 0 of two different child collections must not collide.
+
+    Mirrors ``src/pipeline/normalize.py::_child_rows``, which folds the
+    sanitized collection key into the child row ID alongside position.
+    """
+
+    root = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+    )
+    fund_child = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+        parent_row_id=root["row_id"],
+        position=0,
+        child_collection="funds",
+    )
+    asset_child = row_provenance(
+        source_system="egramswaraj",
+        source_run_id="run-1",
+        source_file="PL.json",
+        source_row_number=3,
+        source_kind="PL",
+        gp_code="0123",
+        fiscal_year="2021-2022",
+        parent_row_id=root["row_id"],
+        position=0,
+        child_collection="assets",
+    )
+
+    assert fund_child["row_id"] != asset_child["row_id"]
 
 
 def test_add_provenance_advances_source_rows_and_does_not_mutate_input():
@@ -358,7 +434,7 @@ def test_add_provenance_empty_frame_still_declares_contract_columns():
         },
     ],
 )
-def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs):
+def test_invalid_provenance_spec_fails_even_before_empty_frame_processing(kwargs: dict) -> None:
     with pytest.raises(ProvenanceError):
         ProvenanceSpec(**kwargs)
 
@@ -382,3 +458,52 @@ def test_provenance_normalizes_nullable_optional_fields_without_raw_type_error()
     assert row["fiscal_year"] is None
     assert row["parent_row_id"] is None
     assert row["pos"] is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Indian grouping. 1,00,000 is one lakh -- the dominant format in the
+        # source data, and the case a three-digit-only validator would reject.
+        ("1,00,000", Decimal("100000")),
+        ("12,34,567", Decimal("1234567")),
+        ("1,23,45,678", Decimal("12345678")),
+        ("1,00,000.50", Decimal("100000.50")),
+        ("-1,00,000", Decimal("-100000")),
+        ("Rs 1,00,000", Decimal("100000")),
+        # International grouping, still accepted.
+        ("1,000", Decimal("1000")),
+        ("12,345,678", Decimal("12345678")),
+        # Ungrouped values never reach the grouping check.
+        ("100000", Decimal("100000")),
+        ("1234.5", Decimal("1234.5")),
+    ],
+)
+def test_supported_digit_grouping_is_parsed(text: str, expected: Decimal) -> None:
+    assert parse_money(text, column="amount") == expected
+
+
+@pytest.mark.parametrize("text", ["1,2", "12,,34", "1,0000", "1,00,00", ",100", "100,"])
+def test_malformed_digit_grouping_raises_instead_of_corrupting(text: str) -> None:
+    """Stripping commas unconditionally turned these into plausible numbers.
+
+    "1,2" parsed as 12 and "12,,34" as 1234 -- a corrupted expenditure amount
+    reaching the warehouse with no error, which is exactly what this helper
+    promises cannot happen.
+    """
+    with pytest.raises(MoneyParseError):
+        parse_money(text, column="amount")
+
+@pytest.mark.parametrize("text", ["₹", "Rs.", "Rs ", "INR "])
+def test_bare_currency_prefix_raises_even_with_allow_null(text: str) -> None:
+    with pytest.raises(MoneyParseError):
+        parse_money(text, column="amount", allow_null=True)
+
+
+@pytest.mark.parametrize("text", ["", "NA", "-"])
+def test_genuine_blank_still_returns_none_under_allow_null(text: str) -> None:
+    assert parse_money(text, column="amount", allow_null=True) is None
+
+
+def test_none_still_returns_none_under_allow_null() -> None:
+    assert parse_money(None, column="amount", allow_null=True) is None

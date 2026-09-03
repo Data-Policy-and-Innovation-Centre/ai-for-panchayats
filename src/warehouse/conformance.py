@@ -105,6 +105,35 @@ VOUCHER_UNIQUE_COLUMNS: tuple[str, ...] = ("gp_lgd_code", "fiscal_year", "vouche
 NO_ENFORCED_FK: tuple[str, str, str] = ("activity_expenditure", "activity_code", "planned_activity")
 NULLABLE_REQUIRED: tuple[str, str] = ("activity_voucher", "voucher_pk")
 
+# Every other FK the spec's ER diagram gives, positive this time: each
+# (child_table, child_column, referenced_table) triple below must be an
+# *enforced* FOREIGN KEY. This is deliberately the complement of
+# NO_ENFORCED_FK above -- that one forbidden relationship is the single
+# documented exception, not evidence that FKs in general are optional.
+# activity_expenditure.plan_code -> plan is deliberately excluded here too,
+# for the same "not verified to always resolve" reason NO_ENFORCED_FK is.
+EXPECTED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("plan", "gp_lgd_code", "gram_panchayat"),
+    ("planned_activity", "plan_code", "plan"),
+    ("planned_activity", "gp_lgd_code", "gram_panchayat"),
+    ("activity_delegation", "activity_code", "planned_activity"),
+    ("activity_asset", "activity_code", "planned_activity"),
+    ("activity_fund", "activity_code", "planned_activity"),
+    ("activity_training", "activity_code", "planned_activity"),
+    ("activity_community_service", "activity_code", "planned_activity"),
+    ("activity_nsap", "activity_code", "planned_activity"),
+    ("activity_expenditure", "gp_lgd_code", "gram_panchayat"),
+    ("voucher", "gp_lgd_code", "gram_panchayat"),
+    ("activity_voucher", "expenditure_id", "activity_expenditure"),
+    ("activity_voucher", "voucher_pk", "voucher"),
+    ("admin_approval", "activity_code", "planned_activity"),
+    ("admin_approval", "gp_lgd_code", "gram_panchayat"),
+    ("admin_approval_scheme", "parent_row_id", "admin_approval"),
+    ("technical_approval", "activity_code", "planned_activity"),
+    ("technical_approval", "gp_lgd_code", "gram_panchayat"),
+    ("physical_progress", "activity_code", "planned_activity"),
+)
+
 # Section 4: types.
 # Business keys must be VARCHAR wherever they appear, in any table.
 BUSINESS_KEY_COLUMNS: frozenset[str] = frozenset({
@@ -333,6 +362,31 @@ def check_activity_expenditure_fk_not_enforced(con: duckdb.DuckDBPyConnection) -
     return []
 
 
+def check_required_foreign_keys(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """Section 3: every positive FK the spec's ER diagram gives must be enforced.
+
+    Complements ``check_activity_expenditure_fk_not_enforced`` above, which
+    checks the one deliberately-*forbidden* relationship. Without this
+    check, a warehouse that dropped every other declared FK still passes
+    conformance whenever its current rows happen to satisfy referential
+    integrity by coincidence -- and accepts orphan rows the moment they
+    stop coinciding.
+    """
+
+    findings: list[Finding] = []
+    actual_tables = _existing_tables(con)
+    for table, column, referenced in EXPECTED_FOREIGN_KEYS:
+        if table not in actual_tables or referenced not in actual_tables:
+            continue  # already reported by check_table_existence
+        if not _enforced_fk_exists(con, table, column, referenced):
+            findings.append(Finding(
+                check=f"constraint.foreign_key.{table}.{column}", severity="violation",
+                expected=f"FOREIGN KEY {table}.{column} -> {referenced}",
+                actual="no enforced FK found",
+            ))
+    return findings
+
+
 def check_activity_voucher_nullable(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """Section 3: activity_voucher.voucher_pk MUST be nullable (488 unmatched rows)."""
 
@@ -385,34 +439,34 @@ def check_surrogate_key_types(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
 
 def check_money_types(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """Section 4: accounting money is DECIMAL(16,2); planning cost is DOUBLE."""
+    """Section 4: accounting money is DECIMAL(16,2); planning cost is DOUBLE.
+
+    A table that exists but is missing the expected money column entirely
+    is reported as its own violation, before any type comparison -- a
+    silent ``continue`` here would let a warehouse with no
+    ``voucher.amount`` (etc.) pass this check even though it is
+    structurally incompatible with the spec.
+    """
 
     findings: list[Finding] = []
     actual_tables = _existing_tables(con)
-    for (table, column), expected_type in MONEY_DECIMAL_16_2.items():
-        if table not in actual_tables:
-            continue
-        columns = _columns(con, table)
-        if column not in columns:
-            continue
-        data_type, _ = columns[column]
-        if data_type != expected_type:
-            findings.append(Finding(
-                check=f"type.money.{table}.{column}", severity="violation",
-                expected=expected_type, actual=data_type,
-            ))
-    for (table, column), expected_type in MONEY_DOUBLE.items():
-        if table not in actual_tables:
-            continue
-        columns = _columns(con, table)
-        if column not in columns:
-            continue
-        data_type, _ = columns[column]
-        if data_type != expected_type:
-            findings.append(Finding(
-                check=f"type.money.{table}.{column}", severity="violation",
-                expected=expected_type, actual=data_type,
-            ))
+    for money_map in (MONEY_DECIMAL_16_2, MONEY_DOUBLE):
+        for (table, column), expected_type in money_map.items():
+            if table not in actual_tables:
+                continue
+            columns = _columns(con, table)
+            if column not in columns:
+                findings.append(Finding(
+                    check=f"type.money.{table}.{column}", severity="violation",
+                    expected=f"column {table}.{column} ({expected_type})", actual="column not found",
+                ))
+                continue
+            data_type, _ = columns[column]
+            if data_type != expected_type:
+                findings.append(Finding(
+                    check=f"type.money.{table}.{column}", severity="violation",
+                    expected=expected_type, actual=data_type,
+                ))
     return findings
 
 
@@ -424,7 +478,10 @@ def check_beneficiary_count_type(con: duckdb.DuckDBPyConnection) -> list[Finding
         return []
     columns = _columns(con, table)
     if column not in columns:
-        return []
+        return [Finding(
+            check="type.beneficiary_count", severity="violation",
+            expected=f"column {table}.{column} exists", actual="column not found",
+        )]
     data_type, _ = columns[column]
     if data_type not in INTEGER_TYPES:
         return [Finding(
@@ -582,7 +639,13 @@ def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]
     findings: list[Finding] = []
     actual_tables = _existing_tables(con)
     for check_name, table, column, expected in RECONCILIATION_TARGETS:
-        if table not in actual_tables or column not in _columns(con, table):
+        if table not in actual_tables:
+            continue  # already reported by check_table_existence
+        if column not in _columns(con, table):
+            findings.append(Finding(
+                check=check_name, severity="violation",
+                expected=f"column {table}.{column} exists", actual="column not found",
+            ))
             continue
         actual = _decimal_sum(con, table, column)
         if actual != expected:
@@ -604,6 +667,7 @@ ALL_CHECKS = (
     check_primary_keys,
     check_voucher_unique_constraint,
     check_activity_expenditure_fk_not_enforced,
+    check_required_foreign_keys,
     check_activity_voucher_nullable,
     check_business_key_types,
     check_surrogate_key_types,

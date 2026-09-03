@@ -189,25 +189,32 @@ def populate(
                     pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
                 ), batch_size=batch_size))
             nsap_rows = transform.activity_nsap(
-                pl, activity_codes, source_system=source_system, source_run_id=source_run_id,
+                pl, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
                 start_id=next_nsap_id,
             )
             add_count("activity_nsap", insert(con, "activity_nsap", nsap_rows, batch_size=batch_size))
             next_nsap_id += len(nsap_rows)
 
-            asset_children = _child_tables(tables, "pl", "asset")
-            asset_frame = pd.concat(
-                [_read(root, tables, name) for name in asset_children], ignore_index=True,
-            ) if asset_children else pd.DataFrame()
+            asset_frames: list[pd.DataFrame] = []
+            asset_children: list[str] = []
+            fund_frames: list[pd.DataFrame] = []
+            fund_children: list[str] = []
+            for name in _child_tables(tables, "pl", ""):
+                frame = _read(root, tables, name)
+                if set(frame.columns) & set(transform.ASSET_CHILD_RENAMES):
+                    asset_frames.append(frame)
+                    asset_children.append(name)
+                elif set(frame.columns) & set(transform.FUND_CHILD_RENAMES):
+                    fund_frames.append(frame)
+                    fund_children.append(name)
+
+            asset_frame = pd.concat(asset_frames, ignore_index=True) if asset_frames else pd.DataFrame()
             add_count("activity_asset", insert(con, "activity_asset", transform.activity_asset(
                 asset_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
             ), batch_size=batch_size))
             used.extend(asset_children)
 
-            fund_children = _child_tables(tables, "pl", "fund")
-            fund_frame = pd.concat(
-                [_read(root, tables, name) for name in fund_children], ignore_index=True,
-            ) if fund_children else pd.DataFrame()
+            fund_frame = pd.concat(fund_frames, ignore_index=True) if fund_frames else pd.DataFrame()
             add_count("activity_fund", insert(con, "activity_fund", transform.activity_fund(
                 fund_frame, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
             ), batch_size=batch_size))
@@ -224,10 +231,21 @@ def populate(
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
         parent_row_ids = set(approvals["row_id"].dropna())
 
-        scheme_children = _child_tables(tables, "aa", "")
-        scheme_frame = pd.concat(
-            [_read(root, tables, name) for name in scheme_children], ignore_index=True,
-        ) if scheme_children else pd.DataFrame()
+        # The scheme array's own JSON key is unverified (see transform.py's
+        # module docstring), so candidates are still found by prefix alone --
+        # but a direct AA child is only kept if it actually carries a
+        # recognized scheme field. Without this, ANY unrelated AA child array
+        # (attachments, comments, ...) would match the empty keyword, get
+        # loaded as all-null scheme rows, and be marked consumed instead of
+        # reported unconsumed.
+        scheme_frames: list[pd.DataFrame] = []
+        scheme_children: list[str] = []
+        for name in _child_tables(tables, "aa", ""):
+            frame = _read(root, tables, name)
+            if set(frame.columns) & set(transform.AA_SCHEME_RENAMES):
+                scheme_frames.append(frame)
+                scheme_children.append(name)
+        scheme_frame = pd.concat(scheme_frames, ignore_index=True) if scheme_frames else pd.DataFrame()
         add_count("admin_approval_scheme", insert(con, "admin_approval_scheme", transform.admin_approval_scheme(
             scheme_frame, parent_row_ids, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))

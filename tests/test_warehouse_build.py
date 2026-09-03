@@ -16,6 +16,7 @@ import duckdb
 import pytest
 
 from warehouse.build import BuildResult, build
+from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
 from warehouse.transform import RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
@@ -202,6 +203,57 @@ def test_activity_fund_second_line_for_same_activity_is_quarantined(tmp_path: Pa
         con.close()
 
 
+def test_childless_activity_gets_synthesized_satellite_rows_and_passes_conformance(tmp_path: Path):
+    """A real gap between this PR's builder and the conformance rule it
+    ships alongside: activity 8 below has no ``fundList``/``assetDetails``
+    array at all (a perfectly valid activity -- e.g. a training-only line
+    with no planned asset or funding split), while activity 7 has both.
+    Before the fix, activity 8 would build successfully with zero
+    activity_asset/activity_fund rows and then fail
+    ``check_satellite_row_parity``, which requires exactly one row per
+    planned_activity. Both tables must now carry a synthesized all-null
+    row for activity 8, and the built warehouse must be conformant.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [
+                {
+                    "activityCd": 7, "planCode": "P1", "totalCost": 15000.50,
+                    "fundList": [{"schemeCode": "S1", "amountTotal": 5000.25}],
+                    "assetDetails": [{"astTyp": "well", "astUnitCost": 15000.50}],
+                },
+                {"activityCd": 8, "planCode": "P1", "totalCost": 200.0},
+            ],
+        },
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts["planned_activity"] == 2
+    assert result.counts["activity_asset"] == 2
+    assert result.counts["activity_fund"] == 2
+    assert result.quarantine_count == 0
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        childless_asset = con.execute(
+            "SELECT asset_type FROM activity_asset WHERE activity_code = '8'"
+        ).fetchone()
+        assert childless_asset == (None,)
+        childless_fund = con.execute(
+            "SELECT fund_scheme_code FROM activity_fund WHERE activity_code = '8'"
+        ).fetchone()
+        assert childless_fund == (None,)
+
+        assert check_satellite_row_parity(con) == []
+        assert not has_violations(check_conformance(con, skip_reconciliation=True))
+    finally:
+        con.close()
+
+
 def test_activity_expenditure_identity_grain_through_build(tmp_path: Path):
     run = publish_raw_run(tmp_path, "run-1", {
         "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
@@ -322,6 +374,9 @@ def test_cross_source_activity_code_collision_fails_build_by_design(tmp_path: Pa
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source PK collision,
+            # not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 
@@ -351,6 +406,9 @@ def test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes(tm
                 "gp_code": "123", "gram_panchayat_name": "Test GP",
                 "fiscal_year": "2021-2022", "totalCost": 42.00, "activityName": "Other system activity",
             }],
+            # Empty but present: this test is about cross-source GP
+            # conformance, not eGramSwaraj completeness.
+            "aa": [], "ta": [], "pp": [], "re": [],
         },
     )
 
@@ -462,6 +520,82 @@ def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
         ]
     finally:
         con.close()
+
+
+def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
+    """A direct AA child array with no scheme-shaped column (attachments,
+    comments, ...) must not be swept into ``admin_approval_scheme`` just
+    because it sits one level below ``aa``. Before the fix, the empty
+    keyword used to discover the scheme table (its own JSON key is
+    unverified, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
+    matched *any* direct AA child, so an attachments array would load as
+    two all-null scheme rows and get marked consumed instead of reported
+    unconsumed."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalAttachments": [
+                {"fileName": "doc1.pdf", "uploadedBy": "clerk1"},
+                {"fileName": "doc2.pdf", "uploadedBy": "clerk2"},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts.get("admin_approval_scheme", 0) == 0
+    assert "aa__admapprovalattachments" not in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("aa__admapprovalattachments",)
+
+
+def test_unrelated_pl_child_array_is_not_loaded_as_asset_or_fund(tmp_path: Path):
+    """A direct PL child array whose key merely contains "asset" or "fund"
+    but has none of the recognized fields must not be swept into
+    activity_asset/activity_fund just by name substring."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{
+            "activityCd": 7, "totalCost": 100,
+            "assetAttachments": [
+                {"fileName": "doc1.pdf", "uploadedBy": "clerk1"},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts.get("activity_asset", 0) == 1
+    assert "pl__assetattachments" not in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("pl__assetattachments",)
+
+
+def test_scheme_and_unrelated_aa_children_are_both_handled_correctly(tmp_path: Path):
+    """A scheme array and an unrelated array can be siblings under the same
+    AA record; only the scheme one is loaded, the other is reported
+    unconsumed."""
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [{"wrkSchmCd": "SC1", "wrkAdmApprFndSnctnGen": 100}],
+            "admApprovalAttachments": [{"fileName": "doc1.pdf"}],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts["admin_approval_scheme"] == 1
+    assert "aa__admapprovalschemewebservice" in result.consumed_tables["egramSwaraj/run-1"]
+    assert result.unconsumed_tables["egramSwaraj/run-1"] == ("aa__admapprovalattachments",)
 
 
 def test_unrecognized_child_table_is_tracked_not_silently_dropped(tmp_path: Path):
