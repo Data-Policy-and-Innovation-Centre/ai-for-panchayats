@@ -6,6 +6,9 @@ import argparse
 import json
 import sys
 from enum import StrEnum
+from typing import Any
+
+import yaml
 from pathlib import Path
 
 from .manifest import ManifestError, RunPublisher, validate_run
@@ -60,6 +63,11 @@ def _parser() -> argparse.ArgumentParser:
         "--payload", action="append", default=[], metavar="NAME=PATH",
         help="copy a local synthetic/test payload into payloads/",
     )
+    ingest.add_argument(
+        "--payload-tree", action="append", default=[], type=Path, metavar="ROOT",
+        help="copy every file under ROOT into payloads/, keyed by its path "
+             "relative to ROOT; repeatable, and combinable with --payload",
+    )
     ingest.add_argument("--terminal-state", default="complete")
 
     verify = commands.add_parser("validate-run", help="verify a published raw run")
@@ -93,6 +101,49 @@ def _counts(values: list[str]) -> dict[str, int]:
     return counts
 
 
+PROGRESS_EVERY = 10_000
+
+
+def _write_tree(publisher: RunPublisher, root: Path) -> tuple[int, list[str]]:
+    """Copy every regular file under ``root`` into ``payloads/``.
+
+    Keyed by the path relative to ``root``, so a scraper tree of
+    ``LGD_<code>_<name>/<year>_<KIND>.json`` arrives with the folder names
+    intact -- which matters, because ``normalize._gp_context`` recovers the
+    GP code from exactly those parent directories.
+
+    Symlinks are skipped rather than followed: a raw run's manifest is an
+    inventory of real bytes with real hashes, and a link that resolves
+    outside the tree is not something this run can honestly claim to have
+    published. Skipped links are returned so the caller can record them --
+    never dropped silently.
+    """
+
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"invalid --payload-tree {root}; not a directory")
+    written = 0
+    skipped: list[str] = []
+    # Sorted so two runs over the same tree publish in the same order, which
+    # keeps the audit log and any progress output comparable between runs.
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            skipped.append(str(path.relative_to(root)))
+            continue
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            publisher.write_payload(path.relative_to(root), handle)
+        written += 1
+        if written % PROGRESS_EVERY == 0:
+            # A full-state run publishes ~204,000 files. Silence for that long
+            # is indistinguishable from a hang.
+            print(f"  {written:,} files copied from {root}", file=sys.stderr, flush=True)
+    if not written:
+        raise ValueError(f"invalid --payload-tree {root}; contains no files")
+    return written, skipped
+
+
 def _ingest(args: argparse.Namespace) -> int:
     with RunPublisher(
         args.raw_root,
@@ -110,7 +161,30 @@ def _ingest(args: argparse.Namespace) -> int:
             name, path = specification.split("=", 1)
             with Path(path).open("rb") as handle:
                 publisher.write_payload(name, handle)
-        publisher.append_audit({"event": "ingest", "source": args.source, "run_id": args.run_id})
+        tree_files = 0
+        tree_symlinks: list[str] = []
+        for root in args.payload_tree:
+            written, skipped = _write_tree(publisher, root)
+            tree_files += written
+            tree_symlinks.extend(skipped)
+        # The file count goes in the audit log rather than being inferred
+        # later: a run that published 203,812 of an expected 203,820 files is
+        # only answerable if the number it actually wrote was recorded.
+        audit: dict[str, Any] = {
+            "event": "ingest", "source": args.source, "run_id": args.run_id,
+        }
+        if args.payload_tree:
+            audit["payload_trees"] = [str(root) for root in args.payload_tree]
+            audit["payload_files"] = tree_files
+        if tree_symlinks:
+            # Never silent: a skipped symlink is data that did not make it in.
+            audit["skipped_symlinks"] = sorted(tree_symlinks)
+            print(
+                f"warning: skipped {len(tree_symlinks)} symlink(s) under --payload-tree; "
+                "a raw run inventories real files only (see audit.jsonl)",
+                file=sys.stderr,
+            )
+        publisher.append_audit(audit)
         destination = publisher.publish(
             terminal_state=args.terminal_state,
             observed_scope=args.observed_scope,
@@ -118,6 +192,41 @@ def _ingest(args: argparse.Namespace) -> int:
         )
     print(destination)
     return 0
+
+
+def _registry_stanza(output_root: Path) -> str:
+    """The `config/snapshots.yaml` entry for a snapshot that was just written.
+
+    Printed rather than appended, deliberately. ``snapshots.py`` refuses any
+    entry whose status is not ``approved``, so writing this file *is* the
+    approval -- and approving one's own output automatically is how an
+    unreviewed snapshot reaches a build. Pasting it is a person's decision;
+    getting the fields right is not, which is the part this removes.
+
+    (#95 asks for the publish-and-open-a-PR command. This is not it.)
+    """
+
+    # Same filename literal as normalize.validate_canonical_manifest reads;
+    # the raw run's manifest.json is a different file in a different tree.
+    manifest = json.loads(
+        (output_root / "canonical_manifest.json").read_text(encoding="utf-8")
+    )
+    source, run_id = manifest["source"], manifest["run_id"]
+    # Emitted by the YAML dumper rather than formatted by hand, because every
+    # field here is required to be a *string* and several plausible values are
+    # not strings in YAML: a run id of `2026-09-03` parses as a date, and one
+    # of `20260903` as an integer. Both make the pasted entry fail
+    # load_snapshot_registry with "has an empty field", a long way from the
+    # cause.
+    entry = {
+        "id": f"{source.lower()}-{run_id}",
+        "source": source,
+        "run_id": run_id,
+        "schema_version": str(manifest["schema_version"]),
+        "status": "approved",
+    }
+    dumped = yaml.safe_dump([entry], sort_keys=False, default_flow_style=False)
+    return "\n".join(f"  {line}" for line in dumped.rstrip().splitlines())
 
 
 def _normalize(args: argparse.Namespace) -> int:
@@ -129,6 +238,17 @@ def _normalize(args: argparse.Namespace) -> int:
     )
     print(f"published {result.output_root} ({len(result.tables)} tables; "
           f"{result.quarantine_count} quarantined)")
+    if result.quarantine_count:
+        # Surfaced next to the stanza on purpose: approving a snapshot is the
+        # moment to look at what it could not keep.
+        print(f"\nRead the quarantine table before approving: "
+              f"{result.quarantine_count} row(s) were not loaded.")
+    # Built before the heading is printed, so a failure here cannot leave a
+    # "paste this" banner with nothing under it.
+    stanza = _registry_stanza(result.output_root)
+    print("\nTo build from this snapshot, add to config/snapshots.yaml "
+          "under `snapshots:` --\n")
+    print(stanza)
     return 0
 
 
