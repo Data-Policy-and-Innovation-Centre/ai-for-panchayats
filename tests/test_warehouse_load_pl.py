@@ -244,6 +244,11 @@ def test_pl_csv_rejects_conflicting_repeated_plan_across_chunk_boundary(tmp_path
         (lambda row: row.__setitem__("planYear", "2021-22"), FiscalYearError, "fiscal_year"),
         (lambda row: row.__setitem__("totalCost", "not-money"), MoneyParseError, "total_cost"),
         (lambda row: row.__setitem__("activityNsap_old_age_below_eighty_male", "1.5"), PLSchemaError, "integer"),
+        (
+            lambda row: row.__setitem__("activityNsap_old_age_below_eighty_male", "1,2"),
+            PLSchemaError,
+            "grouping",
+        ),
     ],
 )
 def test_pl_csv_fails_closed_on_bad_source_contract(tmp_path: Path, mutator, error, message):
@@ -283,6 +288,70 @@ def test_pl_csv_can_use_constant_context_and_melts_nonzero_nsap(tmp_path: Path):
     assert result["activity_nsap"].loc[0, "beneficiary_count"] == 3
     assert result["activity_nsap"].loc[0, "category"] == "old_age"
     assert result.nsap_empty_asserted is False
+
+
+def test_pl_csv_grouped_and_ungrouped_counts_agree(tmp_path: Path):
+    # "1,000.00" must parse exactly like "1000.00": the grouping check
+    # decides whether the commas are well formed, the integrality check
+    # below it decides whether the value is a count. A grouping pattern
+    # without a decimal tail makes the two disagree and fails closed on
+    # ordinary spreadsheet exports.
+    for text in ("1,000.00", "1000.00", "1,000"):
+        path = tmp_path / f"count-{text.replace(',', '_').replace('.', 'p')}.csv"
+        _write_pl(
+            path,
+            [
+                {
+                    "activityCd": "0007",
+                    "planCode": "P-1",
+                    "planYear": "2021-2022",
+                    "totalCost": "1",
+                    "activityNsap_old_age_below_eighty_male": text,
+                }
+            ],
+            bom=False,
+        )
+        result = load_pl_csv(
+            path, spec=ProvenanceSpec("src", "run", "PL.csv", "PL", gp_code="123")
+        )
+        assert result["activity_nsap"].loc[0, "beneficiary_count"] == 1000, text
+
+
+def test_pl_csv_accepts_lakh_grouped_nsap_count(tmp_path: Path):
+    path = tmp_path / "lakh.csv"
+    _write_pl(
+        path,
+        [
+            {
+                "activityCd": "0007",
+                "planCode": "P-1",
+                "planYear": "2021-2022",
+                "totalCost": "1",
+                "activityNsap_old_age_below_eighty_male": "1,00,000",
+            }
+        ],
+        bom=False,
+    )
+    result = load_pl_csv(path, spec=ProvenanceSpec("src", "run", "PL.csv", "PL", gp_code="123"))
+    assert result["activity_nsap"].loc[0, "beneficiary_count"] == 100_000
+
+
+def test_pl_csv_surfaces_source_provenance_lookalike_columns_as_extensions(tmp_path: Path):
+    path = tmp_path / "provenance-lookalike.csv"
+    row = {**_rows()[0], "row_id": "SOURCE-SUPPLIED-ROW-ID"}
+    _write_pl(path, [row])
+
+    result = load_pl_csv(path, spec=_spec(), chunk_size=1)
+
+    planned = result["planned_activity"]
+    assert planned.loc[0, "row_id"] != "SOURCE-SUPPLIED-ROW-ID"
+
+    extensions = result.unmapped_extensions
+    match = extensions.loc[extensions["extension_name"] == "row_id"]
+    assert len(match) == 1
+    assert match.iloc[0]["raw_value"] == "SOURCE-SUPPLIED-ROW-ID"
+    assert match.iloc[0]["reason_code"] == "unmapped_source_provenance"
+    assert match.iloc[0]["table_name"] == "planned_activity"
 
 
 def test_nonzero_nsap_categories_have_distinct_surrogate_and_lineage_ids(tmp_path: Path):

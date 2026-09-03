@@ -751,12 +751,35 @@ def _parse_money(value: object, *, field: str, row: object | None) -> float | No
     return result
 
 
+# Digit grouping this loader accepts for beneficiary counts, checked BEFORE
+# the commas are stripped. Mirrors load_common._MONEY_GROUPED -- same
+# rationale (stripping commas unconditionally turns "1,2" into 12 and
+# "12,,34" into 1234; both Western and Indian lakh grouping must be accepted
+# because this is Odisha government data). The decimal tail is allowed for
+# the same reason an ungrouped "1000.00" is: the integrality check below
+# decides whether the value is a count, so "1,000.00" and "1000.00" must
+# not disagree.
+_COUNT_GROUPED = re.compile(
+    r"""^[+-]?(?:
+          \d{1,3}(?:,\d{3})*          # 1  123  1,234  12,345,678
+        | \d{1,2}(?:,\d{2})*,\d{3}    # 1,00,000  12,34,567  1,23,45,678
+    )(?:\.\d*)?$""",
+    re.X,
+)
+
+
 def _parse_count(value: object, *, field: str, row: object | None) -> int | None:
     if _is_nullish(value):
         return None
     if isinstance(value, bool):
         raise PLSchemaError(f"{field} at source row {row}: boolean is not a beneficiary count")
-    text = str(value).strip().replace(",", "")
+    text = str(value).strip()
+    if "," in text:
+        if not _COUNT_GROUPED.match(text):
+            raise PLSchemaError(
+                f"{field} at source row {row}: {value!r} has malformed digit grouping"
+            )
+        text = text.replace(",", "")
     try:
         decimal_value = Decimal(text)
     except (InvalidOperation, ValueError) as exc:
@@ -831,16 +854,25 @@ def _resolve_row_values(row: Mapping[str, object], header: Sequence[str]) -> dic
     return values
 
 
-def _source_columns_known() -> frozenset[str]:
-    known = {
+# These names collide with generated provenance columns (see
+# _root_provenance/_child_provenance) but, unlike "source_file", are never
+# read from the source row -- generated provenance always wins. A source CSV
+# that happens to carry a same-named column with real data must not vanish
+# just because the name looks already-handled.
+_PROVENANCE_LOOKALIKE_COLUMNS = frozenset(
+    {
         "source_system",
         "source_run_id",
-        "source_file",
         "schema_version",
         "row_id",
         "source_record_id",
         "source_row_number",
     }
+)
+
+
+def _source_columns_known() -> frozenset[str]:
+    known: set[str] = set()
     for aliases in chain(FIELD_ALIASES.values(), RAW_EXTENSION_ALIASES.values()):
         known.update(aliases)
     return frozenset(known)
@@ -851,6 +883,14 @@ REQUIRED_FIELDS = ("activity_code", "plan_code")
 
 
 def _extension_reason(name: str) -> tuple[str, str, str]:
+    if name.casefold() in _PROVENANCE_LOOKALIKE_COLUMNS:
+        return (
+            "unmapped_source_provenance",
+            "source column shares a name with generated provenance; the "
+            "generated value is authoritative and this source value is not "
+            "consumed",
+            "planned_activity",
+        )
     lowered = name.casefold()
     if "asset" in lowered and "loc" in lowered:
         return (
