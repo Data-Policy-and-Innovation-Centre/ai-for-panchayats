@@ -231,6 +231,45 @@ def test_payload_tree_combines_with_individual_payloads(tmp_path: Path):
     assert (payloads / "LGD_115550_Angarbandha" / "2021_PL.json").is_file()
 
 
+def test_colliding_payload_paths_are_refused_not_silently_overwritten(tmp_path: Path, capsys):
+    """Two trees sharing a relative path must not let one quietly win.
+
+    ``write_payload`` finishes with ``os.replace``, so the second write used
+    to take the target and the first file's bytes simply left the run -- while
+    the audit log still counted both. The manifest would then inventory fewer
+    files than the run claimed to have published, with a green exit to show
+    for it. A raw run publishes each path exactly once.
+    """
+
+    first = _scraper_tree(tmp_path / "a", gps=("LGD_115550_Angarbandha",))
+    second = _scraper_tree(tmp_path / "b", gps=("LGD_115550_Angarbandha",))
+    (second / "LGD_115550_Angarbandha" / "2021_PL.json").write_text('{"data": ["different"]}')
+
+    assert main([
+        "ingest", "--raw-root", str(tmp_path / "raw"), "--source", "egramSwaraj",
+        "--run-id", "run-1", "--payload-tree", str(first), "--payload-tree", str(second),
+    ]) == 2
+    assert "publishes each path once" in capsys.readouterr().err
+    # The staging directory is discarded, so no half-run is left behind.
+    assert not (tmp_path / "raw" / "egramSwaraj" / "run-1").exists()
+
+
+def test_a_payload_colliding_with_a_tree_path_is_refused(tmp_path: Path, capsys):
+    """The sibling path: --payload and --payload-tree write into the same
+    namespace, so the collision is not limited to two trees."""
+
+    tree = _scraper_tree(tmp_path / "tree", gps=("LGD_115550_Angarbandha",))
+    extra = tmp_path / "extra.json"
+    extra.write_text("{}")
+    assert main([
+        "ingest", "--raw-root", str(tmp_path / "raw"), "--source", "egramSwaraj",
+        "--run-id", "run-1",
+        "--payload", f"LGD_115550_Angarbandha/2021_PL.json={extra}",
+        "--payload-tree", str(tree),
+    ]) == 2
+    assert "publishes each path once" in capsys.readouterr().err
+
+
 def test_payload_tree_rejects_a_missing_root(tmp_path: Path, capsys):
     assert main([
         "ingest", "--raw-root", str(tmp_path / "raw"), "--source", "egramSwaraj",

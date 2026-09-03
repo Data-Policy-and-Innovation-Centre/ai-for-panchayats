@@ -127,6 +127,15 @@ run: _require_mode_env
 # SAMPLE_GPS makes the sample the target actually promises. It copies whole
 # GP folders out of the downloaded tree, so the sample is the same bytes, the
 # same layout and the same code path as the real thing -- just 1/1000th of it.
+#
+# Selected with a glob and an array slice rather than `ls | head`, which is a
+# trap under the `pipefail` in .SHELLFLAGS above: on the real 6,794-folder
+# tree `ls` writes more than a pipe buffer, `head` exits at 20, and `ls` dies
+# of SIGPIPE with status 141 -- which pipefail promotes to a recipe failure,
+# so `make sample` fails on exactly the tree it is meant for. A slice consumes
+# the whole listing, so there is no early reader to signal. (Both sort the
+# same way; the glob additionally skips stray non-directories, which `cp -R`
+# would not have wanted anyway.)
 SAMPLE_GPS  ?= 20
 SAMPLE_TREE := data/interim/sample/Gram_Panchayat
 
@@ -134,9 +143,8 @@ sample:
 	@test -d "$(PIPELINE_TREE)" || { \
 	  echo "No scraped tree at $(PIPELINE_TREE); pull it from Box first."; exit 1; }
 	@rm -rf $(SAMPLE_TREE) && mkdir -p $(SAMPLE_TREE)
-	@ls $(PIPELINE_TREE) | head -$(SAMPLE_GPS) | while read gp; do \
-	  cp -R "$(PIPELINE_TREE)/$$gp" $(SAMPLE_TREE)/; \
-	done
+	@shopt -s nullglob; gps=($(PIPELINE_TREE)/*/); \
+	  for gp in "$${gps[@]:0:$(SAMPLE_GPS)}"; do cp -R "$${gp%/}" $(SAMPLE_TREE)/; done
 	@echo "sample: $$(ls $(SAMPLE_TREE) | wc -l | tr -d ' ') GP folders in $(SAMPLE_TREE)"
 
 run-staging: sample

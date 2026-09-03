@@ -22,14 +22,16 @@ from pathlib import Path
 
 from src.deploy.errors import SnapshotError
 from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
-from src.warehouse.conformance import MIN_GP_COVERAGE
+from src.warehouse.conformance import MIN_GP_COVERAGE, check_geography_completeness
 from src.warehouse.geography import GeographyError, gp_geography
 
 # #61 is no longer here: gram_panchayat now carries state/district/block for
-# every GP in the LGD reference tree, and assert_full_state below refuses to
-# pin an artifact that is not the whole roster. Pinning the older externally
-# built artifact, which does have blank geography, means passing
-# --known-exception for it explicitly -- which is the right way round.
+# every GP in the LGD reference tree. Dropping the exception is only honest if
+# something checks, so assert_full_state below verifies the geography is
+# actually populated -- not merely that the row count is right -- and refuses
+# the artifact otherwise. The older externally built artifact, whose geography
+# is blank, is therefore refused rather than pinned with an exception: there
+# is no --known-exception that makes a blank-geography database deployable.
 DEFAULT_EXCEPTIONS = (
     "expenditure/activity_voucher/plan lineage not independently reproduced (#43, #49)",
     "full-state reconciliation baseline not established (#62)",
@@ -123,6 +125,17 @@ def assert_full_state(artifact: Path) -> int:
         actual = conn.execute(
             f"SELECT count(*) FROM {ATTACH_CATALOG}.gram_panchayat"
         ).fetchone()[0]
+        # Row count alone would wave through the exact artifact #61 is named
+        # for: 6,794 rows with every geography column NULL. Since this script
+        # is what drops the #61 exception from the manifest, it has to be what
+        # establishes the exception is really gone.
+        #
+        # Delegated to the conformance check that already defines "geography
+        # is complete" -- columns present, every row populated, district and
+        # block cardinality -- rather than restating a weaker version here.
+        # USE makes its unqualified queries read the attached artifact.
+        conn.execute(f"USE {ATTACH_CATALOG}")
+        geography = check_geography_completeness(conn)
     if not floor <= actual <= expected:
         print(
             f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
@@ -131,6 +144,19 @@ def assert_full_state(artifact: Path) -> int:
             "snapshot, or refresh lgd_codes.json if Odisha's roster really changed.",
             file=sys.stderr,
         )
+        return 1
+    if geography:
+        print(
+            f"error: {artifact} holds {actual:,} gram_panchayat rows but its geography "
+            "is not complete; refusing to pin an artifact that would be published as "
+            "having resolved #61:",
+            file=sys.stderr,
+        )
+        for finding in geography:
+            print(
+                f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
+                file=sys.stderr,
+            )
         return 1
     return 0
 

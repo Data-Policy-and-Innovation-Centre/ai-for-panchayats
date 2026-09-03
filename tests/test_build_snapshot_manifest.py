@@ -8,13 +8,14 @@ reads infra/snapshots/full_state.json, and this script is what writes it.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from scripts.build_snapshot_manifest import DEFAULT_EXCEPTIONS, main
-from warehouse.conformance import EXPECTED_GP_COUNT, MIN_GP_COVERAGE
+from warehouse.conformance import EXPECTED_GP_COUNT, GEOGRAPHY_COLUMNS, MIN_GP_COVERAGE
 from warehouse.geography import gp_geography
 from warehouse.schema import CREATE_ORDER, DDL
 
@@ -124,11 +125,44 @@ def test_an_unreadable_artifact_is_refused_not_traced(tmp_path: Path, capsys):
 
 def test_geography_is_no_longer_a_default_known_exception():
     """#61 is fixed, so an artifact this pipeline builds must stop claiming
-    its geography is blank. Pinning the older externally-built artifact means
-    passing --known-exception explicitly."""
+    its geography is blank. What makes dropping the caveat honest is the guard
+    below, which refuses any artifact whose geography is not actually there --
+    so the older externally-built artifact is refused outright rather than
+    pinned with an exception."""
 
     assert not any("#61" in exception for exception in DEFAULT_EXCEPTIONS)
     assert any("#62" in exception for exception in DEFAULT_EXCEPTIONS)
+
+
+@pytest.mark.parametrize("blank", list(GEOGRAPHY_COLUMNS) + [None])
+def test_a_full_size_build_with_blank_geography_cannot_be_pinned(
+    tmp_path: Path, blank: str | None, capsys,
+):
+    """The #61 artifact itself: the full roster of rows, no geography behind
+    them.
+
+    Row count alone cannot tell it apart from a good build, and this script is
+    what removes the #61 caveat from the manifest -- so pinning it would
+    publish a known-bad database as having resolved the very issue it is the
+    example of. ``blank=None`` nulls every geography column at once (the
+    literal #61 case); the rest null one column at a time, because a
+    hand-picked subset of columns is how #61 passed a green check the first
+    time.
+    """
+
+    artifact = _artifact(tmp_path / "blank.duckdb", FULL_STATE)
+    columns = GEOGRAPHY_COLUMNS if blank is None else (blank,)
+    con = duckdb.connect(str(artifact))
+    try:
+        for column in columns:
+            con.execute(f"UPDATE gram_panchayat SET {column} = NULL")
+    finally:
+        con.close()
+
+    out = tmp_path / "manifest.json"
+    assert _pin(artifact, out) == 1
+    assert "geography is not complete" in capsys.readouterr().err
+    assert not out.exists()
 
 
 # --------------------------------------------------------------------- prod vs staging
@@ -169,3 +203,47 @@ def test_both_mode_registries_exist_and_are_separate_files():
     for name in ("prod", "staging"):
         registry = root / _mode_env(name)["PIPELINE_SNAPSHOTS"]
         assert registry.is_file(), f"{name} registry missing: {registry}"
+
+
+def test_the_sample_recipe_survives_pipefail_on_a_full_size_tree(tmp_path: Path):
+    """`make sample` must not die on the tree it exists for.
+
+    The Makefile sets `.SHELLFLAGS := -euo pipefail`, so any pipeline whose
+    reader stops early takes the recipe down with it: `ls | head -20` over
+    6,794 GP folders writes past the 64KB pipe buffer, `head` exits, and `ls`
+    dies of SIGPIPE with status 141. The sample target would then fail on a
+    real tree while passing on every small fixture.
+
+    The recipe is extracted with `make -n` and run under those exact flags
+    rather than via `make` itself, because `.SHELLFLAGS` only exists in GNU
+    Make >= 3.82 -- on the 3.81 that ships with macOS the recipe runs without
+    pipefail and the bug is invisible.
+
+    400 directories with long names clear the pipe buffer (~75KB of listing),
+    which is the property under test; building all 6,794 would only be slower.
+    """
+
+    tree = tmp_path / "tree"
+    padding = "N" * 180
+    for index in range(400):
+        (tree / f"LGD_{index}{padding}").mkdir(parents=True)
+        (tree / f"LGD_{index}{padding}" / "2021_PL.json").write_text("{}")
+    listing = subprocess.run(
+        ["ls", str(tree)], capture_output=True, text=True, check=True
+    ).stdout
+    assert len(listing) > 64 * 1024, "fixture too small to reach the pipe buffer"
+
+    root = Path(__file__).resolve().parents[1]
+    out = tmp_path / "out"
+    recipe = subprocess.run(
+        ["make", "-n", "sample", f"PIPELINE_TREE={tree}", f"SAMPLE_TREE={out}"],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", recipe], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"sample recipe failed: {result.stderr}"
+    # Whole GP folders, contents intact -- a trailing-slash source would copy
+    # the contents into the sample root instead of the directory itself.
+    assert len(list(out.iterdir())) == 20
+    assert len(list(out.glob("*/2021_PL.json"))) == 20
