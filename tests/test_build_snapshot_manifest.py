@@ -360,11 +360,28 @@ def test_the_dirty_marker_sees_an_untracked_file_but_not_an_ignored_one(tmp_path
     committed Makefile and pass no matter what the file under edit says.
     """
 
+    repo = tmp_path / "repo"
+    _throwaway_repo(Path(__file__).resolve().parents[1], repo)
+
+    assert not _code_sha(repo).endswith("-dirty")
+
+    ignored = repo / ".worktrees" / "agent-x"
+    ignored.mkdir(parents=True)
+    (ignored / "file.py").write_text("x = 1\n")
+    assert not _code_sha(repo).endswith("-dirty"), \
+        "an ignored path must not mark the tree dirty"
+
+    (repo / "src" / "warehouse" / "_untracked_probe.py").write_text("x = 1\n")
+    assert _code_sha(repo).endswith("-dirty"), \
+        "an untracked source file means the tree is not the commit"
+
+
+def _throwaway_repo(root: Path, repo: Path) -> None:
+    """A minimal committed repo carrying the working tree's Makefile."""
+
     import shutil
     import subprocess
 
-    root = Path(__file__).resolve().parents[1]
-    repo = tmp_path / "repo"
     (repo / "src" / "warehouse").mkdir(parents=True)
     (repo / "config").mkdir()
     for name in ("Makefile", ".gitignore"):
@@ -378,17 +395,45 @@ def test_the_dirty_marker_sees_an_untracked_file_but_not_an_ignored_one(tmp_path
     subprocess.run([*git, "add", "-A"], cwd=repo, check=True, capture_output=True)
     subprocess.run([*git, "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True)
 
+
+def test_the_dirty_marker_ignores_a_developers_showUntrackedFiles_setting(tmp_path: Path):
+    """Provenance must not depend on a personal git config.
+
+    `status.showUntrackedFiles=no` makes bare `git status --porcelain` print
+    nothing however many untracked files exist, so the marker would go back
+    to stamping a clean sha over an unadded module -- on that developer's
+    machine only, which is the worst way for it to be wrong.
+    """
+
+    import subprocess
+
+    repo = tmp_path / "repo"
+    _throwaway_repo(Path(__file__).resolve().parents[1], repo)
+    subprocess.run(
+        ["git", "config", "status.showUntrackedFiles", "no"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+    assert not _code_sha(repo).endswith("-dirty")
+    (repo / "src" / "warehouse" / "_untracked_probe.py").write_text("x = 1\n")
+    assert _code_sha(repo).endswith("-dirty")
+
+
+def test_a_git_status_that_fails_is_dirty_not_clean(tmp_path: Path):
+    """Empty output from a *failed* status is not evidence of a clean tree.
+
+    `git status` writing nothing because it could not read the index looks
+    identical to it writing nothing because there is nothing to report. Only
+    one of those means the artifact came from that commit, so the exit status
+    is checked rather than just the output.
+    """
+
+    repo = tmp_path / "repo"
+    _throwaway_repo(Path(__file__).resolve().parents[1], repo)
     assert not _code_sha(repo).endswith("-dirty")
 
-    ignored = repo / ".worktrees" / "agent-x"
-    ignored.mkdir(parents=True)
-    (ignored / "file.py").write_text("x = 1\n")
-    assert not _code_sha(repo).endswith("-dirty"), \
-        "an ignored path must not mark the tree dirty"
-
-    (repo / "src" / "warehouse" / "_untracked_probe.py").write_text("x = 1\n")
-    assert _code_sha(repo).endswith("-dirty"), \
-        "an untracked source file means the tree is not the commit"
+    (repo / ".git" / "index").write_bytes(b"not an index")
+    assert _code_sha(repo).endswith("-dirty")
 
 
 def test_make_run_stamps_real_provenance_on_the_raw_run():
