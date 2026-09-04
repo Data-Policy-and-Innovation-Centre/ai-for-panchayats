@@ -34,6 +34,7 @@ from . import transform
 from .config import WarehouseSettings, load_settings
 from .dimensions import dimension_frames
 from .geography import gp_geography
+from .views import materialize
 from .load import DEFAULT_BATCH_SIZE, insert, read_table
 from .schema import CREATE_ORDER, DDL, RESET_ORDER
 from .select import SelectedSnapshot, resolve_snapshots
@@ -325,6 +326,12 @@ def build_into(
         con.execute("BEGIN TRANSACTION")
         try:
             result = populate(con, selected, batch_size=batch_size)
+            # Inside the same transaction as the load: a warehouse that has
+            # the facts but not the consumer relations is not consumable
+            # (#51), so it must not be publishable either. Built after
+            # populate because every one of them reads the tables it fills.
+            for name, rows in materialize(con).items():
+                result[0][name] = rows
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")

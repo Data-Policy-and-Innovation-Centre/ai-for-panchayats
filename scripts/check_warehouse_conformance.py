@@ -42,6 +42,12 @@ def main(argv: list[str] | None = None) -> int:
              "today (#46, #48, #129), and folding the two together meant no real build "
              "ever checked its own scale",
     )
+    parser.add_argument(
+        "--skip-derived", action="store_true",
+        help="omit the consumer relations v_activity/v_asset/... (#51), for synthetic "
+             "fixtures. A real build should not skip this: the chatbot queries these "
+             "and nothing else, so a warehouse without them is not consumable",
+    )
     args = parser.parse_args(argv)
 
     if not args.database.exists():
@@ -50,8 +56,10 @@ def main(argv: list[str] | None = None) -> int:
 
     con = duckdb.connect(str(args.database), read_only=True)
     try:
-        findings = check_conformance(con, skip_reconciliation=args.skip_reconciliation,
-                             skip_geography=args.skip_geography)
+        findings = check_conformance(
+            con, skip_reconciliation=args.skip_reconciliation,
+            skip_geography=args.skip_geography, skip_derived=args.skip_derived,
+        )
     finally:
         con.close()
 
