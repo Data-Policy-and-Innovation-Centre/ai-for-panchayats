@@ -64,7 +64,21 @@ def relation_names() -> tuple[str, ...]:
     return names
 
 
-def materialize(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+# Which relations are stored, and which are left for the consumer to create
+# as views at runtime. `ensure_views()` skips any name that already exists as
+# a table, so a subset is coherent: the stored ones shadow the view, the rest
+# behave exactly as they do today.
+#
+# Set by measurement, not taste -- see the size/latency table in #51. Override
+# with the `relations` argument to compare variants.
+STORED_BY_DEFAULT: tuple[str, ...] = (
+    "v_exp", "v_approval", "v_activity", "v_asset", "v_plan", "v_progress", "v_voucher",
+)
+
+
+def materialize(
+    con: duckdb.DuckDBPyConnection, relations: tuple[str, ...] | None = None,
+) -> dict[str, int]:
     """Build every v_* relation as a table, in dependency order.
 
     Returns row counts per relation. Executed as one script rather than
@@ -73,11 +87,22 @@ def materialize(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     inside these definitions.
     """
 
-    names = relation_names()
+    stored = set(STORED_BY_DEFAULT if relations is None else relations)
+    unknown = stored - set(relation_names())
+    if unknown:
+        raise ViewDefinitionError(f"not defined in {VIEW_DDL_PATH.name}: {sorted(unknown)}")
+
     # The only edit made to the vendored DDL, so that what runs stays
-    # diffable against the consumer's copy.
-    con.execute(_CREATE_VIEW.sub(lambda m: f"CREATE TABLE {m.group(1)} AS", _ddl()))
+    # diffable against the consumer's copy. A relation that is not stored is
+    # still created -- as a view -- because the stored ones are defined in
+    # terms of it; DuckDB persists the view definition, and the consumer's
+    # ensure_views() leaves it alone.
+    def rewrite(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return f"CREATE TABLE {name} AS" if name in stored else f"CREATE VIEW {name} AS"
+
+    con.execute(_CREATE_VIEW.sub(rewrite, _ddl()))
     return {
         name: con.execute(f"SELECT count(*) FROM {name}").fetchone()[0]  # noqa: S608
-        for name in names
+        for name in relation_names() if name in stored
     }
