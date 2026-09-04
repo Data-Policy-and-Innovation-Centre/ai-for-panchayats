@@ -134,7 +134,10 @@ def connect(db_path: Path, views_sql: str | None, *, memory_limit: str,
     _attach(con, db_path, DATA_ALIAS)
     if materialized is not None:
         _attach(con, materialized, "built")
-        # `built` first: a stored v_activity shadows the view of the same name.
+        # `built` first, so its relations win over the in-memory ones of the
+        # same name. Precedence, not storage: `v_activity` is itself a view
+        # there (it adds days_since_sanction, which must not be frozen at
+        # build time), and it still shadows the in-memory definition.
         con.execute(f"SET search_path = 'built.main,memory.main,{DATA_ALIAS}.main'")
         return con
     con.execute(f"SET search_path = 'memory.main,{DATA_ALIAS}.main'")
