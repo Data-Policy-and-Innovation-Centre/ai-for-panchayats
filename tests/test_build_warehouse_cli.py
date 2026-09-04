@@ -13,10 +13,18 @@ real subprocess with no inherited ``PYTHONPATH``, exactly as a user would.
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+
+from scripts import build_warehouse
+from src.warehouse.dimensions import DimensionError
+from src.warehouse.geography import GeographyError
+from src.warehouse.select import SelectionError
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,3 +69,34 @@ def test_cli_unknown_snapshot_id_exits_controlled_not_traceback():
     assert result.returncode == 2
     assert "unknown approved snapshot: does-not-exist" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("error", "why"),
+    [
+        (SelectionError, "a bad snapshot selection"),
+        (GeographyError, "an LGD reference tree that is missing or malformed"),
+        (DimensionError, "a code dictionary that is missing or malformed"),
+    ],
+)
+def test_a_preflight_failure_exits_two_without_a_traceback(monkeypatch, error, why):
+    """The three ways a build can refuse to start must agree.
+
+    Each is raised before any DuckDB file is touched, so each should report
+    its own diagnostic and exit 2. `DimensionError` was the odd one out --
+    the loader was added without being added here, so a missing or malformed
+    dimension CSV reached the documented
+    `uv run python scripts/build_warehouse.py build ...` as a traceback and
+    exit 1. Parametrized rather than written once for the new case, because
+    the defect was a divergence between siblings, and only a test over all
+    three catches the next one.
+    """
+
+    def refuse(**kwargs):
+        raise error(f"cannot start: {why}")
+
+    monkeypatch.setattr(build_warehouse, "build", refuse)
+    args = argparse.Namespace(
+        snapshot_id=["any"], database=None, no_validate=True,
+    )
+    assert build_warehouse.cmd_build(args) == 2

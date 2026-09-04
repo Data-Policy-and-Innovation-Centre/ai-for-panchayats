@@ -489,10 +489,19 @@ DDL: dict[str, str] = {
     # No primary key: the spec gives none for this lookup (unlike dim_code
     # and dim_welfare_scheme, which do). Taken at face value rather than
     # inventing one.
+    # focus_area -> LSDG theme is many-to-many in the source: 9 of the 17
+    # focus areas carry activities under more than one theme. The reference
+    # file records a single theme per focus area, so this table is a
+    # *reduction*, and `distinct_themes` is what says so -- 3 for Sanitation,
+    # 1 for Roads. Carried for the same reason dim_code carries source and
+    # confidence: a consumer presenting a label must be able to tell a clean
+    # mapping from a collapsed one. `source_rows` is the support behind it.
     "dim_lsdg_theme": """
         CREATE TABLE dim_lsdg_theme (
             focus_area_name VARCHAR,
-            lsdg_theme      VARCHAR
+            lsdg_theme      VARCHAR,
+            distinct_themes INTEGER,
+            source_rows     INTEGER
         )""",
     # Rows rejected by a foreign key, a uniqueness rule, or a missing
     # identity field, with the reason. Nothing is discarded silently; every
