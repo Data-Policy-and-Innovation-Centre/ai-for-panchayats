@@ -153,6 +153,150 @@ def test_truncated_snapshot_missing_a_kind_is_rejected(tmp_path: Path):
         resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
 
 
+def test_two_partial_snapshots_whose_union_is_complete_are_accepted(tmp_path: Path):
+    """Completeness is a property of the BUILD, not of every contributor.
+
+    The kind check used to sit inside the per-snapshot loop, which read as
+    "each snapshot must carry all five kinds". That is stronger than the
+    design intends -- `build_warehouse.py` accepts repeated --snapshot-id and
+    `build._merge_gram_panchayat` merges contributions across snapshots -- and
+    it made a single-source snapshot illegal. Adding any new kind (gp_profile
+    for #123, voucher for #129) would then have retroactively invalidated
+    every snapshot already approved, including the full-state one production
+    is about to serve.
+
+    The split here is along a legal line: `aa`/`ta`/`pp` stay with the `pl`
+    they are filtered against (see the co-location guard below), and `re`,
+    which is filtered against nothing, travels alone.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_RE.json": {"data": [{"planYear": "2021"}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL", "AA", "TA", "PP"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"RE"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+    )
+
+    # Neither is complete alone -- proven, not assumed, so this cannot pass by
+    # both snapshots happening to carry everything.
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-a",), registry=spec_registry)
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-b",), registry=spec_registry)
+
+    resolved = resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+    assert len(resolved) == 2
+    covered = {name for snapshot in resolved for name in snapshot.tables}
+    assert {"pl", "aa", "ta", "pp", "re"} <= covered
+
+
+def test_a_selection_whose_union_is_still_incomplete_is_rejected(tmp_path: Path):
+    """The guarantee is unchanged: a build cannot be missing a source kind.
+
+    Two snapshots that are each individually legal but between them still lack
+    `re` must fail, or lifting the check out of the loop would have weakened
+    it into nothing.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 8, "totalCost": 100}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL", "AA", "TA", "PP"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"PL"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+    )
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+
+def test_approvals_without_their_own_pl_are_refused_not_quarantined(tmp_path: Path):
+    """The co-location guard, and why it is a guard rather than a feature.
+
+    `build.populate` walks snapshots one at a time and filters approvals and
+    progress against the activities THIS snapshot's `pl` produced. A snapshot
+    carrying `aa`/`ta`/`pp` without a `pl` therefore has every one of those
+    rows quarantined as an orphan -- and quarantine is not a build failure, so
+    the warehouse would publish with those facts silently missing.
+
+    Lifting the per-snapshot kind check (above) made that arrangement legal to
+    select for the first time, so it has to be refused explicitly. Failing at
+    selection, before any DuckDB file is touched, is the loud version of a
+    hole that is otherwise silent. Making the loader order-independent instead
+    is #161.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 7}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL", "TA", "PP", "RE"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"AA"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+    )
+    with pytest.raises(SelectionError, match="no 'pl' rows"):
+        resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+
+def test_approvals_with_a_declared_but_empty_pl_are_refused_too(tmp_path: Path):
+    """Presence is not the test; rows are.
+
+    The normalizer writes a schema-correct EMPTY table for every kind that
+    was requested, so a snapshot scraped as `--kinds PL,AA` that found no
+    plans still declares `pl`. A presence-only guard waves that through, and
+    `populate` then derives an empty activity_codes set from it and
+    quarantines every approval -- the exact outcome the guard exists to
+    prevent, reached by a different route.
+
+    The sibling case is asserted in the same test on purpose: a *declared but
+    empty* aa has no rows to orphan, so tightening this must not start
+    refusing it. A guard that fires on both pins nothing.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    # `pl` is requested here and yields nothing: declared, empty, and useless
+    # to the `aa` rows alongside it.
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 7}]},
+    })
+    run_c = publish_raw_run(tmp_path, "run-c", {
+        "LGD_123_Test_GP/2021_TA.json": {"data": []},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL", "TA", "PP", "RE"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"PL", "AA"})
+    normalize(run_c, settings.canonical_root, chunk_size=100, kinds={"PL", "TA", "AA"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+        approved("snap-c", "egramSwaraj", "run-c"),
+    )
+    with pytest.raises(SelectionError, match=r"snapshot 'snap-b'.*no 'pl' rows"):
+        resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+    # snap-c: empty pl AND empty aa/ta. Nothing to orphan, so it must resolve.
+    assert len(resolve_snapshots(settings, ("snap-a", "snap-c"), registry=spec_registry)) == 2
+
+
 def test_snapshot_with_all_kinds_explicitly_empty_is_still_accepted(tmp_path: Path):
     """A kind requested but producing zero rows is not the same as a kind
     never requested -- this must still resolve cleanly."""
