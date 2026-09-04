@@ -98,6 +98,90 @@ def test_a_full_state_build_is_pinned(tmp_path: Path, gp_count: int):
     assert out.exists()
 
 
+def test_a_full_size_build_with_swapped_geography_cannot_be_pinned(tmp_path: Path, capsys):
+    """Right shape, wrong rows: the failure cardinality cannot see.
+
+    Two GPs in different districts trade their geography. Every column is
+    still populated, the district and block counts are unchanged, and the row
+    count is exactly the roster -- so the coverage band and
+    check_geography_completeness both pass. This is the shape a join on
+    `gp_name` produces, and 505 GP names are shared, so it is not
+    hypothetical (#136).
+    """
+
+    artifact = _artifact(tmp_path / "swapped.duckdb", FULL_STATE)
+    con = duckdb.connect(str(artifact))
+    try:
+        pair = con.execute(
+            "SELECT gp_lgd_code, district_code, zp_name, block_code, block_name "
+            "FROM gram_panchayat ORDER BY zp_name LIMIT 1"
+        ).fetchall() + con.execute(
+            "SELECT gp_lgd_code, district_code, zp_name, block_code, block_name "
+            "FROM gram_panchayat ORDER BY zp_name DESC LIMIT 1"
+        ).fetchall()
+        (first, *first_geo), (second, *second_geo) = pair
+        assert first_geo != second_geo, "fixture needs two GPs in different districts"
+        for code, geo in ((first, second_geo), (second, first_geo)):
+            con.execute(
+                "UPDATE gram_panchayat SET district_code = ?, zp_name = ?, "
+                "block_code = ?, block_name = ? WHERE gp_lgd_code = ?",
+                [*geo, code],
+            )
+    finally:
+        con.close()
+
+    assert _pin(artifact, tmp_path / "out.json") == 1
+    stderr = capsys.readouterr().err
+    assert "disagrees with the LGD reference tree" in stderr
+    # Two rows are wrong, each on four columns. Counting the columns would
+    # report eight, and on a stale-tree artifact would report six times the
+    # table's own row count.
+    assert "has 2 gram_panchayat row(s)" in stderr
+    assert first in stderr or second in stderr
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_a_missing_geography_column_is_named_not_raised_as_a_binder_error(
+    tmp_path: Path, capsys,
+):
+    """The mapping check must not mask conformance's own columns finding.
+
+    Selecting the six geography columns from an artifact that lacks one is a
+    binder error, and it would be reported through the catch-all in main() as
+    "cannot read <artifact>" -- blaming the file rather than naming the
+    missing column. So the row comparison only runs once completeness passes.
+    """
+
+    # Built without the column rather than altered afterwards: the foreign
+    # keys pointing at gram_panchayat make DROP COLUMN a DependencyException.
+    artifact = tmp_path / "no-zp-name.duckdb"
+    con = duckdb.connect(str(artifact))
+    try:
+        for table in CREATE_ORDER:
+            ddl = DDL[table]
+            if table == "gram_panchayat":
+                ddl = ddl.replace("zp_name       VARCHAR,", "", 1)
+                assert "zp_name" not in ddl, "DDL changed; this fixture no longer drops it"
+            con.execute(ddl)
+        con.executemany(
+            "INSERT INTO gram_panchayat (gp_lgd_code, gp_name, state_code, state_name, "
+            "district_code, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (code, f"GP {code}", geo["state_code"], geo["state_name"],
+                 geo["district_code"], geo["block_code"], geo["block_name"])
+                for code, geo in gp_geography().items()
+            ],
+        )
+    finally:
+        con.close()
+
+    assert _pin(artifact, tmp_path / "out.json") == 1
+    stderr = capsys.readouterr().err
+    assert "Binder Error" not in stderr
+    assert "zp_name" in stderr
+    assert not (tmp_path / "out.json").exists()
+
+
 def test_the_roster_size_agrees_with_the_conformance_literal():
     """Two sources of truth, deliberately: this guard derives the roster size
     from lgd_codes.json, while conformance carries an independent literal

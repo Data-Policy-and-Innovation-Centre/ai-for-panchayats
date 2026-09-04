@@ -23,7 +23,7 @@ from pathlib import Path
 from src.deploy.errors import SnapshotError
 from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
 from src.warehouse.conformance import MIN_GP_COVERAGE, check_geography_completeness
-from src.warehouse.geography import GeographyError, gp_geography
+from src.warehouse.geography import GEOGRAPHY_COLUMNS, GeographyError, gp_geography
 
 # #61 is no longer here: gram_panchayat now carries state/district/block for
 # every GP in the LGD reference tree. Dropping the exception is only honest if
@@ -74,6 +74,47 @@ def _known_exceptions(args: argparse.Namespace) -> tuple[str, ...]:
     if args.known_exceptions is None:
         return DEFAULT_EXCEPTIONS
     return tuple(args.known_exceptions)
+
+
+MISMATCHES_SHOWN = 5
+
+
+def _geography_mismatches(rows: list[tuple], lookup) -> dict[str, list[str]]:
+    """GP code -> what disagrees with the LGD reference tree, per row.
+
+    Keyed by row rather than returned flat so the caller can say how many
+    *rows* are wrong: one swapped GP disagrees on four columns at once, and
+    counting those separately would report a 6,794-row table as having
+    40,764 bad rows.
+
+    Cardinality is not correctness. ``check_geography_completeness`` proves
+    every column is populated and that the artifact has ~30 districts and
+    ~314 blocks -- all of which a build that joined on ``gp_name`` instead of
+    ``gp_lgd_code`` would also satisfy, while handing 505 GPs that share a
+    name to the wrong district (#136).
+
+    This compares against the same tree the build read, so it establishes
+    faithful *transfer*, not ground truth -- nothing here can tell you the
+    LGD file itself is right. What it does catch is an artifact whose
+    geography did not come from this tree by this code: a mis-keyed join, a
+    column shifted by one, a build from a stale reference, or an externally
+    produced database being pinned as though our pipeline had made it.
+    """
+
+    mismatches: dict[str, list[str]] = {}
+    for code, *values in rows:
+        expected = lookup.get(code)
+        if expected is None:
+            mismatches[code] = ["not in the LGD reference tree"]
+            continue
+        wrong = [
+            f"{column} is {value!r}, tree says {expected[column]!r}"
+            for column, value in zip(GEOGRAPHY_COLUMNS, values)
+            if value != expected[column]
+        ]
+        if wrong:
+            mismatches[code] = wrong
+    return mismatches
 
 
 def assert_full_state(artifact: Path) -> int:
@@ -136,6 +177,15 @@ def assert_full_state(artifact: Path) -> int:
         # USE makes its unqualified queries read the attached artifact.
         conn.execute(f"USE {ATTACH_CATALOG}")
         geography = check_geography_completeness(conn)
+        # Cardinality says the shape is right; the row comparison below says
+        # the rows are. Only reached once completeness has passed: selecting
+        # these columns from an artifact that is missing one raises a binder
+        # error, which would mask conformance's own geography.columns finding
+        # with a stack-shaped message about the wrong thing.
+        geography_rows = [] if geography else conn.execute(
+            "SELECT gp_lgd_code, " + ", ".join(GEOGRAPHY_COLUMNS)
+            + f" FROM {ATTACH_CATALOG}.gram_panchayat"
+        ).fetchall()
     if not floor <= actual <= expected:
         print(
             f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
@@ -157,6 +207,19 @@ def assert_full_state(artifact: Path) -> int:
                 f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
                 file=sys.stderr,
             )
+        return 1
+    mismatches = _geography_mismatches(geography_rows, gp_geography())
+    if mismatches:
+        print(
+            f"error: {artifact} has {len(mismatches):,} gram_panchayat row(s) whose "
+            "geography disagrees with the LGD reference tree; refusing to pin an "
+            "artifact whose place mapping this pipeline did not produce:",
+            file=sys.stderr,
+        )
+        for code in sorted(mismatches)[:MISMATCHES_SHOWN]:
+            print(f"  {code}: {'; '.join(mismatches[code])}", file=sys.stderr)
+        if len(mismatches) > MISMATCHES_SHOWN:
+            print(f"  ... and {len(mismatches) - MISMATCHES_SHOWN:,} more", file=sys.stderr)
         return 1
     return 0
 
