@@ -74,7 +74,31 @@ def test_failed_terminal_run_is_integrity_valid_but_not_approvable(tmp_path: Pat
 
 
 def test_snapshot_registry_has_only_approved_entries():
-    assert load_snapshot_registry(Path(__file__).parents[1] / "config" / "snapshots.yaml").snapshots == ()
+    """What the name says, rather than that the registry is empty.
+
+    It asserted `== ()` because it was written when no snapshot had been
+    approved yet. That made the first real approval fail CI for the wrong
+    reason -- an empty registry is a starting state, not an invariant.
+
+    Being precise about what each half pins: `load_snapshot_registry` already
+    raises SnapshotRegistryError on a non-approved entry, so the status
+    assertion below is unreachable defence-in-depth and would only start
+    doing work if that refusal were ever relaxed. The duplicate-id check is
+    the half that adds coverage -- nothing else rejects two entries sharing
+    a snapshot_id, and `--snapshot-id` would then silently pick one of them.
+    """
+
+    registry = load_snapshot_registry(
+        Path(__file__).parents[1] / "config" / "snapshots.yaml"
+    )
+    assert all(spec.status == "approved" for spec in registry.snapshots), [
+        (spec.snapshot_id, spec.status) for spec in registry.snapshots
+        if spec.status != "approved"
+    ]
+    ids = [spec.snapshot_id for spec in registry.snapshots]
+    # A duplicated id would make `--snapshot-id` ambiguous, and the build
+    # would silently pick one of two runs.
+    assert len(ids) == len(set(ids)), ids
 
 
 def test_file_like_payloads_are_streamed_in_bounded_chunks(tmp_path: Path):
