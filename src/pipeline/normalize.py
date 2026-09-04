@@ -6,6 +6,7 @@ contract and currently implements the eGramSwaraj JSON shape only.
 
 from __future__ import annotations
 
+import csv
 import json
 import hashlib
 import os
@@ -21,7 +22,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .manifest import ManifestError, RunManifest, approve_run
+from .manifest import ManifestError, RunManifest, approve_run, load_manifest
 
 KNOWN_ENVELOPE_KEYS = frozenset({"data", "response", "result", "records", "rows"})
 SUPPORTED_KINDS = frozenset({"PL", "AA", "TA", "PP", "RE"})
@@ -31,6 +32,18 @@ KIND_RE = re.compile(
     r"(?i)(?P<year>\d{4}(?:-\d{2,4})?)[_-](?P<kind>PL|AA|TA|PP|RE)(?:$|[_-])"
 )
 GP_RE = re.compile(r"^LGD[_-]?(?P<code>\d+)[_-](?P<name>.+)$", re.IGNORECASE)
+# Flat reference extracts, each published as its own raw run: one CSV, one
+# canonical table, no per-GP folder tree and no fiscal year in the filename.
+# Keyed by the raw run's `source` -- the same field the snapshot registry
+# records -- so `normalize_run` picks the lane without a new CLI flag and
+# without either lane having to sniff the other's payloads.
+#
+# The value is (source_kind, key_column). The key column stands in for the
+# JSON lane's business id: these files carry no activityCd, and identity has
+# to follow the row's own key rather than its line number (#110).
+FLAT_CSV_SOURCES: dict[str, tuple[str, str]] = {
+    "egramswaraj_profile": ("PROFILE", "basic_info_lgd"),
+}
 ID_KEYS = ("activityCd", "activity_cd", "activityId", "activity_id", "id")
 PROVENANCE_COLUMNS = (
     "row_id", "parent_row_id", "pos", "source_system", "source_run_id",
@@ -916,7 +929,143 @@ def normalize_egramswaraj(
     )
 
 
-def normalize_run(*args: Any, **kwargs: Any) -> NormalizationResult:
-    """Stable generic entry point; eGramSwaraj is the first supported source."""
+def normalize_flat_csv(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    source_kind: str,
+    key_column: str,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize a validated one-row-per-entity CSV run into an atomic Parquet tree.
 
-    return normalize_egramswaraj(*args, **kwargs)
+    A second lane rather than a CSV mode bolted onto the JSON one. Nothing
+    the JSON lane does applies here: there is no `LGD_<code>_<name>` folder to
+    parse a GP out of, no fiscal year in the filename, no envelope to unwrap
+    and no nested child arrays to recurse into. What the two lanes do share is
+    the *output* contract -- the same provenance columns, the same atomic
+    publication, the same canonical manifest -- and that is the half a
+    snapshot has to honour.
+
+    The rows are held in memory rather than streamed. These extracts are one
+    row per entity, so the ceiling is the number of GPs in Odisha (6,794 x 99
+    string columns, ~3 MB on disk); the JSON lane's chunked multi-table budget
+    exists for a 204,000-file walk and would be machinery with nothing to do
+    here. `chunk_size` still bounds the part files that get written.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    csv_paths = sorted(payload_root.rglob("*.csv"))
+    if len(csv_paths) != 1:
+        # Not a convenience restriction. Two CSVs in one run would share a
+        # run_id and a canonical table, so their rows would be
+        # indistinguishable in provenance and their identities could collide.
+        raise NormalizationError(
+            f"a flat-CSV run must publish exactly one .csv payload; "
+            f"{payload_root} has {len(csv_paths)}"
+        )
+    csv_path = csv_paths[0]
+    source_file = csv_path.relative_to(payload_root).as_posix()
+    table_name = source_kind.lower()
+
+    rows: list[dict[str, Any]] = []
+    identity_counts: dict[str, int] = {}
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or key_column not in reader.fieldnames:
+            raise NormalizationError(
+                f"{source_file} has no {key_column!r} column; "
+                f"found {list(reader.fieldnames or ())}"
+            )
+        for record in reader:
+            # A blank key is not an error here -- 84 of the profile rows carry
+            # one, and they must reach the warehouse's quarantine rather than
+            # be dropped where nothing counts them. `_record_identity` falls
+            # back to content, so they still get distinct row_ids.
+            business_id = (record.get(key_column) or "").strip() or None
+            identity = _record_identity(record, business_id)
+            occurrence = identity_counts.get(identity, 0)
+            identity_counts[identity] = occurrence + 1
+            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
+            root_key = hashlib.sha256("|".join(
+                (manifest.source, source_kind, source_file, "", "", identity_key)
+            ).encode("utf-8")).hexdigest()
+            row = _flatten_scalars(record)
+            row.update(_provenance(
+                manifest=manifest, source_file=source_file, source_kind=source_kind,
+                year=None, gp_code=None, gp_name=None, row_id=root_key,
+                source_record_id=root_key, parent_row_id=None, pos=None,
+                business_id=business_id,
+            ))
+            rows.append(row)
+
+    types = dict(PROVENANCE_SCHEMA)
+    _merge_table_types(types, rows)
+    schema = _arrow_schema(types)
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+    with AtomicParquetPublication(destination) as publication:
+        # No fiscal-year partitioning: the source has no fiscal year, so every
+        # row would land in one `fiscal_year-unknown` directory that says
+        # nothing and reads as missing data rather than as inapplicable.
+        paths = publication.write_rows(
+            table_name, rows, chunk_size=chunk_size, schema=schema,
+            partition_by_fiscal_year=False,
+        ) or publication.write_empty(table_name, schema)
+        canonical = {
+            "source": manifest.source,
+            "run_id": manifest.run_id,
+            "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+            "raw_manifest_identity": {
+                "source": manifest.source, "run_id": manifest.run_id,
+                "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+            },
+            "schema_version": manifest.schema_version,
+            "tables": {
+                table_name: {
+                    "row_count": len(rows),
+                    "files": [
+                        _canonical_file_record(publication.staging_root, path)
+                        for path in paths
+                    ],
+                },
+            },
+            "quarantine_count": 0,
+            "terminal_state": "complete",
+        }
+        publication.write_canonical_manifest(canonical)
+        validate_canonical_manifest(publication.staging_root)
+        publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), len(rows), 0,
+    )
+
+
+def normalize_run(
+    run_path: str | Path, output_root: str | Path, **kwargs: Any,
+) -> NormalizationResult:
+    """Stable generic entry point; the raw run's own `source` picks the lane.
+
+    Dispatching on the manifest rather than on a CLI flag keeps the choice
+    where it cannot be got wrong: a run published as `egramswaraj_profile`
+    cannot be normalized as if it were the JSON scrape, whatever the caller
+    passes. Reading the manifest twice (here and again inside the lane) is
+    cheap next to the walk that follows.
+    """
+
+    source = load_manifest(run_path).source.casefold()
+    flat = FLAT_CSV_SOURCES.get(source)
+    if flat is None:
+        return normalize_egramswaraj(run_path, output_root, **kwargs)
+    source_kind, key_column = flat
+    kwargs.pop("kinds", None)
+    return normalize_flat_csv(
+        run_path, output_root, source_kind=source_kind, key_column=key_column, **kwargs,
+    )

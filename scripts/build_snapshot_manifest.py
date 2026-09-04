@@ -125,7 +125,7 @@ def assert_full_state(artifact: Path) -> int:
     it. So this is where a sample has to be stopped.
 
     It has to be stopped somewhere, because a 20-GP smoke build is otherwise
-    indistinguishable from a full one -- same 19 tables, same schema, same
+    indistinguishable from a full one -- same tables, same schema, same
     green conformance run -- and the result would be a chatbot answering
     statewide questions from 0.3% of the data. The prod/staging env files
     make the right thing easy; they are a convenience, and a convenience can

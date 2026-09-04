@@ -15,7 +15,9 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from warehouse.build import BuildResult, build
+from src.pipeline.manifest import RunPublisher
+from src.pipeline.normalize import normalize_run
+from warehouse.build import BuildResult, build, create_schema
 from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
 from warehouse.transform import RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
@@ -703,3 +705,160 @@ def test_geography_reaches_the_built_table(tmp_path: Path):
     finally:
         con.close()
     assert row == [("115550", "Angarbandha", "21", "Odisha", "303", "Anugul", "3639", "Anugul")]
+
+
+# --------------------------------------------------------------------- gp_profile (#123)
+
+PROFILE_COLUMNS = (
+    "basic_info_lgd,param__gp_name,"
+    "demographic_details_total_gender_wise_population,"
+    "demographic_details_male_population,demographic_details_female_population,"
+    "demographic_details_transgender_population,demographic_details_children_population,"
+    "demographic_details_sc_population,demographic_details_st_population,"
+    "demographic_details_obc_population,demographic_details_general_population,"
+    "general_no_of_households"
+)
+
+
+def _profile_snapshot(tmp_path: Path, settings, run_id: str, body: str, *,
+                       columns: str = PROFILE_COLUMNS) -> None:
+    """Publish and normalize a profile CSV run into the build's canonical root."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", run_id) as publisher:
+        publisher.write_payload(
+            "eGramSwaraj_panchayat_master.csv", f"{columns}\n{body}".encode(),
+        )
+        run = publisher.publish()
+    normalize_run(run, settings.canonical_root)
+
+
+# GP 123 is the one `_pl_aa_run` scrapes, so it resolves; 999 does not exist
+# in gram_panchayat, and the third row carries no key at all -- the shape of
+# the 84 profile-less rows in the real extract.
+PROFILE_BODY = (
+    "123,Test GP,900,450,440,10,200,100,150,300,350,210\n"
+    "999,Ghost GP,10,5,5,0,1,1,1,1,7,3\n"
+    ",Unfilled GP,,,,,,,,,,"
+)
+
+
+def test_gp_profile_loads_and_both_kinds_of_bad_row_are_quarantined(tmp_path: Path):
+    """The three outcomes a profile row can have, in one build (#123).
+
+    Loaded, orphaned, or unkeyed -- and the last two are told apart on
+    purpose. An unkeyed row is a GP whose profile was never filled in (84 of
+    them upstream, which collide on the empty string and break the primary
+    key if let through); an orphan is a GP the scrape never saw. Both are
+    countable in the quarantine table rather than filtered away where nothing
+    would notice the source shrinking.
+    """
+
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(tmp_path, settings, "profile-1", PROFILE_BODY)
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("profile-1", "egramswaraj_profile", "profile-1"),
+    )
+
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings, registry=spec_registry,
+    )
+    assert result.counts["gp_profile"] == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT gp_lgd_code, total_population, households FROM gp_profile"
+        ).fetchall() == [("123", 900, 210)]
+        # Zero orphans: every loaded code resolves against the dimension.
+        assert con.execute(
+            "SELECT count(*) FROM gp_profile p"
+            " LEFT JOIN gram_panchayat g USING (gp_lgd_code) WHERE g.gp_lgd_code IS NULL"
+        ).fetchone()[0] == 0
+        reasons = dict(con.execute(
+            "SELECT reason_code, sum(row_count) FROM quarantine"
+            " WHERE table_name = 'gp_profile' GROUP BY reason_code"
+        ).fetchall())
+        assert reasons == {"missing_key": 1, "orphan_reference": 1}
+    finally:
+        con.close()
+
+
+def test_gp_profile_resolves_its_key_whichever_order_the_snapshots_are_listed(tmp_path: Path):
+    """The profile load must not depend on which snapshot is processed first.
+
+    gp_profile has a FOREIGN KEY to gram_panchayat, which every scrape
+    snapshot contributes to. Loading it inside the per-snapshot loop would
+    mean that listing the profile snapshot first quarantined every row as an
+    orphan -- and the build would still finish green, because quarantining is
+    not a failure. That is #161's defect, and this pins that gp_profile does
+    not reintroduce it.
+    """
+
+    counts = {}
+    for order in (("snap-1", "profile-1"), ("profile-1", "snap-1")):
+        root = tmp_path / "-".join(order)
+        root.mkdir()
+        settings, _ = _build_settings_and_registry(root)
+        _profile_snapshot(root, settings, "profile-1", PROFILE_BODY)
+        result = build(
+            snapshot_ids=order, settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )
+        counts[order] = result.counts["gp_profile"]
+    assert counts[("snap-1", "profile-1")] == counts[("profile-1", "snap-1")] == 1
+
+
+def test_unfiltered_profile_rows_are_rejected_by_the_schema(tmp_path: Path):
+    """The trap the filtering exists to avoid, proven rather than asserted.
+
+    #123 recorded this as a primary-key collision: 84 blank-key rows all
+    become '' and 83 of them duplicate the first. With the FOREIGN KEY to
+    gram_panchayat in place the schema is stricter than that -- the *first*
+    blank row is already rejected, because '' is not a GP -- so all 84 fail,
+    not 83. Both refusals are asserted below, in that order, because relaxing
+    either one on its own still leaves the other standing and the comment
+    alone would not say so.
+    """
+
+    con = duckdb.connect(str(tmp_path / "trap.duckdb"))
+    try:
+        create_schema(con)
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
+        with pytest.raises(duckdb.ConstraintException, match="foreign key"):
+            con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+
+        # And behind the FK, the collision #123 described.
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('', NULL)")
+        con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+        with pytest.raises(duckdb.ConstraintException, match="[Pp]rimary key|unique"):
+            con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+    finally:
+        con.close()
+
+
+def test_gp_profile_fails_the_build_when_a_population_column_is_renamed(tmp_path: Path):
+    """An all-NULL demographics table would pass every other check.
+
+    Right row count, valid primary key, zero orphans -- and every population
+    null. `_first_present(..., required=True)` is what turns an upstream
+    rename into a stopped build instead of a silently empty one.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1", "123,Test GP,900,210",
+        columns="basic_info_lgd,param__gp_name,"
+                "demographic_details_total_population,general_no_of_households",
+    )
+    with pytest.raises(RequiredFieldUnresolved, match="total_population"):
+        build(
+            snapshot_ids=("snap-1", "profile-1"), settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )

@@ -62,21 +62,28 @@ class Finding:
 # THE SPECIFICATION -- authoritative constants, easy to update in one place.
 # ---------------------------------------------------------------------------
 
-# Section 1: exactly these 19 tables must exist.
+# Section 1: exactly these tables must exist -- the spec's 19 plus gp_profile.
+# The count is deliberately not written into the check messages below: it
+# has drifted once already, and this set is the only place that should
+# have to change when it drifts again.
 EXPECTED_TABLES: frozenset[str] = frozenset({
     "gram_panchayat", "plan", "planned_activity", "activity_delegation",
     "activity_asset", "activity_fund", "activity_training", "activity_community_service",
     "activity_nsap", "activity_expenditure", "voucher", "activity_voucher",
     "admin_approval", "admin_approval_scheme", "technical_approval", "physical_progress",
     "dim_code", "dim_welfare_scheme", "dim_lsdg_theme",
+    # The twentieth: GP demographics from the panchayat profile extract
+    # (#123). The Box spec documents "19 tables" and needs the same
+    # amendment, or the checker and the documents now disagree.
+    "gp_profile",
 })
 
-# An internal bookkeeping table that may legitimately exist alongside the 19.
+# An internal bookkeeping table that may legitimately exist alongside the 20.
 # Its presence is informational, never a violation.
 ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"quarantine"})
 
 # The consumer-facing relations, materialised as tables by warehouse.views
-# (#51). They are derived from the 19 -- no new facts -- so they are allowed
+# (#51). They are derived from the fact tables -- no new facts -- so they are allowed
 # alongside them rather than counted among them. Checked for presence
 # separately: a warehouse missing them builds but is not consumable.
 DERIVED_RELATIONS: frozenset[str] = frozenset({
@@ -98,6 +105,7 @@ DYNAMIC_RELATIONS: frozenset[str] = frozenset({"v_activity"})
 # (activity_voucher, dim_lsdg_theme), not an omission.
 EXPECTED_PRIMARY_KEYS: dict[str, tuple[str, ...] | None] = {
     "gram_panchayat": ("gp_lgd_code",),
+    "gp_profile": ("gp_lgd_code",),
     "plan": ("plan_code",),
     "planned_activity": ("activity_code",),
     "activity_delegation": ("activity_code",),
@@ -131,6 +139,7 @@ NULLABLE_REQUIRED: tuple[str, str] = ("activity_voucher", "voucher_pk")
 # activity_expenditure.plan_code -> plan is deliberately excluded here too,
 # for the same "not verified to always resolve" reason NO_ENFORCED_FK is.
 EXPECTED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("gp_profile", "gp_lgd_code", "gram_panchayat"),
     ("plan", "gp_lgd_code", "gram_panchayat"),
     ("planned_activity", "plan_code", "plan"),
     ("planned_activity", "gp_lgd_code", "gram_panchayat"),
@@ -313,7 +322,7 @@ def _decimal_sum(con: duckdb.DuckDBPyConnection, table: str, column: str) -> Dec
 # ---------------------------------------------------------------------------
 
 def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """Section 1: exactly the 19 tables, missing/extra reported separately."""
+    """Section 1: exactly EXPECTED_TABLES, missing/extra reported separately."""
 
     findings: list[Finding] = []
     actual = _existing_tables(con)
@@ -328,13 +337,13 @@ def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     for table in sorted(unexpected):
         findings.append(Finding(
             check="tables.unexpected", severity="violation",
-            expected="only the 19 spec tables", actual=f"unexpected table {table!r}",
+            expected="only the expected tables", actual=f"unexpected table {table!r}",
         ))
 
     for table in sorted(actual & ALLOWED_EXTRA_TABLES):
         findings.append(Finding(
             check="tables.internal", severity="informational",
-            expected="not part of the spec's 19 tables", actual=f"{table!r} present",
+            expected="not part of the expected inventory", actual=f"{table!r} present",
             detail="internal bookkeeping table, not a violation",
         ))
     return findings
@@ -675,7 +684,7 @@ def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
     Behind its own ``skip_derived`` flag for the reason
     ``check_geography_completeness`` is behind ``skip_geography``: a fixture
-    that creates the 19 spec tables to exercise a schema rule is not wrong
+    that creates the spec tables to exercise a schema rule is not wrong
     for having no ``v_activity``. A real build is.
 
     Three things can be wrong, and this checks all three.

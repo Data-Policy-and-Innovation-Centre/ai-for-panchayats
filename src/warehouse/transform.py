@@ -320,6 +320,90 @@ def gram_panchayat(root_frames: list[pd.DataFrame], quarantine: Quarantine,
     return deduped
 
 
+# --------------------------------------------------------------------- gp_profile
+
+# The profile CSV's own header spelling -> the DDL column. Ten of its 99
+# columns, written out rather than taken by prefix: the file's columns are
+# whatever the scrape happened to see, so a pattern match would silently
+# widen the table the next time the portal adds a field.
+GP_PROFILE_KEY = "basic_info_lgd"
+GP_PROFILE_RENAMES = {
+    "demographic_details_total_gender_wise_population": "total_population",
+    "demographic_details_male_population": "male_population",
+    "demographic_details_female_population": "female_population",
+    "demographic_details_transgender_population": "transgender_population",
+    "demographic_details_children_population": "children_population",
+    "demographic_details_sc_population": "sc_population",
+    "demographic_details_st_population": "st_population",
+    "demographic_details_obc_population": "obc_population",
+    "demographic_details_general_population": "general_population",
+    "general_no_of_households": "households",
+}
+GP_PROFILE_COLUMNS = [
+    "source_system", "source_run_id", "gp_lgd_code", *GP_PROFILE_RENAMES.values(),
+]
+
+
+def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+               *, source_system: str, source_run_id: str) -> pd.DataFrame:
+    """One row per GP, from the panchayat profile extract (#123).
+
+    Two rejections, kept apart because they mean different things:
+
+    * **84 rows carry no LGD code at all** -- placeholders for GPs whose
+      profile was never filled in. Loaded unfiltered, 83 of them collide on
+      the empty string and fail the primary key. They are quarantined rather
+      than filtered so the count stays visible; dropping them silently is how
+      a shrinking source goes unnoticed. Note they are not blank rows: they
+      still carry the scrape's own `param__*` request fields, which is why
+      "the row is empty" is not a safe test for them.
+    * **A keyed row whose GP is not in `gram_panchayat`** is an orphan, and
+      goes to quarantine under the standard reason code.
+
+    Every one of the ten measures is resolved with ``required=True``. A
+    profile whose population columns were renamed upstream must fail the
+    build loudly; loading 6,710 rows of all-NULL demographics would pass every
+    check this repo has -- right row count, no orphans, valid key -- and be
+    wrong in the only way that matters.
+    """
+
+    if profile.empty:
+        return pd.DataFrame(columns=GP_PROFILE_COLUMNS)
+
+    key, _ = _first_present(
+        profile, "gp_profile", "gp_lgd_code", (GP_PROFILE_KEY,), required=True,
+    )
+    out = pd.DataFrame({
+        "source_system": profile["source_system"],
+        "source_run_id": profile["source_run_id"],
+        "gp_lgd_code": to_code(key),
+    })
+    for source, target in GP_PROFILE_RENAMES.items():
+        series, _ = _first_present(
+            profile, "gp_profile", target, (source,), required=True,
+        )
+        out[target] = to_int(series)
+
+    unkeyed = out["gp_lgd_code"].isna()
+    if unkeyed.any():
+        quarantine.add(
+            "gp_profile", "missing_key", "profile row carries no LGD code",
+            "gp_lgd_code", out.loc[unkeyed, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~unkeyed]
+
+    out = _dedupe(
+        out, ["gp_lgd_code"], "gp_profile", quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    out = _restrict(
+        out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    return out[GP_PROFILE_COLUMNS]
+
+
 # --------------------------------------------------------------------- PL: plan + planned_activity + satellites
 
 PL_RENAMES = {

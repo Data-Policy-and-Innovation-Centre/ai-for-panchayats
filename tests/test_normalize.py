@@ -11,6 +11,7 @@ from src.pipeline.normalize import (
     NormalizationError,
     _normalise_year,
     normalize_egramswaraj,
+    normalize_run,
     to_records,
     validate_canonical_manifest,
 )
@@ -681,3 +682,114 @@ def test_a_small_table_is_not_split_into_one_part_per_flush(tmp_path: Path):
         f"20 rows written as {len(parts)} part files; the small table is "
         f"being flushed alongside the big one"
     )
+
+
+# --------------------------------------------------------------------- flat CSV lane (#123)
+
+PROFILE_HEADER = "basic_info_lgd,param__gp_name,demographic_details_male_population"
+
+
+def profile_run(tmp_path: Path, run_id: str, body: str) -> Path:
+    """A raw run published the way the profile extract is: one CSV, its own source."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", run_id) as publisher:
+        publisher.write_payload(
+            "eGramSwaraj_panchayat_master.csv",
+            f"{PROFILE_HEADER}\n{body}".encode(),
+        )
+        return publisher.publish()
+
+
+def test_flat_csv_run_normalizes_to_one_canonical_table(tmp_path: Path):
+    """The lane the JSON normalizer cannot serve (#123).
+
+    A one-row-per-GP reference CSV has no `LGD_<code>_<name>` folder, no
+    fiscal year in its filename and no nested child arrays, so it matches
+    neither `_gp_context` nor `KIND_RE`. What it must still produce is the
+    same *output* contract -- provenance columns, atomic publication, a
+    canonical manifest -- because that is the half a snapshot depends on.
+    """
+
+    run = profile_run(tmp_path, "profile-1", "115550,Angarbandha,120\n115551,Badabandha,130")
+    result = normalize_run(run, tmp_path / "canonical")
+
+    assert set(result.tables) == {"profile"}
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 2
+    assert [row["basic_info_lgd"] for row in canonical] == ["115550", "115551"]
+    # The key column stands in for the JSON lane's activityCd.
+    assert [row["business_id"] for row in canonical] == ["115550", "115551"]
+    assert {row["source_kind"] for row in canonical} == {"PROFILE"}
+    assert {row["source_system"] for row in canonical} == {"egramswaraj_profile"}
+    # No fiscal year exists in this source, so none is invented -- and the
+    # rows are not filed under a `fiscal_year-unknown` partition that would
+    # read as missing data rather than as inapplicable.
+    assert {row["fiscal_year"] for row in canonical} == {None}
+    assert not list((result.output_root / "profile").glob("fiscal_year-*"))
+    assert (result.output_root / "canonical_manifest.json").is_file()
+
+
+def test_flat_csv_row_ids_follow_the_key_not_the_line_number(tmp_path: Path):
+    """Same guarantee as the JSON lane's identity tests, one source over (#110).
+
+    A reference extract is re-scraped periodically and there is nothing that
+    fixes its row order. Keying identity on the line number would make every
+    row_id -- and every link anything later builds on one -- move the first
+    time the portal returned the same GPs in a different order.
+    """
+
+    forward = normalize_run(
+        profile_run(tmp_path, "profile-fwd", "115550,Angarbandha,120\n115551,Badabandha,130"),
+        tmp_path / "canonical",
+    )
+    reverse = normalize_run(
+        profile_run(tmp_path, "profile-rev", "115551,Badabandha,130\n115550,Angarbandha,120"),
+        tmp_path / "canonical",
+    )
+
+    def by_key(result):
+        return {row["basic_info_lgd"]: row["row_id"] for row in rows(files(result, "profile")[0])}
+
+    assert by_key(forward) == by_key(reverse)
+    assert len(set(by_key(forward).values())) == 2
+
+
+def test_flat_csv_blank_keys_still_get_distinct_row_ids(tmp_path: Path):
+    """The 84 profile-less rows must survive normalization to be counted later.
+
+    Rejecting them here would make the warehouse's quarantine count wrong by
+    84 and hide a shrinking source. They carry no key, so identity falls back
+    to content -- which is why the two below must not collide.
+    """
+
+    result = normalize_run(
+        profile_run(tmp_path, "profile-blank", ",Angarbandha,\n,Badabandha,\n115550,Kendu,120"),
+        tmp_path / "canonical",
+    )
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 3
+    assert len({row["row_id"] for row in canonical}) == 3
+    assert sum(1 for row in canonical if row["business_id"] is None) == 2
+
+
+def test_flat_csv_run_refuses_an_ambiguous_or_unkeyed_payload(tmp_path: Path):
+    """Two failures that must stop the run rather than produce a partial table.
+
+    Two CSVs in one run would share a run_id and a canonical table, so their
+    rows would be indistinguishable in provenance. A missing key column would
+    give every row a content-derived identity and silently load a table whose
+    primary key is null throughout.
+    """
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-two") as publisher:
+        publisher.write_payload("a.csv", f"{PROFILE_HEADER}\n1,A,2".encode())
+        publisher.write_payload("b.csv", f"{PROFILE_HEADER}\n2,B,3".encode())
+        two = publisher.publish()
+    with pytest.raises(NormalizationError, match="exactly one .csv payload"):
+        normalize_run(two, tmp_path / "canonical")
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-unkeyed") as publisher:
+        publisher.write_payload("p.csv", b"gp_name,population\nAngarbandha,120")
+        unkeyed = publisher.publish()
+    with pytest.raises(NormalizationError, match="basic_info_lgd"):
+        normalize_run(unkeyed, tmp_path / "canonical")

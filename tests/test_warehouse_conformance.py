@@ -55,6 +55,17 @@ FULL_DDL: dict[str, str] = {
             zp_name VARCHAR, block_code VARCHAR, block_name VARCHAR
         )
     """,
+    "gp_profile": """
+        CREATE TABLE gp_profile (
+            source_system VARCHAR, source_run_id VARCHAR,
+            gp_lgd_code VARCHAR PRIMARY KEY,
+            total_population INTEGER, male_population INTEGER,
+            female_population INTEGER, transgender_population INTEGER,
+            children_population INTEGER, sc_population INTEGER,
+            st_population INTEGER, obc_population INTEGER,
+            general_population INTEGER, households INTEGER,
+            FOREIGN KEY (gp_lgd_code) REFERENCES gram_panchayat (gp_lgd_code)
+        )""",
     "plan": """
         CREATE TABLE plan (
             plan_code VARCHAR PRIMARY KEY, gp_lgd_code VARCHAR, fiscal_year VARCHAR,
@@ -171,7 +182,7 @@ def build_full_schema(con: duckdb.DuckDBPyConnection) -> None:
 # planned_activity -> activity_delegation, etc).
 _FK_DEPENDENTS: dict[str, tuple[str, ...]] = {
     "gram_panchayat": (
-        "plan", "planned_activity", "activity_expenditure", "voucher",
+        "gp_profile", "plan", "planned_activity", "activity_expenditure", "voucher",
         "admin_approval", "technical_approval",
     ),
     "plan": ("planned_activity",),
