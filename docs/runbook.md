@@ -93,41 +93,79 @@ Everything is prefixed by `var.name`, default `prdw-chatbot`
 | Snapshot bucket | `dpic-prdw-snapshots` | `infra/terraform/snapshot/variables.tf:7-11` |
 | App Terraform state | `s3://dpic-prdw-tfstate/prdw/app/terraform.tfstate` | `infra/terraform/app/versions.tf:16-22` |
 
-### 1a. From the AWS console
+### Ask the running tasks, not the PRIMARY deployment
 
-> UNVERIFIED — no console session was used to write this. The navigation is
-> inferred from the resource types in Terraform.
+**`PRIMARY` is the deployment Terraform most recently asked for. It is not
+necessarily what users are getting**, and during exactly the incident that
+brings you here it usually is not. `service.tf:122-132` spells out the case:
+with `deployment_minimum_healthy_percent` at 100 the old task keeps serving
+while a new revision that can never start sits in `ACTIVE`, and `apply`
+reports success. A partial rollout can also serve *both* revisions at once.
 
-1. **ECS → Clusters → `prdw-chatbot` → Services → `prdw-chatbot`.**
-2. The **Deployments** tab lists deployments with a rollout state. The one
-   marked `PRIMARY` is what is serving. Note its **task definition revision**
-   (`prdw-chatbot:N`) and its **running count**.
-3. **Task definitions → `prdw-chatbot` → revision `N` → the `chatbot`
-   container.** Its `image` is
-   `<account>.dkr.ecr.ap-south-1.amazonaws.com/prdw-chatbot:<tag>`
-   (`service.tf:153`). **The tag is the answer to "what image".**
-4. Split the tag: `docker/build.sh:70` builds it as
-   `<repo-short-sha>-<consumer-short-sha>[-arm64]`. The first segment is the
-   commit of *this* repository. The `-arm64` suffix is derived from
-   `PLATFORM` and is enforced on both sides — `build.sh:64-82` refuses to mint
-   a contradicting tag, and `service.tf:133-141` refuses to register one.
-5. **CloudWatch → Log groups → `/ecs/prdw-chatbot`.** Open the newest stream
-   under the `chatbot` prefix and read the *first* lines. The snapshot
-   identity is printed exactly once, at startup, by
-   `src/deploy/fetch.py:288` and `scripts/fetch_snapshot.py:64`, in the format
-   from `src/deploy/fetch.py:80-85`:
+So enumerate what is actually running. There may be more than one answer, and
+if there is, that is the finding.
 
-   ```
-   provisional_full_state_snapshot s3://dpic-prdw-snapshots/duckdb/database_allgps.duckdb?versionId=<V> sha256=<H> bytes=<N> aggregates=verified
-   ```
+```bash
+aws ecs list-tasks --cluster prdw-chatbot --service-name prdw-chatbot \
+  --desired-status RUNNING --region ap-south-1 --query 'taskArns' --output text
+```
 
-   **`aggregates=SKIPPED` means the aggregate gate did not run.** That is a
-   benchmarking-only mode (`scripts/fetch_snapshot.py:27-31`) and must never
-   appear on a production task.
+```bash
+aws ecs describe-tasks --cluster prdw-chatbot --region ap-south-1 \
+  --tasks <arn> [<arn> ...] \
+  --query 'tasks[].{task:taskArn,td:taskDefinitionArn,health:healthStatus,started:startedAt}'
+```
 
-### 1b. From the repository
+Distinct `td` values across running tasks mean **two revisions are serving
+simultaneously**; every step below has to be done for each of them, and a
+single answer to "what is running" does not exist until the rollout settles.
 
-Given the repo commit from step 4:
+Then, per revision:
+
+```bash
+aws ecs describe-task-definition --task-definition prdw-chatbot:<N> \
+  --region ap-south-1 --query 'taskDefinition.containerDefinitions[0].image'
+```
+
+The image is `<account>.dkr.ecr.ap-south-1.amazonaws.com/prdw-chatbot:<tag>`
+(`service.tf:153`). **The tag is the answer to "what image".** For what the
+tag does and does not prove about a commit, see the caution below.
+
+And per *task* — not "the newest log stream", which may belong to a task that
+never became healthy, or to a replacement for one that died:
+
+```
+/ecs/prdw-chatbot  →  chatbot/chatbot/<task-id>
+```
+
+The stream name ends in the task id from `taskArn`
+(`service.tf:174-178` sets the `awslogs-stream-prefix` to `chatbot`), so pick
+the stream for each *running* task rather than the most recent one. Read its
+first lines: the snapshot identity is printed exactly once, at startup, by
+`src/deploy/fetch.py:288` and `scripts/fetch_snapshot.py:64`, in the format
+from `src/deploy/fetch.py:80-85`:
+
+```
+provisional_full_state_snapshot s3://dpic-prdw-snapshots/duckdb/database_allgps.duckdb?versionId=<V> sha256=<H> bytes=<N> aggregates=verified
+```
+
+**`aggregates=SKIPPED` means the aggregate gate did not run.** That is a
+benchmarking-only mode (`scripts/fetch_snapshot.py:27-31`) and must never
+appear on a production task.
+
+> UNVERIFIED — no console session and no AWS call informed any of this. The
+> `--query` expressions in particular have never been run. The console path is
+> ECS → Clusters → `prdw-chatbot` → Services → `prdw-chatbot` → **Tasks** (not
+> Deployments), then CloudWatch → Log groups → `/ecs/prdw-chatbot`.
+>
+> **OPEN QUESTION 8.** The exact log stream name format is inferred from the
+> `awslogs-stream-prefix` and the awslogs driver's documented
+> `<prefix>/<container>/<task-id>` shape. Confirm it against a real stream.
+
+### Cross-check against the repository
+
+Given a commit you inferred from a tag and confirmed resolves (see the
+caution below):
 
 ```bash
 git -C . show <repo-short-sha>:infra/snapshots/full_state.json | jq '{key, version_id, sha256, byte_size, expectations_version_id, known_exceptions}'
@@ -145,15 +183,31 @@ must equal the ones in the startup log line. If they differ, the image was
 built from a tree that does not match the commit its tag claims — see the
 caution below.
 
-### Caution: the tag does not prove the tree
+### Caution: the tag does not prove the commit, and the commit does not prove the tree
 
-`docker/build.sh:70` derives the tag from `git rev-parse --short HEAD` and
-**does not check that the working tree is clean**. An image built with
-uncommitted changes to `infra/snapshots/full_state.json` carries a different
-snapshot pin under a tag that claims the committed one. ECR's immutable tags
-(`service.tf:31`) make the *second* such push fail loudly, but the first
-succeeds silently. The startup log line in step 5 is the only evidence of what
-was actually baked in, which is why §1a reads it rather than trusting the tag.
+Two separate reasons the tag is a hint rather than an answer, and the startup
+log line is the only real evidence.
+
+**The tag need not contain a commit at all.** `docker/build.sh:70` is
+`TAG="${TAG:-...}"` — a supplied `TAG` is used verbatim, and lines 72-81
+validate only the architecture suffix. Terraform enforces no commit-shaped
+prefix either (`service.tf:133-141` checks the suffix and nothing else). So
+splitting a tag on `-` and treating the first segment as a short SHA can name
+a commit that does not exist, or worse, one that does and is not the right
+one. Confirm any commit you infer this way — `git cat-file -e <sha>` at
+minimum — and if it does not resolve, the tag was overridden and the
+repository cannot tell you the commit. Take the snapshot identity from the
+startup log line instead, and find the manifest by its `version_id` (§3).
+
+**Even a real commit does not prove the tree.** `build.sh:70` derives the
+default tag from `git rev-parse --short HEAD` and **does not check the working
+tree is clean**. An image built with uncommitted changes to
+`infra/snapshots/full_state.json` carries a different snapshot pin under a tag
+that claims the committed one. ECR's immutable tags (`service.tf:31`) make the
+*second* such push fail loudly; the first succeeds silently.
+
+Both are why the identity check is "read the startup line, then match it
+against the committed manifest" rather than "read the tag".
 
 > **OPEN QUESTION 1.** The AWS account id is not in this repository. The ECR
 > repository URL is available from the app module as
@@ -283,8 +337,14 @@ git log --oneline -- infra/snapshots/full_state.json
 git show <commit>:infra/snapshots/full_state.json | jq '{version_id, sha256}'
 ```
 
-Then find the image tag built from that commit: the tag's first segment is that
-commit's short SHA (`build.sh:70`), so list ECR and match the prefix.
+Then find the image tag built from that commit: for a tag built the default
+way, the first segment is that commit's short SHA (`build.sh:70`), so list ECR
+and match the prefix. **This fails silently for any image built with an
+explicit `TAG` override**, which nothing enforces the shape of — see the
+caution in §1. If no tag matches, do not conclude the image is gone; match on
+the snapshot instead, by starting each candidate tag and reading its startup
+line, or by `docker pull`ing it and reading `/app/manifest/full_state.json`
+directly.
 
 > **OPEN QUESTION 3.** There is no recorded mapping from image tag to
 > deployment time. The only sources would be ECR push timestamps and, once #92
@@ -501,3 +561,6 @@ default bucket.
 6. Whether an operator role may delete objects in the state bucket. (§5)
 7. **Whether the circuit breaker will be enabled at all**, and with what
    `rollback` setting. §4 is unusable until #92 answers this. (§0, §4)
+8. The exact CloudWatch log stream name format, inferred from the
+   `awslogs-stream-prefix` and the awslogs driver's documented
+   `<prefix>/<container>/<task-id>` shape. (§1)
