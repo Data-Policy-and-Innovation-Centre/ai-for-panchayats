@@ -699,10 +699,20 @@ def normalize_egramswaraj(
         # raised peak buffered rows by the number of tables.
         #
         # Fullest-first, and stopping at the budget rather than emptying every
-        # buffer, is what keeps the part files the same size they were. A
-        # table holding 40 rows when a big table trips the budget would
-        # otherwise be written as a 40-row Parquet file -- once per flush, so
-        # hundreds of near-empty files per small table at full-state scale.
+        # buffer, is what protects the *small* tables. A table holding 40 rows
+        # when a big table trips the budget would otherwise be written as a
+        # 40-row Parquet file -- once per flush, so hundreds of near-empty
+        # files per small table at full-state scale.
+        #
+        # It does not restore the old part sizes for the big tables, and does
+        # not try to. Sharing one budget across N filling tables means the
+        # fullest holds roughly chunk_size/N when it trips, so at 1,000 GPs
+        # the run writes 718 part files where the old shape wrote 199, and
+        # 227.4 MB where it wrote 218.0 (+4.3%, from per-file overhead).
+        # Buying those back means a budget of N x chunk_size, which is a real
+        # memory regression; --chunk-size is the knob for anyone who wants
+        # that trade. Note it now bounds rows buffered in *total*, where it
+        # used to bound rows per part per table.
         schemas = {name: _arrow_schema(types) for name, types in table_types.items()}
         schemas[QUARANTINE_TABLE] = _arrow_schema({
             "source_system": pa.string(), "source_run_id": pa.string(),

@@ -24,20 +24,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import resource
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.dataset as ds
 from loguru import logger
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from src.pipeline.normalize import normalize_egramswaraj  # noqa: E402
 
 DEFAULT_TREE = Path("data/raw/eGramSwaraj_Data/Gram_Panchayat")
 
@@ -86,25 +80,61 @@ def fingerprint(snapshot: Path) -> dict[str, dict[str, object]]:
     return out
 
 
+# Runs one normalization and reports what it cost, as JSON on stdout.
+#
+# In a child process, because peak memory is the whole point of the column
+# and it cannot be measured in the parent. ``ru_maxrss`` is a high-water mark
+# over the life of a process and never falls, so in a single process the
+# figure for every size after the first is really the largest thing that has
+# happened so far -- including ``fingerprint()`` reading whole tables into
+# pandas between sizes. Measured that way, 2 GPs "peaks" higher than 4 GPs.
+# A fresh child per size has no history to inherit.
+CHILD = """
+import json, resource, sys, time
+sys.path.insert(0, {root!r})
+from src.pipeline.normalize import normalize_egramswaraj
+
+run_path, output_root, chunk_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+# CPU as a delta around the call, so importing pyarrow is not charged to
+# normalization. Peak RSS is not a delta: it is the child's high-water mark,
+# and the interpreter and its imports are genuinely part of that.
+before = resource.getrusage(resource.RUSAGE_SELF)
+started = time.monotonic()
+result = normalize_egramswaraj(run_path, output_root, chunk_size=chunk_size)
+elapsed = time.monotonic() - started
+usage = resource.getrusage(resource.RUSAGE_SELF)
+print(json.dumps({{
+    "seconds": elapsed,
+    "user_s": usage.ru_utime - before.ru_utime,
+    "sys_s": usage.ru_stime - before.ru_stime,
+    "maxrss": usage.ru_maxrss,
+    "max_buffered_rows": result.max_buffered_rows,
+    "quarantined": result.quarantine_count,
+    "snapshot": str(result.output_root),
+}}))
+"""
+
+
 def measure(run_path: Path, output_root: Path, chunk_size: int) -> dict[str, object]:
     """Wall clock, CPU split, and peak RSS for one normalization.
 
     CPU is reported alongside wall clock because the ratio is the diagnosis,
     not decoration: a run that is ~90% user time is bound by parsing, and no
-    amount of faster storage will help it. Measured on this process with
-    getrusage, so it excludes the subprocess that published the run.
+    amount of faster storage will help it.
     """
 
     if output_root.exists():
         shutil.rmtree(output_root)
-    before = resource.getrusage(resource.RUSAGE_SELF)
-    started = time.monotonic()
-    result = normalize_egramswaraj(run_path, output_root, chunk_size=chunk_size)
-    elapsed = time.monotonic() - started
-    after = resource.getrusage(resource.RUSAGE_SELF)
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-c", CHILD.format(root=str(root)),
+         str(run_path), str(output_root), str(chunk_size)],
+        check=True, capture_output=True, text=True, cwd=root,
+    )
+    measured = json.loads(completed.stdout)
 
-    user = after.ru_utime - before.ru_utime
-    system = after.ru_stime - before.ru_stime
+    elapsed = measured["seconds"]
+    user, system = measured["user_s"], measured["sys_s"]
     # ru_maxrss is bytes on macOS, kilobytes on Linux.
     scale = 1024 * 1024 if sys.platform == "darwin" else 1024
     return {
@@ -113,10 +143,10 @@ def measure(run_path: Path, output_root: Path, chunk_size: int) -> dict[str, obj
         "sys_s": round(system, 2),
         "cpu_pct": round(100 * (user + system) / elapsed) if elapsed else 0,
         "user_share_pct": round(100 * user / (user + system)) if (user + system) else 0,
-        "peak_mb": round(max(after.ru_maxrss, before.ru_maxrss) / scale),
-        "max_buffered_rows": result.max_buffered_rows,
-        "quarantined": result.quarantine_count,
-        "snapshot": str(result.output_root),
+        "peak_mb": round(measured["maxrss"] / scale),
+        "max_buffered_rows": measured["max_buffered_rows"],
+        "quarantined": measured["quarantined"],
+        "snapshot": measured["snapshot"],
     }
 
 
@@ -129,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chunk-size", type=int, default=100_000)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
+    # Resolved because `publish` runs the ingest subprocess with cwd set to
+    # the repo root: a relative --work would mean two different directories.
+    args.work = args.work.expanduser().resolve()
+    args.tree = args.tree.expanduser().resolve()
 
     if not args.tree.is_dir():
         logger.error("no scraped tree at {}", args.tree)

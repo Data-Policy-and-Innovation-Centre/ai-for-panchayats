@@ -454,30 +454,40 @@ def test_a_small_table_is_not_split_into_one_part_per_flush(tmp_path: Path):
     Buffers share one row budget, so a big table trips it. Flushing *every*
     buffer at that point writes whatever the small tables happen to be
     holding -- a row or two -- as a Parquet file of its own, once per flush.
-    On this fixture that is 13 files for 20 rows; at full-state scale it is
+    On this fixture that is 12 files for 20 rows; at full-state scale it is
     hundreds of near-empty files per small table.
 
     Flushing fullest-first and stopping once the budget is met leaves the
-    small buffers alone until the end, so they land in one file. Peak
-    buffered rows is unchanged either way -- that is
+    small buffers alone until the end, so they land in one file.
+
+    The small table here is ``aa``, which sorts *before* the big ``pl``, and
+    that is the point: an earlier version of this test used a small table
+    that sorted last, so plain alphabetical order emptied the big buffer
+    first and the test passed without fullest-first doing anything. Both
+    mutations have to fail -- flushing everything, and flushing in name order
+    -- and with the small table sorting first, both do.
+
+    Peak buffered rows is unchanged either way; that is
     ``test_peak_buffered_rows_does_not_grow_with_table_count``.
     """
 
     payloads = {}
     for index in range(20):
-        payloads[f"LGD_{index}_GP/2021_PL.json"] = {"data": (
-            # 30 activities per GP dominate the shared budget; the single
-            # fundList entry beside them is the small table, and it is spread
-            # across the whole input rather than sitting at the start.
-            [{"activityCd": n, "totalCost": n} for n in range(30)]
-            + [{"activityCd": 999, "totalCost": 1,
-                "fundList": [{"schemeCode": "S", "amountTotal": 1}]}]
-        )}
+        gp = f"LGD_{index}_GP"
+        # 30 activities per GP dominate the shared budget.
+        payloads[f"{gp}/2021_PL.json"] = {"data": [
+            {"activityCd": n, "totalCost": n} for n in range(30)
+        ]}
+        # One AA record beside them, spread across the whole input rather
+        # than sitting at the start.
+        payloads[f"{gp}/2021_AA.json"] = {"data": [
+            {"activityCd": 1, "wrkAdmApprNo": f"A{index}"}
+        ]}
     run = make_run(tmp_path, "run-1", payloads)
 
     result = normalize_egramswaraj(run, tmp_path / "canonical", chunk_size=50)
 
-    parts = list((result.output_root / "pl__fundlist").rglob("*.parquet"))
+    parts = list((result.output_root / "aa").rglob("*.parquet"))
     assert len(parts) == 1, (
         f"20 rows written as {len(parts)} part files; the small table is "
         f"being flushed alongside the big one"
