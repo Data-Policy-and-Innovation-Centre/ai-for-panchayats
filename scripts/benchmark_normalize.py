@@ -5,9 +5,23 @@
         --work /tmp/bench --out /tmp/bench.json
 
 Two questions, one run. *How fast* is the obvious one. *Did the output
-change* is the one that decides whether a speedup is allowed to ship: run
-this on the branch and on the commit it branched from, and the ``fingerprint``
-values must match exactly at every size.
+change* is the one that decides whether a speedup is allowed to ship.
+
+To compare two implementations, swap the implementation and keep the
+harness -- checking out the parent commit wholesale would take this script
+with it, since it does not exist there::
+
+    uv run python scripts/benchmark_normalize.py --gps 20 --gps 100 \
+        --work /tmp/bench --out /tmp/new.json
+
+    git checkout <parent> -- src/pipeline/normalize.py
+    uv run python scripts/benchmark_normalize.py --gps 20 --gps 100 \
+        --work /tmp/bench --out /tmp/old.json
+    git checkout HEAD -- src/pipeline/normalize.py
+
+The ``fingerprint`` values must then match exactly at every size. Reusing
+one ``--work`` across both runs is deliberate and supported; ``parts`` is
+reported separately because it is *expected* to differ.
 
 The fingerprint is content, not files. Part-file boundaries are an
 implementation detail -- ``write_rows`` already splits a batch by fiscal year,
@@ -37,12 +51,26 @@ from loguru import logger
 DEFAULT_TREE = Path("data/raw/eGramSwaraj_Data/Gram_Panchayat")
 
 
+def _positive(value: str) -> int:
+    """A GP count argparse will not accept as negative or zero."""
+
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {count}")
+    return count
+
+
 def build_subset(tree: Path, count: int, destination: Path) -> int:
     """Copy the first `count` GP folders, in sorted order so runs compare."""
 
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
+    # Guarded because `[:count]` is quietly catastrophic for count < 1:
+    # `--gps -1` selects every GP folder except the last, so a typo copies
+    # and normalizes almost the whole state instead of failing.
+    if count < 1:
+        raise ValueError(f"--gps must be at least 1, got {count}")
     folders = sorted(p for p in tree.iterdir() if p.is_dir())[:count]
     for folder in folders:
         shutil.copytree(folder, destination / folder.name)
@@ -190,7 +218,7 @@ def measure(run_path: Path, output_root: Path, chunk_size: int) -> dict[str, obj
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--gps", action="append", type=int, default=[], required=True,
+    parser.add_argument("--gps", action="append", type=_positive, default=[], required=True,
                         help="GP count to measure; repeatable")
     parser.add_argument("--tree", type=Path, default=DEFAULT_TREE)
     parser.add_argument("--work", type=Path, required=True, help="scratch directory")
