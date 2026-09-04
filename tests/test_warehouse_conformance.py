@@ -804,14 +804,23 @@ def test_geography_completeness_flags_missing_columns(tmp_path):
     con.close()
 
 
-def test_geography_completeness_skipped_for_synthetic_fixtures(tmp_path):
-    """A three-GP fixture is not wrong for having one district, so the
-    cardinality assertions ride with the reconciliation gate."""
+def test_geography_has_its_own_opt_out(tmp_path):
+    """A three-GP fixture is not wrong for having one district, so there is an
+    opt-out -- but it is NOT --skip-reconciliation.
+
+    Folding the two together meant no real build ever checked its own scale:
+    voucher and dim_code have no loader (#46, #48, #129), so every real build
+    skips the totals today, and a 20-GP build reported PASS."""
 
     con = _connect(tmp_path)
     build_full_schema(con)
-    findings = check_conformance(con, skip_reconciliation=True)
-    assert not any(f.check.startswith("geography.") for f in findings)
+
+    skipped = check_conformance(con, skip_reconciliation=True, skip_geography=True)
+    assert not any(f.check.startswith("geography.") for f in skipped)
+
+    # Skipping only the totals must still assert scale.
+    checked = check_conformance(con, skip_reconciliation=True)
+    assert any(f.check.startswith("geography.") for f in checked)
     con.close()
 
 

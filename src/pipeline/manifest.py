@@ -275,6 +275,18 @@ class RunPublisher:
         staging = self._require_open()
         rel = _safe_relative(relative_path, staging / "payloads")
         target = staging / "payloads" / rel
+        # Refused here rather than in the CLI, because every writer routes
+        # through this method: two --payload-tree roots sharing a relative
+        # path, a tree path colliding with a --payload name, or a repeated
+        # --payload all land on the same target. os.replace below would take
+        # the last one silently, leaving the manifest inventorying fewer
+        # files than the caller counted -- source bytes lost, with a green
+        # run to show for it. A run publishes each path exactly once.
+        if target.exists():
+            raise ManifestError(
+                f"payload already written: {rel}; a raw run publishes each path once "
+                "(overlapping --payload-tree roots, or a --payload of the same name)"
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:

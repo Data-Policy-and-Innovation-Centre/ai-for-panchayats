@@ -249,7 +249,12 @@ def test_childless_activity_gets_synthesized_satellite_rows_and_passes_conforman
         assert childless_fund == (None,)
 
         assert check_satellite_row_parity(con) == []
-        assert not has_violations(check_conformance(con, skip_reconciliation=True))
+        # skip_geography: this fixture is one GP, not the state. It is a separate
+        # flag from skip_reconciliation precisely so a real build cannot skip both
+        # by accident.
+        assert not has_violations(
+            check_conformance(con, skip_reconciliation=True, skip_geography=True)
+        )
     finally:
         con.close()
 

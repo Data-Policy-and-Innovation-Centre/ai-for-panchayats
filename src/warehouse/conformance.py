@@ -184,6 +184,17 @@ EXPECTED_GP_COUNT = 6794
 EXPECTED_DISTRICT_COUNT = 30
 EXPECTED_BLOCK_COUNT = 314
 
+# Coverage, not equality. `gram_panchayat` is built from GPs that were
+# *observed* in the scrape, and a GP whose every payload is empty produces no
+# rows and so never reaches the dimension -- verified: three scraped folders,
+# one of them dataless, yields two rows. Demanding exactly 6,794 would refuse
+# a genuinely complete build.
+#
+# The threshold does not need to be precise, because the thing it separates
+# is three orders of magnitude wide: the pilot is 20 GPs, the state is ~6,800.
+# Anything between is neither, and should be looked at by a person.
+MIN_GP_COVERAGE = 0.90
+
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
 # decimal arithmetic, never binary float ``==``.
@@ -642,11 +653,12 @@ def check_dim_code_uniqueness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
 
 def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """Section 6: gram_panchayat carries geography for every GP in the state.
+    """gram_panchayat carries geography for the whole state.
 
-    Gated with the reconciliation totals rather than run always, for the same
-    reason: these are assertions about the *reference build*, and a synthetic
-    fixture holding three GPs is not wrong for having three districts.
+    Behind its own ``skip_geography`` flag rather than run always, because a
+    synthetic fixture holding three GPs is not wrong for having three
+    districts -- but deliberately NOT behind ``skip_reconciliation``, which
+    every real build must pass today for unrelated reasons (#46, #48, #129).
 
     #61 shipped 6,794 rows with no district behind a green build, because
     nothing checked. Completeness and cardinality are both asserted: a table
@@ -674,10 +686,22 @@ def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding
 
     findings: list[Finding] = []
     total = _row_count(con, table)
-    if total != EXPECTED_GP_COUNT:
+    floor = int(EXPECTED_GP_COUNT * MIN_GP_COVERAGE)
+    if total < floor:
         findings.append(Finding(
             check="geography.gp_count", severity="violation",
-            expected=str(EXPECTED_GP_COUNT), actual=str(total),
+            expected=f"at least {floor} of {EXPECTED_GP_COUNT} GPs",
+            actual=str(total),
+            detail="a build well short of the roster is a sample, not the state",
+        ))
+    elif total > EXPECTED_GP_COUNT:
+        # The other direction: GP codes the roster does not know mean the
+        # build and the reference tree disagree about what Odisha is -- and
+        # that tree is also what fills these columns.
+        findings.append(Finding(
+            check="geography.gp_count", severity="violation",
+            expected=f"at most {EXPECTED_GP_COUNT} GPs (the LGD roster)",
+            actual=str(total),
         ))
     # Every geography column, not a hand-picked subset: listing three of the
     # six by name let a table with 100% NULL district_code and state_code pass
@@ -699,11 +723,11 @@ def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding
         actual = con.execute(
             f"SELECT count(DISTINCT {column}) FROM {table} WHERE {column} IS NOT NULL"
         ).fetchone()[0]
-        if actual != expected:
+        if not int(expected * MIN_GP_COVERAGE) <= actual <= expected:
             findings.append(Finding(
                 check=f"geography.{name}", severity="violation",
-                expected=str(expected), actual=str(actual),
-                detail=f"distinct {column}",
+                expected=f"{int(expected * MIN_GP_COVERAGE)}-{expected}",
+                actual=str(actual), detail=f"distinct {column}",
             ))
     return findings
 
@@ -762,21 +786,28 @@ ALL_CHECKS = (
 
 
 def check_conformance(
-    con: duckdb.DuckDBPyConnection, *, skip_reconciliation: bool = False,
+    con: duckdb.DuckDBPyConnection, *,
+    skip_reconciliation: bool = False, skip_geography: bool = False,
 ) -> list[Finding]:
     """Run every check and return the combined findings, in a stable order.
 
-    ``skip_reconciliation=True`` omits Section 6 (the exact reference-build
-    totals, and the full-state geography cardinality) -- use this for
-    synthetic fixtures that were never meant to match the real published
-    totals or to contain all 6,794 GPs.
+    Two independent opt-outs, because they are skipped for different reasons
+    and folding them into one hid a hole: `voucher` and `dim_code` have no
+    loader yet (#46, #48, #129), so every real build today must skip the
+    reconciliation totals -- and while geography rode that same flag, no real
+    build ever asserted its own scale. A 20-GP build reported "PASS".
+
+    ``skip_reconciliation`` omits the exact published totals.
+    ``skip_geography`` omits full-state coverage; use it for synthetic
+    fixtures, which are not wrong for holding three GPs.
     """
 
     findings: list[Finding] = []
     for check in ALL_CHECKS:
         findings.extend(check(con))
-    if not skip_reconciliation:
+    if not skip_geography:
         findings.extend(check_geography_completeness(con))
+    if not skip_reconciliation:
         findings.extend(check_reconciliation_totals(con))
     return findings
 

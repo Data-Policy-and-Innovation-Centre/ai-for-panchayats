@@ -21,11 +21,19 @@ import sys
 from pathlib import Path
 
 from src.deploy.errors import SnapshotError
-from src.deploy.manifest import PROVISIONAL_LABEL, build_manifest
+from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
+from src.warehouse.conformance import MIN_GP_COVERAGE, check_geography_completeness
+from src.warehouse.geography import GeographyError, gp_geography
 
+# #61 is no longer here: gram_panchayat now carries state/district/block for
+# every GP in the LGD reference tree. Dropping the exception is only honest if
+# something checks, so assert_full_state below verifies the geography is
+# actually populated -- not merely that the row count is right -- and refuses
+# the artifact otherwise. The older externally built artifact, whose geography
+# is blank, is therefore refused rather than pinned with an exception: there
+# is no --known-exception that makes a blank-geography database deployable.
 DEFAULT_EXCEPTIONS = (
     "expenditure/activity_voucher/plan lineage not independently reproduced (#43, #49)",
-    "full-state geography is blank for all gram_panchayat rows (#61)",
     "full-state reconciliation baseline not established (#62)",
 )
 
@@ -48,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--known-exception",
         action="append",
         dest="known_exceptions",
-        help="repeatable; defaults to the open #43/#49, #61 and #62 exceptions",
+        help="repeatable; defaults to the open #43/#49 and #62 exceptions",
     )
     exceptions.add_argument(
         "--no-known-exceptions",
@@ -68,8 +76,105 @@ def _known_exceptions(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(args.known_exceptions)
 
 
+def assert_full_state(artifact: Path) -> int:
+    """Refuse to pin an artifact that is not the whole state.
+
+    This is the only place a database becomes deployable: the deployment
+    reads ``infra/snapshots/full_state.json``, and this script is what writes
+    it. So this is where a sample has to be stopped.
+
+    It has to be stopped somewhere, because a 20-GP smoke build is otherwise
+    indistinguishable from a full one -- same 19 tables, same schema, same
+    green conformance run -- and the result would be a chatbot answering
+    statewide questions from 0.3% of the data. The prod/staging env files
+    make the right thing easy; they are a convenience, and a convenience can
+    be skipped. This cannot.
+
+    The bound is coverage, not equality. ``gram_panchayat`` is built from GPs
+    *observed* in the scrape, and a GP whose payloads are all empty produces
+    no rows at all -- so demanding exactly the roster size would refuse a
+    genuinely complete build. The gap this has to separate is three orders of
+    magnitude wide (20 GPs versus ~6,800), so the threshold does not need to
+    be precise.
+
+    The roster size comes from the LGD tree rather than a literal here, but
+    ``conformance.EXPECTED_GP_COUNT`` is a deliberately independent literal --
+    conformance is written against the spec, not against our loader's inputs,
+    so a corrupted reference tree cannot satisfy both. A test asserts they
+    still agree.
+
+    There is deliberately no --allow-partial override. An override exists to
+    be used, and the only caller who needs one is the caller this guard is
+    for.
+    """
+
+    expected = len(gp_geography())
+    floor = int(expected * MIN_GP_COVERAGE)
+    with attach_read_only(artifact) as conn:
+        tables = conn.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = ?",
+            [ATTACH_CATALOG],
+        ).fetchall()
+        if ("gram_panchayat",) not in tables:
+            print(
+                f"error: {artifact} has no gram_panchayat table; refusing to pin an "
+                "artifact whose scope cannot be established",
+                file=sys.stderr,
+            )
+            return 1
+        actual = conn.execute(
+            f"SELECT count(*) FROM {ATTACH_CATALOG}.gram_panchayat"
+        ).fetchone()[0]
+        # Row count alone would wave through the exact artifact #61 is named
+        # for: 6,794 rows with every geography column NULL. Since this script
+        # is what drops the #61 exception from the manifest, it has to be what
+        # establishes the exception is really gone.
+        #
+        # Delegated to the conformance check that already defines "geography
+        # is complete" -- columns present, every row populated, district and
+        # block cardinality -- rather than restating a weaker version here.
+        # USE makes its unqualified queries read the attached artifact.
+        conn.execute(f"USE {ATTACH_CATALOG}")
+        geography = check_geography_completeness(conn)
+    if not floor <= actual <= expected:
+        print(
+            f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
+            f"snapshot must hold between {floor:,} and {expected:,} (the LGD reference "
+            "tree). A partial build must not be pinned; rebuild from a full-state "
+            "snapshot, or refresh lgd_codes.json if Odisha's roster really changed.",
+            file=sys.stderr,
+        )
+        return 1
+    if geography:
+        print(
+            f"error: {artifact} holds {actual:,} gram_panchayat rows but its geography "
+            "is not complete; refusing to pin an artifact that would be published as "
+            "having resolved #61:",
+            file=sys.stderr,
+        )
+        for finding in geography:
+            print(
+                f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
+                file=sys.stderr,
+            )
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        refusal = assert_full_state(args.artifact)
+    except GeographyError as exc:
+        # Blames the right file: a missing lgd_codes.json is not a problem
+        # with the artifact being pinned.
+        print(f"error: cannot read the LGD reference tree: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - any read failure is a refusal
+        print(f"error: cannot read {args.artifact}: {exc}", file=sys.stderr)
+        return 1
+    if refusal:
+        return refusal
     try:
         manifest = build_manifest(
             args.artifact,
