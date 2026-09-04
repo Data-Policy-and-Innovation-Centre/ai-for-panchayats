@@ -42,6 +42,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
+import numpy as np
 import pandas as pd
 
 from .load_common import CsvSchemaError, read_csv
@@ -80,6 +81,16 @@ class DimensionError(RuntimeError):
     """Raised when a code dictionary is missing, malformed, or contradictory."""
 
 
+def keys_for(name: str) -> tuple[str, ...]:
+    """The table's identifying columns, or its first column as a label.
+
+    dim_lsdg_theme declares no primary key, so an error message about a bad
+    row there still needs something to name the row by.
+    """
+
+    return DIMENSION_KEYS.get(name) or DIMENSION_COLUMNS[name][:1]
+
+
 def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
     kept = DIMENSION_COLUMNS[name]
     path = (directory or REFERENCE_DIR) / f"{name}.csv"
@@ -105,13 +116,30 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
         frame[column] = frame[column].astype("string").str.strip()
 
     for column in integers:
-        # Written by pandas as "3.0"/"350.0"; they are counts, and a theme
-        # count of 3.0 in a report reads as a defect.
-        frame[column] = (
-            pd.to_numeric(frame[column], errors="coerce").round().astype("Int64")
-        )
+        # Written in the file as "3.0"/"350.0"; they are counts, and a theme
+        # count of "3.0" in a provenance note reads as a defect.
+        #
+        # Coerce-and-round would be shorter and wrong in the specific way
+        # #116 and #127 were wrong: `distinct_themes` is the field that tells
+        # a consumer whether a mapping was collapsed, so turning "2.6" into 3
+        # or "n/a" into NULL misrepresents exactly the thing it exists to
+        # report -- and the build still succeeds. A reference file has no
+        # quarantine to fall back on, so anything that is not a whole number
+        # is refused outright.
+        raw = frame[column].astype("string").str.strip()
+        numeric = pd.to_numeric(raw, errors="coerce")
+        finite = np.isfinite(numeric.to_numpy(dtype="float64", na_value=np.nan))
+        invalid = raw.isna() | (raw == "") | numeric.isna() | ~finite
+        fractional = ~invalid & (numeric != numeric.round())
+        if invalid.any() or fractional.any():
+            offending = frame.loc[invalid | fractional, [*keys_for(name), column]]
+            raise DimensionError(
+                f"{path}: {column} must be a whole number; got "
+                f"{offending.head(3).to_dict('records')}"
+            )
+        frame[column] = numeric.astype("Int64")
 
-    keys = DIMENSION_KEYS.get(name, ())
+    keys = keys_for(name)
     if keys:
         blank = frame[list(keys)].isna().any(axis=1) | (frame[list(keys)] == "").any(axis=1)
         if blank.any():

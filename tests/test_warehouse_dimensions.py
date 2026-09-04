@@ -174,3 +174,47 @@ def test_the_decode_join_needs_its_cast_and_not_for_the_reason_the_issue_gives()
             """).fetchall()
     finally:
         con.close()
+
+
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [
+        ("2.6", "fractional: rounding to 3 overstates how many themes were collapsed"),
+        ("n/a", "not a number: coercing to NULL hides that the mapping is collapsed"),
+        ("", "blank: same as above"),
+        ("inf", "non-finite: astype('Int64') would raise far from the cause"),
+    ],
+)
+def test_a_theme_count_that_is_not_a_whole_number_is_refused(
+    tmp_path: Path, value: str, why: str,
+):
+    """`distinct_themes` is the field that says whether a mapping was
+    collapsed, so silently rounding or nulling it misrepresents exactly the
+    thing it exists to report -- and the build still succeeds. Same defect
+    family as #116 (fractional counts rounded) and #127 (malformed digit
+    grouping rewritten). A reference file has no quarantine to fall back on.
+    """
+
+    csv = tmp_path / "dim_lsdg_theme.csv"
+    csv.write_text(
+        "focus_area_name,lsdg_theme,distinct_themes,n_rows\n"
+        f"Sanitation,Theme 5,{value},350.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DimensionError, match="must be a whole number"):
+        _load("dim_lsdg_theme", tmp_path)
+
+
+def test_a_whole_number_written_as_a_float_is_accepted(tmp_path: Path):
+    """The real file spells them "3.0" and "350.0"; refusing those would
+    reject the very data this loader exists to read."""
+
+    csv = tmp_path / "dim_lsdg_theme.csv"
+    csv.write_text(
+        "focus_area_name,lsdg_theme,distinct_themes,n_rows\n"
+        "Sanitation,Theme 5,3.0,350.0\n",
+        encoding="utf-8",
+    )
+    frame = _load("dim_lsdg_theme", tmp_path)
+    assert frame["distinct_themes"].iloc[0] == 3
+    assert frame["source_rows"].iloc[0] == 350
