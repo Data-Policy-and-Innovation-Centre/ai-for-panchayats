@@ -920,3 +920,37 @@ def test_gp_profile_quarantines_a_row_whose_measure_cannot_be_read(tmp_path: Pat
         assert reasons == {"unreadable_measure": 1, "orphan_reference": 1}
     finally:
         con.close()
+
+
+def test_gp_profile_quarantines_a_fractional_count_rather_than_rounding_it(tmp_path: Path):
+    """`to_int` rounds, so a null-check alone accepts an invented number.
+
+    `clean.to_int` ends in `numeric.round()`. A population of "1.5" therefore
+    parses cleanly to 2 and the unreadable-value check -- which asks whether
+    the cast produced NULL -- never sees it. A rounded count is not a
+    recovered count; it is a number nobody observed. Same predicate as
+    `activity_nsap`'s beneficiary counts (#116), which is why it now lives at
+    module scope rather than nested in one transform.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,450,440,10,200,100,150,300,350,1.5",
+    )
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
+            "AND reason_code = 'unreadable_measure'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()

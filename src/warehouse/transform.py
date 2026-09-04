@@ -173,6 +173,42 @@ class FieldResolutions:
         return tuple(r for r in self.records if r.matched_candidate is None)
 
 
+def _is_fractional(text: object) -> bool:
+    """A count that is not a whole number is malformed, not roundable.
+
+    ``clean.to_int`` ends in ``numeric.round()``, so "1.5" becomes 2 and looks
+    like a clean parse to anything that only checks for null afterwards. A
+    rounded count is an invented one.
+
+    Module level rather than nested in one transform: activity_nsap's
+    beneficiary counts and gp_profile's populations are the same question
+    about the same kind of column, and two copies of this predicate would
+    drift (#116, #123).
+    """
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    if not value.is_finite():
+        return False
+    return value != value.to_integral_value()
+
+
+def _is_non_finite(text: object) -> bool:
+    """NaN and Infinity: not fractional, and still not a count."""
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    return not value.is_finite()
+
+
 class EmptyRequiredColumn(ValueError):
     """A required column resolved by name, but none of its values survived.
 
@@ -393,7 +429,9 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
     A row carrying a value that is present but unreadable is quarantined
     rather than loaded with a hole: nine good measures do not make a tenth
     trustworthy, and a silently-NULL cell is the thing this whole function is
-    arranged to prevent.
+    arranged to prevent. "Unreadable" includes values that parse *too*
+    willingly -- ``to_int`` rounds, so a population of "1.5" would otherwise
+    be stored as 2, an invented number rather than a missing one.
     """
 
     if profile.empty:
@@ -418,7 +456,17 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
         )
         converted = to_int(series)
         text = series.astype("string").str.strip()
-        unreadable |= text.notna() & (text != "") & converted.isna()
+        # `to_int` rounds, so a fractional count parses cleanly and a
+        # null-check alone would accept an invented one. Same grouping cleanup
+        # and same two predicates as activity_nsap, which asks this about the
+        # same kind of column.
+        cleaned = text.map(
+            lambda value: ungroup_digits(value) if isinstance(value, str) else value
+        ).astype("string")
+        present = text.notna() & (text != "")
+        unreadable |= present & (
+            converted.isna() | cleaned.map(_is_fractional) | cleaned.map(_is_non_finite)
+        )
         out[target] = converted
 
     unkeyed = out["gp_lgd_code"].isna()
@@ -675,26 +723,6 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
         lambda text: ungroup_digits(text) if isinstance(text, str) else text
     ).astype("string")
     malformed = raw.notna() & (raw != "") & cleaned.isna()
-
-    def _is_fractional(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        if not value.is_finite():
-            return False
-        return value != value.to_integral_value()
-
-    def _is_non_finite(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        return not value.is_finite()
 
     fractional = cleaned.map(_is_fractional)
     non_finite = cleaned.map(_is_non_finite)
