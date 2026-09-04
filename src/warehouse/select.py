@@ -111,15 +111,29 @@ def resolve_snapshots(
                 f"snapshot {snapshot_id!r} declares unrecognized dataset(s) {unknown}; "
                 "teach warehouse.schema.KIND_TABLES about them before building"
             )
-        missing_kinds = tuple(kind for kind in KNOWN_KIND_PREFIXES if kind not in tables)
-        if missing_kinds:
-            # A kind absent entirely (never requested at normalization time)
-            # is not the same as a kind present with zero rows.
-            raise SelectionError(
-                f"snapshot {snapshot_id!r} is missing required source-kind dataset(s) "
-                f"{missing_kinds}; a partial normalization cannot be built"
-            )
         resolved.append(SelectedSnapshot(
             spec=spec, snapshot_root=snapshot_root, manifest=manifest, tables=tables,
         ))
+
+    # Checked across the SELECTION, not per snapshot. The guarantee is
+    # unchanged -- a build still cannot be missing a source kind -- but it is
+    # the build that must be complete, not every contributor to it.
+    #
+    # This sat inside the loop above, which read as "each snapshot must carry
+    # all five kinds". That was always stronger than the design:
+    # `build_warehouse.py` accepts repeated --snapshot-id, and
+    # `build._merge_gram_panchayat` exists specifically to merge contributions
+    # across snapshots in one build. It also made a single-source snapshot
+    # illegal, so adding any new kind -- gp_profile (#123), voucher (#129) --
+    # would have retroactively invalidated every snapshot already approved,
+    # including the one production is about to serve.
+    covered = {name for snapshot in resolved for name in snapshot.tables}
+    missing_kinds = tuple(kind for kind in KNOWN_KIND_PREFIXES if kind not in covered)
+    if missing_kinds:
+        # A kind absent entirely (never requested at normalization time) is
+        # not the same as a kind present with zero rows.
+        raise SelectionError(
+            f"selection {tuple(snapshot_ids)!r} is missing required source-kind "
+            f"dataset(s) {missing_kinds}; a partial normalization cannot be built"
+        )
     return tuple(resolved)

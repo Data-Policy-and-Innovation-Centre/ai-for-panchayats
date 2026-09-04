@@ -153,6 +153,74 @@ def test_truncated_snapshot_missing_a_kind_is_rejected(tmp_path: Path):
         resolve_snapshots(settings, ("snap-1",), registry=spec_registry)
 
 
+def test_two_partial_snapshots_whose_union_is_complete_are_accepted(tmp_path: Path):
+    """Completeness is a property of the BUILD, not of every contributor.
+
+    The kind check used to sit inside the per-snapshot loop, which read as
+    "each snapshot must carry all five kinds". That was always stronger than
+    the design intends -- `build_warehouse.py` accepts repeated --snapshot-id
+    and `build._merge_gram_panchayat` exists precisely to merge contributions
+    across snapshots -- and it made a single-source snapshot illegal.
+
+    That is not a hypothetical restriction. Adding any new kind (gp_profile
+    for #123, voucher for #129) would have retroactively invalidated every
+    snapshot already approved, including the full-state one production is
+    about to serve, because none of them carries a dataset that did not exist
+    when they were normalized.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 7}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL"})
+    normalize(run_b, settings.canonical_root, chunk_size=100,
+              kinds={"AA", "TA", "PP", "RE"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+    )
+
+    # Neither is complete alone -- proven, not assumed, so this test cannot
+    # pass by both snapshots happening to carry everything.
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-a",), registry=spec_registry)
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-b",), registry=spec_registry)
+
+    resolved = resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+    assert len(resolved) == 2
+    covered = {name for snapshot in resolved for name in snapshot.tables}
+    assert {"pl", "aa", "ta", "pp", "re"} <= covered
+
+
+def test_a_selection_whose_union_is_still_incomplete_is_rejected(tmp_path: Path):
+    """The guarantee is unchanged: a build cannot be missing a source kind.
+
+    Two partial snapshots that between them still lack a kind must fail, or
+    lifting the check out of the loop would have weakened it into nothing.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 7}]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"AA", "TA"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+    )
+    with pytest.raises(SelectionError, match="missing required source-kind"):
+        resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+
 def test_snapshot_with_all_kinds_explicitly_empty_is_still_accepted(tmp_path: Path):
     """A kind requested but producing zero rows is not the same as a kind
     never requested -- this must still resolve cleanly."""
