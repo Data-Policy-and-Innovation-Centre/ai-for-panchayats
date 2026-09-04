@@ -352,3 +352,143 @@ def test_union_schema_is_stable_across_chunk_boundaries(tmp_path: Path):
     assert str(table.schema.field("amount").type) == "string"
     assert [row["amount"] for row in table.to_pylist()] == ["1", "two"]
     assert result.max_buffered_rows <= 1
+
+
+def _parses_for(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gps: int) -> tuple[int, int]:
+    """(payload files, json.loads calls) for a run over `gps` GP folders."""
+
+    import src.pipeline.normalize as normalize_module
+
+    payloads: dict[str, object] = {}
+    for index in range(gps):
+        gp = f"LGD_{index}_GP"
+        payloads[f"{gp}/2021_PL.json"] = {"data": [{
+            "activityCd": 7, "totalCost": 100,
+            "fundList": [{"schemeCode": "S1", "amountTotal": 5}],
+        }]}
+        payloads[f"{gp}/2021_AA.json"] = {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [{"wrkSchmCd": "SC1"}],
+        }]}
+    run = make_run(tmp_path / f"g{gps}", "run-1", payloads)
+
+    parses = 0
+    real_loads = normalize_module.json.loads
+
+    def counting_loads(*args, **kwargs):
+        nonlocal parses
+        parses += 1
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr(normalize_module.json, "loads", counting_loads)
+    try:
+        normalize_egramswaraj(run, tmp_path / f"canonical-{gps}", chunk_size=100)
+    finally:
+        monkeypatch.setattr(normalize_module.json, "loads", real_loads)
+    return len(payloads), parses
+
+
+def test_parse_cost_scales_with_input_not_with_table_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Cost must be O(input), not O(tables x input) -- #145.
+
+    The old shape walked the whole payload tree once to infer schemas, once
+    per output table, and once more for quarantine. On the full state that
+    was 12 walks of ~204,000 files: ~118 GiB of JSON parsed to emit ~1.3 GiB
+    of Parquet, with 88% of wall-clock in json.loads.
+
+    Asserted as a *slope* rather than an absolute count, so the fixed cost of
+    reading the run manifests cannot mask a regression, and so the number
+    does not have to be updated whenever an unrelated json.loads is added.
+
+    Two walks remain by design: schema inference has to see every record
+    before a Parquet column type can be fixed. Both fixtures produce the same
+    six tables, so under the old shape this slope would be 8, not 2.
+    """
+
+    small_files, small_parses = _parses_for(tmp_path, monkeypatch, 3)
+    large_files, large_parses = _parses_for(tmp_path, monkeypatch, 9)
+
+    slope = (large_parses - small_parses) / (large_files - small_files)
+    assert slope == 2, (
+        f"{slope} parses per input file: expected 2 (schema inference + one "
+        f"write pass), not one walk per output table"
+    )
+
+
+def test_peak_buffered_rows_does_not_grow_with_table_count(tmp_path: Path):
+    """The single-pass rewrite must not buy speed with memory.
+
+    Holding one buffer per table is the obvious way to walk the input once,
+    and it multiplies peak buffered rows by the number of tables. Buffers are
+    flushed on a shared budget instead, so this bound holds however many
+    tables a run produces.
+
+    What this does and does not pin: ``max_buffered_rows`` counts rows held
+    across *all* buffers, so switching to per-table thresholds makes this
+    fail. It would not catch a change that also redefined the metric to be
+    per-table -- that is what the peak-RSS column in
+    ``scripts/benchmark_normalize.py`` is for.
+    """
+
+    payloads = {}
+    for index in range(6):
+        payloads[f"LGD_{index}_GP/2021_PL.json"] = {"data": [
+            {"activityCd": n, "totalCost": n,
+             "fundList": [{"schemeCode": "S", "amountTotal": n}]}
+            for n in range(20)
+        ]}
+    run = make_run(tmp_path, "run-1", payloads)
+
+    result = normalize_egramswaraj(run, tmp_path / "canonical", chunk_size=8)
+
+    assert result.max_buffered_rows <= 8, (
+        f"buffered {result.max_buffered_rows} rows against a chunk_size of 8"
+    )
+
+
+def test_a_small_table_is_not_split_into_one_part_per_flush(tmp_path: Path):
+    """Sharing a flush budget must not shred the small tables.
+
+    Buffers share one row budget, so a big table trips it. Flushing *every*
+    buffer at that point writes whatever the small tables happen to be
+    holding -- a row or two -- as a Parquet file of its own, once per flush.
+    On this fixture that is 12 files for 20 rows; at full-state scale it is
+    hundreds of near-empty files per small table.
+
+    Flushing fullest-first and stopping once the budget is met leaves the
+    small buffers alone until the end, so they land in one file.
+
+    The small table here is ``aa``, which sorts *before* the big ``pl``, and
+    that is the point: an earlier version of this test used a small table
+    that sorted last, so plain alphabetical order emptied the big buffer
+    first and the test passed without fullest-first doing anything. Both
+    mutations have to fail -- flushing everything, and flushing in name order
+    -- and with the small table sorting first, both do.
+
+    Peak buffered rows is unchanged either way; that is
+    ``test_peak_buffered_rows_does_not_grow_with_table_count``.
+    """
+
+    payloads = {}
+    for index in range(20):
+        gp = f"LGD_{index}_GP"
+        # 30 activities per GP dominate the shared budget.
+        payloads[f"{gp}/2021_PL.json"] = {"data": [
+            {"activityCd": n, "totalCost": n} for n in range(30)
+        ]}
+        # One AA record beside them, spread across the whole input rather
+        # than sitting at the start.
+        payloads[f"{gp}/2021_AA.json"] = {"data": [
+            {"activityCd": 1, "wrkAdmApprNo": f"A{index}"}
+        ]}
+    run = make_run(tmp_path, "run-1", payloads)
+
+    result = normalize_egramswaraj(run, tmp_path / "canonical", chunk_size=50)
+
+    parts = list((result.output_root / "aa").rglob("*.parquet"))
+    assert len(parts) == 1, (
+        f"20 rows written as {len(parts)} part files; the small table is "
+        f"being flushed alongside the big one"
+    )

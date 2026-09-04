@@ -13,9 +13,10 @@ import re
 import shutil
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,6 +25,8 @@ from .manifest import ManifestError, RunManifest, approve_run
 
 KNOWN_ENVELOPE_KEYS = frozenset({"data", "response", "result", "records", "rows"})
 SUPPORTED_KINDS = frozenset({"PL", "AA", "TA", "PP", "RE"})
+# Not a source table: the sink for records no adapter could turn into rows.
+QUARANTINE_TABLE = "quarantine"
 KIND_RE = re.compile(
     r"(?i)(?P<year>\d{4}(?:-\d{2,4})?)[_-](?P<kind>PL|AA|TA|PP|RE)(?:$|[_-])"
 )
@@ -678,60 +681,95 @@ def normalize_egramswaraj(
         _merge_table_types(table_types.setdefault(table_name, dict(PROVENANCE_SCHEMA)), [value])
 
     destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
-    staged_tables: dict[str, list[Path]] = {}
     observed_max_buffered_rows = 0
     with AtomicParquetPublication(destination) as publication:
+        # One pass over the input, one buffer per table, rather than a full
+        # re-read and re-parse of every file for each table in turn.
+        #
+        # The old shape cost 1 schema-inference walk + one walk per table + a
+        # quarantine walk. On the full state that is 12 walks of ~204,000
+        # files -- ~118 GiB parsed to produce ~1.3 GiB of Parquet, with 88% of
+        # wall-clock in json.loads. Eleven of those twelve walks parsed each
+        # file only to discard it (#145).
+        #
+        # Memory is deliberately unchanged. Buffers share one budget: when the
+        # rows held across every table reach chunk_size, the fullest buffers
+        # are written out until the total is back under it. Giving each table
+        # its own chunk_size threshold would have been simpler and would have
+        # raised peak buffered rows by the number of tables.
+        #
+        # Fullest-first, and stopping at the budget rather than emptying every
+        # buffer, is what protects the *small* tables. A table holding 40 rows
+        # when a big table trips the budget would otherwise be written as a
+        # 40-row Parquet file -- once per flush, so hundreds of near-empty
+        # files per small table at full-state scale.
+        #
+        # It does not restore the old part sizes for the big tables, and does
+        # not try to. Sharing one budget across N filling tables means the
+        # fullest holds roughly chunk_size/N when it trips, so at 1,000 GPs
+        # the run writes 718 part files where the old shape wrote 199, and
+        # 227.4 MB where it wrote 218.0 (+4.3%, from per-file overhead).
+        # Buying those back means a budget of N x chunk_size, which is a real
+        # memory regression; --chunk-size is the knob for anyone who wants
+        # that trade. Note it now bounds rows buffered in *total*, where it
+        # used to bound rows per part per table.
+        schemas = {name: _arrow_schema(types) for name, types in table_types.items()}
+        schemas[QUARANTINE_TABLE] = _arrow_schema({
+            "source_system": pa.string(), "source_run_id": pa.string(),
+            "source_record_id": pa.string(), "schema_version": pa.string(),
+            "source_file": pa.string(), "source_kind": pa.string(),
+            "reason_code": pa.string(), "reason": pa.string(), "raw_value": pa.string(),
+        })
+        paths_by_table: dict[str, list[Path]] = {name: [] for name in schemas}
+        buffers: dict[str, list[Mapping[str, Any]]] = {name: [] for name in schemas}
+        buffered_rows = 0
+
+        def flush(*, final: bool) -> None:
+            nonlocal buffered_rows
+            # Ties broken by name so the write order never depends on dict
+            # insertion order, which depends on which file was read first.
+            # (Order *within* a table is the walk order either way, so this
+            # decides only which files rows land in, not their sequence.)
+            for name in sorted(buffers, key=lambda n: (-len(buffers[n]), n)):
+                if not final and buffered_rows < chunk_size:
+                    return
+                rows = buffers[name]
+                if not rows:
+                    continue
+                paths_by_table[name].extend(publication.write_rows(
+                    name, rows, chunk_size=chunk_size, schema=schemas[name],
+                    partition_by_fiscal_year=name != QUARANTINE_TABLE,
+                ))
+                buffered_rows -= len(rows)
+                rows.clear()
+
+        for item_name, value in _iter_run_items(payload_root, manifest, wanted):
+            if item_name is None:
+                buffers[QUARANTINE_TABLE].append(value.as_row(manifest))
+            else:
+                # Present by construction: the inference pass above walked the
+                # same input with the same `wanted`, so it saw every table name
+                # this pass can produce.
+                buffers[item_name].append(value)
+            buffered_rows += 1
+            observed_max_buffered_rows = max(observed_max_buffered_rows, buffered_rows)
+            if buffered_rows >= chunk_size:
+                flush(final=False)
+        flush(final=True)
+
         for table_name in sorted(table_types):
-            schema = _arrow_schema(table_types[table_name])
-            paths: list[Path] = []
-            buffer: list[Mapping[str, Any]] = []
-            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
-                if item_name != table_name:
-                    continue
-                buffer.append(value)
-                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
-                if len(buffer) >= chunk_size:
-                    paths.extend(publication.write_rows(
-                        table_name, buffer, chunk_size=chunk_size, schema=schema,
-                    ))
-                    buffer.clear()
-            if buffer:
-                paths.extend(publication.write_rows(
-                    table_name, buffer, chunk_size=chunk_size, schema=schema,
-                ))
-                buffer.clear()
-            if not paths:
-                paths.extend(publication.write_empty(table_name, schema))
-            staged_tables[table_name] = paths
+            if not paths_by_table[table_name]:
+                paths_by_table[table_name].extend(
+                    publication.write_empty(table_name, schemas[table_name])
+                )
+        staged_tables = {name: paths_by_table[name] for name in sorted(table_types)}
         if quarantine_count:
-            qschema = _arrow_schema({
-                "source_system": pa.string(), "source_run_id": pa.string(),
-                "source_record_id": pa.string(), "schema_version": pa.string(),
-                "source_file": pa.string(), "source_kind": pa.string(),
-                "reason_code": pa.string(), "reason": pa.string(), "raw_value": pa.string(),
-            })
-            paths = []
-            buffer = []
-            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
-                if item_name is not None:
-                    continue
-                buffer.append(value.as_row(manifest))
-                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
-                if len(buffer) >= chunk_size:
-                    paths.extend(publication.write_rows(
-                        "quarantine", buffer, chunk_size=chunk_size,
-                        partition_by_fiscal_year=False, schema=qschema,
-                    ))
-                    buffer.clear()
-            if buffer:
-                paths.extend(publication.write_rows(
-                    "quarantine", buffer, chunk_size=chunk_size,
-                    partition_by_fiscal_year=False, schema=qschema,
-                ))
-            staged_tables["quarantine"] = paths
+            staged_tables[QUARANTINE_TABLE] = paths_by_table[QUARANTINE_TABLE]
         files = {
             table_name: {
-                "row_count": table_counts.get(table_name, quarantine_count if table_name == "quarantine" else 0),
+                "row_count": table_counts.get(
+                    table_name, quarantine_count if table_name == QUARANTINE_TABLE else 0
+                ),
                 "files": [_canonical_file_record(publication.staging_root, path) for path in paths],
             }
             for table_name, paths in staged_tables.items()
