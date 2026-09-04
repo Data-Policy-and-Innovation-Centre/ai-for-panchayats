@@ -186,6 +186,16 @@ def assert_full_state(artifact: Path) -> int:
             "SELECT gp_lgd_code, " + ", ".join(GEOGRAPHY_COLUMNS)
             + f" FROM {ATTACH_CATALOG}.gram_panchayat"
         ).fetchall()
+        # PROFILE is deliberately not in schema.REQUIRED_KINDS -- an
+        # independent reference extract must not make a rebuild of the scraped
+        # data impossible (#123). That argument is only honest if completeness
+        # is enforced where the artifact actually becomes deployable, which is
+        # here. Without this a build selecting only the PL/AA/TA/PP/RE
+        # snapshots publishes an empty gp_profile: the DDL creates the table
+        # either way, and nothing downstream reads its row count.
+        profile_rows = None if ("gp_profile",) not in tables else conn.execute(
+            f"SELECT count(*) FROM {ATTACH_CATALOG}.gp_profile"
+        ).fetchone()[0]
     if not floor <= actual <= expected:
         print(
             f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
@@ -207,6 +217,25 @@ def assert_full_state(artifact: Path) -> int:
                 f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
                 file=sys.stderr,
             )
+        return 1
+    if profile_rows is None:
+        print(
+            f"error: {artifact} has no gp_profile table; a deployable snapshot must "
+            "carry GP demographics (#123). Rebuild including the profile snapshot.",
+            file=sys.stderr,
+        )
+        return 1
+    # Against the same roster and the same floor as gram_panchayat above. The
+    # ceiling is the roster, not equality: 84 of the 6,794 GPs have no profile
+    # upstream at all, so demanding one per GP would refuse a complete build.
+    if not floor <= profile_rows <= expected:
+        print(
+            f"error: {artifact} holds {profile_rows:,} gp_profile rows; a deployable "
+            f"snapshot must hold between {floor:,} and {expected:,}. An empty or "
+            "partial gp_profile means the profile snapshot was left out of the "
+            "build, not that the demographics are missing upstream.",
+            file=sys.stderr,
+        )
         return 1
     mismatches = _geography_mismatches(geography_rows, gp_geography())
     if mismatches:

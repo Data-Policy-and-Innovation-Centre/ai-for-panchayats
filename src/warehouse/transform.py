@@ -173,6 +173,28 @@ class FieldResolutions:
         return tuple(r for r in self.records if r.matched_candidate is None)
 
 
+class EmptyRequiredColumn(ValueError):
+    """A required column resolved by name, but none of its values survived.
+
+    The sibling case ``RequiredFieldUnresolved`` does not cover, and the one
+    that is easier to reach: the header is still there and the values are not.
+    ``_first_present`` proves a column NAME exists; nothing proved the values
+    parsed. A scrape emitting blanks -- or text where a count belongs -- would
+    otherwise publish the right number of rows with entirely NULL measures,
+    past every check there is, because the columns are nullable and no
+    conformance rule reads their contents (#123).
+    """
+
+    def __init__(self, *, table: str, columns: tuple[str, ...], rows: int) -> None:
+        self.table = table
+        self.columns = columns
+        self.rows = rows
+        super().__init__(
+            f"{table}: required column(s) {columns!r} are null in all {rows:,} loaded "
+            "row(s); the source column is present but carries no readable values"
+        )
+
+
 def _dedupe(frame: pd.DataFrame, keys: list[str], table: str, quarantine: Quarantine,
             *, source_system: str, source_run_id: str) -> pd.DataFrame:
     """Collapse to one row per composite key, quarantining genuine conflicts.
@@ -360,11 +382,18 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
     * **A keyed row whose GP is not in `gram_panchayat`** is an orphan, and
       goes to quarantine under the standard reason code.
 
-    Every one of the ten measures is resolved with ``required=True``. A
-    profile whose population columns were renamed upstream must fail the
-    build loudly; loading 6,710 rows of all-NULL demographics would pass every
-    check this repo has -- right row count, no orphans, valid key -- and be
-    wrong in the only way that matters.
+    Every one of the ten measures is resolved with ``required=True``, and then
+    checked again after conversion. The two catch different failures and only
+    the pair is sufficient: ``required=True`` catches an upstream *rename*,
+    while ``EmptyRequiredColumn`` catches the header surviving with no readable
+    values behind it. Either way, loading 6,710 rows of all-NULL demographics
+    would pass every other check this repo has -- right row count, no orphans,
+    valid key -- and be wrong in the only way that matters.
+
+    A row carrying a value that is present but unreadable is quarantined
+    rather than loaded with a hole: nine good measures do not make a tenth
+    trustworthy, and a silently-NULL cell is the thing this whole function is
+    arranged to prevent.
     """
 
     if profile.empty:
@@ -378,11 +407,19 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
         "source_run_id": profile["source_run_id"],
         "gp_lgd_code": to_code(key),
     })
+    # A value that was present in the source and did NOT survive the cast is a
+    # parse failure, not an absent measure, and `to_int` cannot tell them apart
+    # -- it coerces both to NA. Tracked here, while the raw text is still in
+    # reach, so the row can be quarantined rather than loaded with a hole.
+    unreadable = pd.Series(False, index=profile.index)
     for source, target in GP_PROFILE_RENAMES.items():
         series, _ = _first_present(
             profile, "gp_profile", target, (source,), required=True,
         )
-        out[target] = to_int(series)
+        converted = to_int(series)
+        text = series.astype("string").str.strip()
+        unreadable |= text.notna() & (text != "") & converted.isna()
+        out[target] = converted
 
     unkeyed = out["gp_lgd_code"].isna()
     if unkeyed.any():
@@ -401,6 +438,26 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
         out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id,
     )
+
+    bad = unreadable.reindex(out.index, fill_value=False)
+    if bad.any():
+        quarantine.add(
+            "gp_profile", "unreadable_measure",
+            "a population or household value could not be read as a whole number",
+            "gp_lgd_code", out.loc[bad, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~bad]
+
+    # Last, on the rows actually being loaded. `required=True` above only
+    # proves the column NAME survived upstream; this is what makes the
+    # docstring's claim true rather than aspirational.
+    if not out.empty:
+        empty = tuple(
+            column for column in GP_PROFILE_RENAMES.values() if out[column].isna().all()
+        )
+        if empty:
+            raise EmptyRequiredColumn(table="gp_profile", columns=empty, rows=len(out))
     return out[GP_PROFILE_COLUMNS]
 
 

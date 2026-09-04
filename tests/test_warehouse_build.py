@@ -19,7 +19,7 @@ from src.pipeline.manifest import RunPublisher
 from src.pipeline.normalize import normalize_run
 from warehouse.build import BuildResult, build, create_schema
 from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
-from warehouse.transform import RequiredFieldUnresolved
+from warehouse.transform import EmptyRequiredColumn, RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
 from _warehouse_helpers import approved, make_settings, normalize, publish_raw_run, registry, write_manual_snapshot
@@ -862,3 +862,61 @@ def test_gp_profile_fails_the_build_when_a_population_column_is_renamed(tmp_path
                 approved("profile-1", "egramswaraj_profile", "profile-1"),
             ),
         )
+
+
+def test_gp_profile_fails_the_build_when_a_column_survives_but_its_values_do_not(tmp_path: Path):
+    """`required=True` proves a column NAME survived, not that values did.
+
+    The header can stay while the scrape starts emitting blanks, and `to_int`
+    turns every one of them into NULL without complaint. The columns are
+    nullable and no conformance rule reads their contents, so the build would
+    publish the right number of GPs with entirely empty demographics -- the
+    exact silent failure the required-field logic is there to prevent, reached
+    by the route it does not cover.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(tmp_path, settings, "profile-1", "123,Test GP,,,,,,,,,,")
+    with pytest.raises(EmptyRequiredColumn, match="total_population"):
+        build(
+            snapshot_ids=("snap-1", "profile-1"), settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )
+
+
+def test_gp_profile_quarantines_a_row_whose_measure_cannot_be_read(tmp_path: Path):
+    """A present-but-unreadable value is a parse failure, not an absent measure.
+
+    `to_int` coerces both to NA and cannot tell them apart, so the raw text is
+    checked while it is still in reach. The row is quarantined rather than
+    loaded with a hole: nine good measures do not make a tenth trustworthy,
+    and a silently-NULL cell is what this whole path exists to prevent.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,450,440,10,200,100,150,300,350,not-a-number\n"
+        "456,Other GP,800,400,390,10,180,90,140,280,300,190",
+    )
+    # 456 is not in gram_panchayat, so it is an orphan; 123 is the readable one.
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        reasons = dict(con.execute(
+            "SELECT reason_code, sum(row_count) FROM quarantine "
+            "WHERE table_name = 'gp_profile' GROUP BY reason_code"
+        ).fetchall())
+        assert reasons == {"unreadable_measure": 1, "orphan_reference": 1}
+    finally:
+        con.close()

@@ -22,12 +22,15 @@ from warehouse.schema import CREATE_ORDER, DDL
 FULL_STATE = len(gp_geography())
 
 
-def _artifact(path: Path, gp_count: int, *, extra: int = 0) -> Path:
+def _artifact(path: Path, gp_count: int, *, extra: int = 0, profiles: bool = True) -> Path:
     """A structurally complete warehouse holding `gp_count` real GPs.
 
     ``extra`` appends GP codes the reference tree does not know, which is the
     only way to build an artifact with *more* rows than the roster -- slicing
     past its end just gives the whole roster back.
+
+    ``profiles`` fills gp_profile to match. Default True because a deployable
+    artifact carries demographics (#123); the False case is its own test.
     """
 
     rows = [
@@ -49,6 +52,12 @@ def _artifact(path: Path, gp_count: int, *, extra: int = 0) -> Path:
                 "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            if profiles:
+                con.executemany(
+                    "INSERT INTO gp_profile (gp_lgd_code, total_population, households) "
+                    "VALUES (?, ?, ?)",
+                    [(row[0], 1000, 200) for row in rows],
+                )
     finally:
         con.close()
     return path
@@ -469,3 +478,32 @@ def test_make_run_stamps_real_provenance_on_the_raw_run():
     # rebuild would need; sharing one between modes would make them look alike.
     assert prod["config-hash"] != staging["config-hash"]
     assert prod["code-sha"] == staging["code-sha"]  # same tree, same code
+
+
+def test_a_build_without_demographics_cannot_be_pinned(tmp_path: Path, capsys):
+    """PROFILE is not a required kind; the publication guard is what makes that safe.
+
+    `schema.REQUIRED_KINDS` deliberately excludes PROFILE so that a rebuild of
+    the scraped data alone stays possible (#123). The cost of that choice is
+    that a build selecting only the PL/AA/TA/PP/RE snapshots completes with an
+    empty gp_profile -- the DDL creates the table either way, and nothing
+    downstream reads its row count. This is where that has to be caught,
+    because this script is the only place an artifact becomes deployable.
+    """
+
+    artifact = _artifact(tmp_path / "no-profile.duckdb", 6794, profiles=False)
+    assert _pin(artifact, tmp_path / "out.json") == 1
+    assert "gp_profile rows" in capsys.readouterr().err
+
+
+def test_an_artifact_without_a_gp_profile_table_is_refused(tmp_path: Path, capsys):
+    """A missing table is a different failure from an empty one, and says so."""
+
+    artifact = _artifact(tmp_path / "dropped.duckdb", 6794)
+    con = duckdb.connect(str(artifact))
+    try:
+        con.execute("DROP TABLE gp_profile")
+    finally:
+        con.close()
+    assert _pin(artifact, tmp_path / "out.json") == 1
+    assert "no gp_profile table" in capsys.readouterr().err
