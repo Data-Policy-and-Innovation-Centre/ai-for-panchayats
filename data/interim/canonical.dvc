@@ -1,0 +1,6 @@
+outs:
+- md5: 6a2c4e76bd70903760336ab081e0b5a9.dir
+  size: 1627112703
+  nfiles: 1126
+  hash: md5
+  path: canonical
