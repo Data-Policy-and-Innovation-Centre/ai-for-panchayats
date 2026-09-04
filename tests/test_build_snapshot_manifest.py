@@ -15,7 +15,12 @@ import duckdb
 import pytest
 
 from scripts.build_snapshot_manifest import DEFAULT_EXCEPTIONS, main
-from warehouse.conformance import EXPECTED_GP_COUNT, GEOGRAPHY_COLUMNS, MIN_GP_COVERAGE
+from warehouse.conformance import (
+    EXPECTED_GP_COUNT,
+    GEOGRAPHY_COLUMNS,
+    GP_PROFILE_MEASURES,
+    MIN_GP_COVERAGE,
+)
 from warehouse.geography import gp_geography
 from warehouse.schema import CREATE_ORDER, DDL
 
@@ -53,10 +58,16 @@ def _artifact(path: Path, gp_count: int, *, extra: int = 0, profiles: bool = Tru
                 rows,
             )
             if profiles:
+                # Every measure, not two of them. Populating a subset is the
+                # defect `check_gp_profile_completeness` exists to catch, and
+                # this fixture demonstrated it: an artifact with the right row
+                # count and eight NULL columns was pinned clean.
+                measures = ", ".join(GP_PROFILE_MEASURES)
+                placeholders = ", ".join("?" for _ in GP_PROFILE_MEASURES)
                 con.executemany(
-                    "INSERT INTO gp_profile (gp_lgd_code, total_population, households) "
-                    "VALUES (?, ?, ?)",
-                    [(row[0], 1000, 200) for row in rows],
+                    f"INSERT INTO gp_profile (gp_lgd_code, {measures}) "
+                    f"VALUES (?, {placeholders})",
+                    [(row[0], *range(1, len(GP_PROFILE_MEASURES) + 1)) for row in rows],
                 )
     finally:
         con.close()
@@ -493,7 +504,7 @@ def test_a_build_without_demographics_cannot_be_pinned(tmp_path: Path, capsys):
 
     artifact = _artifact(tmp_path / "no-profile.duckdb", 6794, profiles=False)
     assert _pin(artifact, tmp_path / "out.json") == 1
-    assert "gp_profile rows" in capsys.readouterr().err
+    assert "gp_profile.gp_count" in capsys.readouterr().err
 
 
 def test_an_artifact_without_a_gp_profile_table_is_refused(tmp_path: Path, capsys):

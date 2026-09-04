@@ -430,8 +430,10 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
     rather than loaded with a hole: nine good measures do not make a tenth
     trustworthy, and a silently-NULL cell is the thing this whole function is
     arranged to prevent. "Unreadable" includes values that parse *too*
-    willingly -- ``to_int`` rounds, so a population of "1.5" would otherwise
-    be stored as 2, an invented number rather than a missing one.
+    willingly: ``to_int`` rounds, so a population of "1.5" would otherwise be
+    stored as 2 -- an invented number rather than a missing one -- and it
+    carries a negative through untouched, though nobody ever counted -1
+    people.
     """
 
     if profile.empty:
@@ -464,8 +466,14 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
             lambda value: ungroup_digits(value) if isinstance(value, str) else value
         ).astype("string")
         present = text.notna() & (text != "")
+        # A negative population or household count is impossible, and `to_int`
+        # carries it through untouched -- it is neither null, fractional nor
+        # non-finite, so every other predicate here accepts it.
         unreadable |= present & (
-            converted.isna() | cleaned.map(_is_fractional) | cleaned.map(_is_non_finite)
+            converted.isna()
+            | cleaned.map(_is_fractional)
+            | cleaned.map(_is_non_finite)
+            | (converted < 0)
         )
         out[target] = converted
 

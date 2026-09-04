@@ -20,6 +20,7 @@ from warehouse.geography import gp_geography
 
 from warehouse.conformance import (
     EXPECTED_ACTIVITY_EXPENDITURE_TOTAL,
+    GP_PROFILE_MEASURES,
     EXPECTED_PLANNED_COST_TOTAL,
     EXPECTED_VOUCHER_AMOUNT_TOTAL,
     check_activity_expenditure_fk_not_enforced,
@@ -30,6 +31,7 @@ from warehouse.conformance import (
     check_conformance,
     check_dim_code_uniqueness,
     check_geography_completeness,
+    check_gp_profile_completeness,
     check_fiscal_year_format,
     check_money_types,
     check_primary_keys,
@@ -859,6 +861,16 @@ def _seed_full_state_geography(con):
         "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
+    # Demographics too: "full state" now means both coverage checks, and a
+    # fixture that seeds one and not the other is the shape of artifact this
+    # is meant to refuse. Every measure is populated -- naming a subset is the
+    # trap `check_gp_profile_completeness` exists to close.
+    measures = ", ".join(GP_PROFILE_MEASURES)
+    placeholders = ", ".join("?" for _ in GP_PROFILE_MEASURES)
+    con.executemany(
+        f"INSERT INTO gp_profile (gp_lgd_code, {measures}) VALUES (?, {placeholders})",
+        [(row[0], *range(1, len(GP_PROFILE_MEASURES) + 1)) for row in rows],
+    )
     return rows[0][0]
 
 
@@ -936,4 +948,49 @@ def test_check_conformance_rejects_schema_previously_passed_as_conformant(tmp_pa
     assert "type.money.voucher.amount" in checks_fired
     assert "constraint.foreign_key.planned_activity.plan_code" in checks_fired
     assert has_violations(findings)
+    con.close()
+
+
+def test_gp_profile_with_the_right_row_count_and_no_data_is_a_violation(tmp_path):
+    """Row count is not the check -- that was #61's mistake, one table over.
+
+    An artifact can hold a profile row for every GP and carry nothing in it.
+    `transform.gp_profile` raises `EmptyRequiredColumn` on that, but only
+    while it is building the table; an artifact produced elsewhere, by an
+    older version, or hand-patched never goes through it. This is the check
+    that sees such an artifact.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    rows = [
+        (code, f"GP {code}", geo["state_code"], geo["state_name"],
+         geo["district_code"], geo["zp_name"], geo["block_code"], geo["block_name"])
+        for code, geo in gp_geography().items()
+    ]
+    con.executemany(
+        "INSERT INTO gram_panchayat (gp_lgd_code, gp_name, state_code, state_name, "
+        "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    # Right count, every measure NULL.
+    con.executemany("INSERT INTO gp_profile (gp_lgd_code) VALUES (?)", [(r[0],) for r in rows])
+    findings = check_gp_profile_completeness(con)
+    assert [f.check for f in findings] == ["gp_profile.populated"]
+
+    # And the subset case, which is how the manifest fixture hid this: two of
+    # the ten populated still leaves eight columns of nothing.
+    con.execute("UPDATE gp_profile SET total_population = 1, households = 2")
+    assert [f.check for f in check_gp_profile_completeness(con)] == ["gp_profile.populated"]
+
+    con.execute(
+        "UPDATE gp_profile SET "
+        + ", ".join(f"{col} = 1" for col in GP_PROFILE_MEASURES)
+    )
+    assert check_gp_profile_completeness(con) == []
+
+    # A negative count is impossible, and nothing else here would catch it:
+    # it is not null, not fractional and not non-finite.
+    con.execute("UPDATE gp_profile SET male_population = -1")
+    assert [f.check for f in check_gp_profile_completeness(con)] == ["gp_profile.non_negative"]
     con.close()

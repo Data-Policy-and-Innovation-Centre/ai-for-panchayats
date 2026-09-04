@@ -954,3 +954,34 @@ def test_gp_profile_quarantines_a_fractional_count_rather_than_rounding_it(tmp_p
         ).fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_gp_profile_quarantines_a_negative_count(tmp_path: Path):
+    """`to_int` carries a negative through untouched.
+
+    It is not null, not fractional and not non-finite, so every other
+    predicate in the unreadable check accepts it -- and nobody ever counted
+    -1 people.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,-1,440,10,200,100,150,300,350,210",
+    )
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
+            "AND reason_code = 'unreadable_measure'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()

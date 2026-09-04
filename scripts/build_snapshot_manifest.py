@@ -22,7 +22,11 @@ from pathlib import Path
 
 from src.deploy.errors import SnapshotError
 from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
-from src.warehouse.conformance import MIN_GP_COVERAGE, check_geography_completeness
+from src.warehouse.conformance import (
+    MIN_GP_COVERAGE,
+    check_geography_completeness,
+    check_gp_profile_completeness,
+)
 from src.warehouse.geography import GEOGRAPHY_COLUMNS, GeographyError, gp_geography
 
 # #61 is no longer here: gram_panchayat now carries state/district/block for
@@ -193,9 +197,14 @@ def assert_full_state(artifact: Path) -> int:
         # here. Without this a build selecting only the PL/AA/TA/PP/RE
         # snapshots publishes an empty gp_profile: the DDL creates the table
         # either way, and nothing downstream reads its row count.
-        profile_rows = None if ("gp_profile",) not in tables else conn.execute(
-            f"SELECT count(*) FROM {ATTACH_CATALOG}.gp_profile"
-        ).fetchone()[0]
+        # Row count is not the check, for the same reason it was not enough
+        # for geography: 6,710 keys with every measure NULL is the right count
+        # and no data. The transform-side EmptyRequiredColumn cannot help here
+        # -- it runs while the table is being built, and this path exists
+        # precisely to judge an artifact built somewhere else. Delegated to
+        # the conformance check that defines "the demographics are there",
+        # rather than restating a weaker version.
+        profile = None if ("gp_profile",) not in tables else check_gp_profile_completeness(conn)
     if not floor <= actual <= expected:
         print(
             f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
@@ -218,24 +227,24 @@ def assert_full_state(artifact: Path) -> int:
                 file=sys.stderr,
             )
         return 1
-    if profile_rows is None:
+    if profile is None:
         print(
             f"error: {artifact} has no gp_profile table; a deployable snapshot must "
             "carry GP demographics (#123). Rebuild including the profile snapshot.",
             file=sys.stderr,
         )
         return 1
-    # Against the same roster and the same floor as gram_panchayat above. The
-    # ceiling is the roster, not equality: 84 of the 6,794 GPs have no profile
-    # upstream at all, so demanding one per GP would refuse a complete build.
-    if not floor <= profile_rows <= expected:
+    if profile:
         print(
-            f"error: {artifact} holds {profile_rows:,} gp_profile rows; a deployable "
-            f"snapshot must hold between {floor:,} and {expected:,}. An empty or "
-            "partial gp_profile means the profile snapshot was left out of the "
-            "build, not that the demographics are missing upstream.",
+            f"error: {artifact} does not carry complete GP demographics; refusing to "
+            "pin it (#123):",
             file=sys.stderr,
         )
+        for finding in profile:
+            print(
+                f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
+                file=sys.stderr,
+            )
         return 1
     mismatches = _geography_mismatches(geography_rows, gp_geography())
     if mismatches:

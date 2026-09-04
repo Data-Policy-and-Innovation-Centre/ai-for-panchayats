@@ -222,6 +222,23 @@ EXPECTED_BLOCK_COUNT = 314
 # Anything between is neither, and should be looked at by a person.
 MIN_GP_COVERAGE = 0.90
 
+# The demographic measures, spelled out here rather than imported from
+# `transform` on purpose: this module is written against the spec, not against
+# our loader's inputs, so a rename on one side has to fail loudly instead of
+# being followed silently by the checker meant to catch it.
+#
+# Listed in full for the reason the geography list is: naming a subset let a
+# table with 100% NULL district_code pass clean, which is what #61 is named
+# for. The same trap is already visible here -- the manifest test fixture
+# populated total_population and households and left the other eight NULL,
+# and every check passed.
+GP_PROFILE_TABLE = "gp_profile"
+GP_PROFILE_MEASURES: tuple[str, ...] = (
+    "total_population", "male_population", "female_population",
+    "transgender_population", "children_population", "sc_population",
+    "st_population", "obc_population", "general_population", "households",
+)
+
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
 # decimal arithmetic, never binary float ``==``.
@@ -824,6 +841,70 @@ def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding
     return findings
 
 
+def check_gp_profile_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """gp_profile carries real demographics for the whole state (#123).
+
+    The artifact-level counterpart to ``transform.gp_profile``'s
+    ``EmptyRequiredColumn``, and not a duplicate of it. That one runs while
+    the table is being built, so it protects nothing about an artifact built
+    somewhere else, built by an older version, or hand-patched -- and this
+    script is what decides such an artifact is deployable.
+
+    Row count alone is exactly the mistake #61 was: 6,710 keys with every
+    measure NULL is the right count and no data. Checked the same three ways
+    geography is -- columns present, every row populated, count within the
+    roster -- plus non-negativity, because ``clean.to_int`` will happily carry
+    a -1 through and a negative population is not a number anyone observed.
+
+    Coverage, not equality: 84 of the 6,794 GPs have no profile upstream at
+    all, so demanding one row per GP would refuse a complete build.
+    """
+
+    table = GP_PROFILE_TABLE
+    if table not in _existing_tables(con):
+        return []  # already reported by check_table_existence
+    columns = _columns(con, table)
+    missing = tuple(col for col in GP_PROFILE_MEASURES if col not in columns)
+    if missing:
+        return [Finding(
+            check="gp_profile.columns", severity="violation",
+            expected=f"{table} has {list(GP_PROFILE_MEASURES)}",
+            actual=f"missing {list(missing)}",
+        )]
+
+    findings: list[Finding] = []
+    total = _row_count(con, table)
+    floor = int(EXPECTED_GP_COUNT * MIN_GP_COVERAGE)
+    if not floor <= total <= EXPECTED_GP_COUNT:
+        findings.append(Finding(
+            check="gp_profile.gp_count", severity="violation",
+            expected=f"between {floor} and {EXPECTED_GP_COUNT} rows",
+            actual=str(total),
+            detail="a build well short of the roster is a sample, not the state",
+        ))
+    blank = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} IS NULL" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if blank:
+        findings.append(Finding(
+            check="gp_profile.populated", severity="violation",
+            expected=f"every row has all of {', '.join(GP_PROFILE_MEASURES)}",
+            actual=f"{blank} row(s) with a null measure",
+        ))
+    negative = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} < 0" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if negative:
+        findings.append(Finding(
+            check="gp_profile.non_negative", severity="violation",
+            expected="no negative population or household count",
+            actual=f"{negative} row(s) with a negative measure",
+        ))
+    return findings
+
+
 def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """Section 6: the exact published totals from the reference build.
 
@@ -891,7 +972,9 @@ def check_conformance(
     build ever asserted its own scale. A 20-GP build reported "PASS".
 
     ``skip_reconciliation`` omits the exact published totals.
-    ``skip_geography`` omits full-state coverage; use it for synthetic
+    ``skip_geography`` omits full-state coverage -- geography AND gp_profile
+    demographics, which are the same question about two tables; use it for
+    synthetic
     fixtures, which are not wrong for holding three GPs.
     ``skip_derived`` omits the consumer relations (#51), for the same
     reason: a fixture exercising a schema rule need not materialise them.
@@ -903,7 +986,13 @@ def check_conformance(
     if not skip_derived:
         findings.extend(check_derived_relations(con))
     if not skip_geography:
+        # Both are full-state coverage checks and are skipped together: a
+        # synthetic fixture holding three GPs is not wrong for having three
+        # districts, and it is not wrong for having three profiles either.
+        # The flag keeps its name because that is what the CLI and the
+        # Makefile pass; what it means is "this is not the state".
         findings.extend(check_geography_completeness(con))
+        findings.extend(check_gp_profile_completeness(con))
     if not skip_reconciliation:
         findings.extend(check_reconciliation_totals(con))
     return findings
