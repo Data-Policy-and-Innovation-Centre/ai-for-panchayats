@@ -13,9 +13,10 @@ import re
 import shutil
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
