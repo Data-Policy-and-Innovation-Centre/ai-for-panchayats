@@ -113,12 +113,39 @@ aws ecs list-tasks --cluster prdw-chatbot --service-name prdw-chatbot \
 ```bash
 aws ecs describe-tasks --cluster prdw-chatbot --region ap-south-1 \
   --tasks <arn> [<arn> ...] \
-  --query 'tasks[].{task:taskArn,td:taskDefinitionArn,health:healthStatus,started:startedAt}'
+  --query 'tasks[].{task:taskArn,td:taskDefinitionArn,ip:attachments[0].details[?name==`privateIPv4Address`].value|[0],started:startedAt}'
 ```
 
-Distinct `td` values across running tasks mean **two revisions are serving
-simultaneously**; every step below has to be done for each of them, and a
-single answer to "what is running" does not exist until the rollout settles.
+**Do not read `healthStatus` here — it is `UNKNOWN`.** The task definition
+declares no container `healthCheck` (`service.tf:74-181`; the
+`start_period_seconds = 420` at line 81 is a local feeding the service's
+`health_check_grace_period_seconds` at line 306, not a container probe). ECS
+reports a task as `RUNNING` the moment the container starts, which is while
+`docker/entrypoint.sh` is still downloading and hashing a ~1 GB snapshot.
+
+**Serving is decided by the load balancer, so ask the load balancer.** A task
+receives traffic only once its target passes two checks 30 s apart
+(`service.tf:210-217`):
+
+```bash
+# The target group is named `prdw-chatbot`, same as everything else
+# (`service.tf:199-200`). There is no Terraform output for its ARN, so look it
+# up by name rather than by an output that does not exist.
+TG=$(aws elbv2 describe-target-groups --names prdw-chatbot --region ap-south-1 \
+       --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 describe-target-health --region ap-south-1 --target-group-arn "$TG" \
+  --query 'TargetHealthDescriptions[].{target:Target.Id,port:Target.Port,state:TargetHealth.State,reason:TargetHealth.Reason}'
+```
+
+Match `target` against each running task's private IP from the query above.
+Only tasks whose target state is `healthy` are serving. A task that is
+`RUNNING` with an `initial` or `unhealthy` target is starting up or failing,
+and reporting its revision as "what is running" is exactly the mistake this
+section exists to prevent.
+
+**Two revisions with `healthy` targets means both are serving simultaneously**;
+every step below has to be done for each of them, and a single answer to "what
+is running" does not exist until the rollout settles.
 
 Then, per revision:
 
@@ -152,6 +179,22 @@ provisional_full_state_snapshot s3://dpic-prdw-snapshots/duckdb/database_allgps.
 **`aggregates=SKIPPED` means the aggregate gate did not run.** That is a
 benchmarking-only mode (`scripts/fetch_snapshot.py:27-31`) and must never
 appear on a production task.
+
+**If the startup lines are gone, read the image instead.** The log group keeps
+30 days (`service.tf:66`) and the snapshot identity is printed exactly once, at
+startup — so a task that has been up longer than that has no surviving record
+of what it fetched. The manifest is baked into the image, which is immutable
+(`service.tf:31`), so pull the exact tag and read it:
+
+```bash
+docker pull <account>.dkr.ecr.ap-south-1.amazonaws.com/prdw-chatbot:<tag>
+docker run --rm --entrypoint cat <...>:<tag> /app/manifest/full_state.json | jq '{key, version_id, sha256}'
+```
+
+That answers what the task *was told* to fetch, which is the same thing while
+the image is immutable and `entrypoint.sh` refuses to serve a mismatch. It does
+not prove the fetch succeeded — but a task that is serving traffic got past
+that check by definition.
 
 > UNVERIFIED — no console session and no AWS call informed any of this. The
 > `--query` expressions in particular have never been run. The console path is
@@ -242,8 +285,37 @@ This is the same operation as a deploy with a different tag, which is why it is
 not a separate mechanism. `image_tag` has no default and is validated non-empty
 (`variables.tf:36-44`).
 
+> **Every other variable must be passed too, exactly as production was applied.**
+> `terraform apply -var image_tag=...` does not "change only the tag" — it
+> re-evaluates *every* input, and any variable not supplied falls back to its
+> default. **There is no committed `.tfvars` file in `infra/terraform/app/`**,
+> so nothing is auto-loaded and whatever production was applied with lives
+> outside this repository. A rollback that passes the tag alone would, for
+> instance, silently revert an ALB-TLS deployment (`certificate_arn`,
+> `public_domain`, `enable_cdn=false`) to the default CloudFront topology —
+> turning an image rollback into a topology change, during an incident.
+>
+> **Before typing apply, run plan and read it.** The plan is the check: if it
+> proposes anything beyond a new task definition revision and the service
+> pointing at it, the variable set is wrong and applying it will make the
+> outage worse.
+>
+> ```bash
+> terraform -chdir=infra/terraform/app plan \
+>   -var-file=<the production var file> -var image_tag=<known-good-tag>
+> ```
+>
+> **OPEN QUESTION 9.** Where the production variable set actually lives — a
+> var file held outside the repo, `TF_VAR_*` in someone's environment, or a
+> series of `-var` flags in a runbook nobody wrote down. Until that is
+> recorded, no one can perform this rollback correctly from this document
+> alone, and that is the single biggest gap in it. It is also an argument for
+> #92: a deploy workflow makes the variable set a committed artifact instead
+> of an operator's shell history.
+
 ```bash
-terraform -chdir=infra/terraform/app apply -var image_tag=<known-good-tag>
+terraform -chdir=infra/terraform/app apply \
+  -var-file=<the production var file> -var image_tag=<known-good-tag>
 ```
 
 What this actually does: it registers a **new** task definition revision whose
@@ -424,9 +496,15 @@ rejected. That includes an apply someone runs for an unrelated change.
    deliberately** — apply with the *known-good* image tag:
 
    ```bash
-   terraform -chdir=infra/terraform/app plan -var image_tag=<known-good-tag>
-   terraform -chdir=infra/terraform/app apply -var image_tag=<known-good-tag>
+   terraform -chdir=infra/terraform/app plan \
+     -var-file=<the production var file> -var image_tag=<known-good-tag>
+   terraform -chdir=infra/terraform/app apply \
+     -var-file=<the production var file> -var image_tag=<known-good-tag>
    ```
+
+   The same warning as §2a applies and matters more here, because you are
+   already mid-incident: omitting the production variables re-evaluates every
+   input from its default. Read the plan before applying.
 
    This registers a new revision with the good image and points the service at
    it. State and service agree again, and they agree on something you chose.
@@ -435,13 +513,30 @@ rejected. That includes an apply someone runs for an unrelated change.
    anything, which leaves the *next* deploy computing its diff from a revision
    nobody deliberately picked.
 
-4. **Read why the deployment failed before deploying anything else.** The
-   breaker fires on tasks that never become healthy. With a 420 s grace period
-   (`service.tf:306`), a task that fails after the breaker gave up has usually
-   failed in `fetch_snapshot` or at secret injection. Both are in
-   `/ecs/prdw-chatbot`; the snapshot failure messages are the
-   `SnapshotError` subclasses in `src/deploy/errors.py`, raised from
-   `src/deploy/fetch.py`.
+4. **Read why the deployment failed before deploying anything else**, and read
+   it in *two* places, because the two common causes surface differently.
+
+   **Snapshot failures reach CloudWatch.** `fetch_snapshot` runs inside the
+   container, so its `SnapshotError` subclasses (`src/deploy/errors.py`, raised
+   from `src/deploy/fetch.py`) appear in `/ecs/prdw-chatbot`.
+
+   **Secret-injection failures do not.** `OPENAI_API_KEY` is injected by the
+   ECS agent from Secrets Manager (`service.tf:168-169`) *before* the container
+   process starts, so a failure there produces no application log line at all —
+   looking only at CloudWatch hides the cause entirely. The header comment at
+   `service.tf:3-7` names this as a mode the service can sit in without
+   stabilizing. Enumerate stopped tasks and read the reasons:
+
+   ```bash
+   aws ecs list-tasks --cluster prdw-chatbot --service-name prdw-chatbot \
+     --desired-status STOPPED --region ap-south-1 --query 'taskArns' --output text
+   aws ecs describe-tasks --cluster prdw-chatbot --region ap-south-1 --tasks <arn> ... \
+     --query 'tasks[].{stopped:stoppedReason,code:stopCode,containers:containers[].{name:name,reason:reason,exit:exitCode}}'
+   ```
+
+   A `ResourceInitializationError` mentioning `secretsmanager` is this case. An
+   empty CloudWatch stream for a task that stopped is itself the signal to look
+   here.
 
 5. **Check the alarm state.** `prdw-chatbot-no-running-tasks`
    (`alarms.tf:78-98`) needs five consecutive minutes at zero running tasks, so
@@ -564,3 +659,7 @@ default bucket.
 8. The exact CloudWatch log stream name format, inferred from the
    `awslogs-stream-prefix` and the awslogs driver's documented
    `<prefix>/<container>/<task-id>` shape. (§1)
+9. **Where the production Terraform variable set lives.** No `.tfvars` is
+   committed, so nothing is auto-loaded and a rollback that passes only
+   `-var image_tag` reverts every other input to its default. Nobody can
+   perform §2a correctly from this document until this is recorded. (§2, §4)
