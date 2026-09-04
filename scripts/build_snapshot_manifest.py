@@ -17,17 +17,25 @@ object version S3 returns.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from src.deploy.errors import SnapshotError
-from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
-from src.warehouse.conformance import (
+# Run directly (not via pytest, which sets pythonpath=["src", "."] itself, and
+# not only via `python -m`), so the repository root needs to be on sys.path
+# explicitly -- same convention as scripts/build_warehouse.py. `src.deploy`
+# imports `src.warehouse`, so the repo root (not `src/`) must be the path
+# added; otherwise the nested import fails with ModuleNotFoundError.
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from src.deploy.errors import SnapshotError  # noqa: E402
+from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest  # noqa: E402
+from src.warehouse.conformance import (  # noqa: E402
     MIN_GP_COVERAGE,
     check_geography_completeness,
     check_gp_profile_completeness,
 )
-from src.warehouse.geography import GEOGRAPHY_COLUMNS, GeographyError, gp_geography
+from src.warehouse.geography import GEOGRAPHY_COLUMNS, GeographyError, gp_geography  # noqa: E402
 
 # #61 is no longer here: gram_panchayat now carries state/district/block for
 # every GP in the LGD reference tree. Dropping the exception is only honest if
