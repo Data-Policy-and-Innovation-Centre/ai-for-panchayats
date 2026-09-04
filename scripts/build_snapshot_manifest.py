@@ -22,7 +22,11 @@ from pathlib import Path
 
 from src.deploy.errors import SnapshotError
 from src.deploy.manifest import ATTACH_CATALOG, PROVISIONAL_LABEL, attach_read_only, build_manifest
-from src.warehouse.conformance import MIN_GP_COVERAGE, check_geography_completeness
+from src.warehouse.conformance import (
+    MIN_GP_COVERAGE,
+    check_geography_completeness,
+    check_gp_profile_completeness,
+)
 from src.warehouse.geography import GEOGRAPHY_COLUMNS, GeographyError, gp_geography
 
 # #61 is no longer here: gram_panchayat now carries state/district/block for
@@ -125,7 +129,7 @@ def assert_full_state(artifact: Path) -> int:
     it. So this is where a sample has to be stopped.
 
     It has to be stopped somewhere, because a 20-GP smoke build is otherwise
-    indistinguishable from a full one -- same 19 tables, same schema, same
+    indistinguishable from a full one -- same tables, same schema, same
     green conformance run -- and the result would be a chatbot answering
     statewide questions from 0.3% of the data. The prod/staging env files
     make the right thing easy; they are a convenience, and a convenience can
@@ -186,6 +190,21 @@ def assert_full_state(artifact: Path) -> int:
             "SELECT gp_lgd_code, " + ", ".join(GEOGRAPHY_COLUMNS)
             + f" FROM {ATTACH_CATALOG}.gram_panchayat"
         ).fetchall()
+        # PROFILE is deliberately not in schema.REQUIRED_KINDS -- an
+        # independent reference extract must not make a rebuild of the scraped
+        # data impossible (#123). That argument is only honest if completeness
+        # is enforced where the artifact actually becomes deployable, which is
+        # here. Without this a build selecting only the PL/AA/TA/PP/RE
+        # snapshots publishes an empty gp_profile: the DDL creates the table
+        # either way, and nothing downstream reads its row count.
+        # Row count is not the check, for the same reason it was not enough
+        # for geography: 6,710 keys with every measure NULL is the right count
+        # and no data. The transform-side EmptyRequiredColumn cannot help here
+        # -- it runs while the table is being built, and this path exists
+        # precisely to judge an artifact built somewhere else. Delegated to
+        # the conformance check that defines "the demographics are there",
+        # rather than restating a weaker version.
+        profile = None if ("gp_profile",) not in tables else check_gp_profile_completeness(conn)
     if not floor <= actual <= expected:
         print(
             f"error: {artifact} holds {actual:,} gram_panchayat rows; a deployable "
@@ -203,6 +222,25 @@ def assert_full_state(artifact: Path) -> int:
             file=sys.stderr,
         )
         for finding in geography:
+            print(
+                f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
+                file=sys.stderr,
+            )
+        return 1
+    if profile is None:
+        print(
+            f"error: {artifact} has no gp_profile table; a deployable snapshot must "
+            "carry GP demographics (#123). Rebuild including the profile snapshot.",
+            file=sys.stderr,
+        )
+        return 1
+    if profile:
+        print(
+            f"error: {artifact} does not carry complete GP demographics; refusing to "
+            "pin it (#123):",
+            file=sys.stderr,
+        )
+        for finding in profile:
             print(
                 f"  {finding.check}: expected {finding.expected}, got {finding.actual}",
                 file=sys.stderr,

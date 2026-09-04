@@ -146,6 +146,13 @@ def populate(
     # here rather than in transform keeps that module free of file system
     # access (see its docstring).
     geography = gp_geography()
+    # Held back until every snapshot has contributed to gram_panchayat.
+    # gp_profile has a FOREIGN KEY to it, so loading a profile snapshot
+    # before the scrape snapshots that name the same GPs would quarantine
+    # every row as an orphan and still finish green -- the order dependence
+    # #161 is open about elsewhere in this function. Deferring is the whole
+    # fix here: one row per GP, no per-snapshot state, nothing to interleave.
+    profile_frames: list[tuple[str, str, pd.DataFrame]] = []
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -172,6 +179,12 @@ def populate(
             if kind in tables and kind != "re":
                 used.append(kind)
         pl, aa, ta, pp, re = (top_level[k] for k in ("pl", "aa", "ta", "pp", "re"))
+
+        if "profile" in tables:
+            profile_frames.append(
+                (source_system, source_run_id, _read(root, tables, "profile"))
+            )
+            used.append("profile")
 
         # Every kind independently records its own GP via the same
         # folder-name parser, so the dimension is built from all of them,
@@ -261,8 +274,14 @@ def populate(
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
         parent_row_ids = set(approvals["row_id"].dropna())
 
-        # The scheme array's own JSON key is unverified (see transform.py's
-        # module docstring), so candidates are still found by prefix alone --
+        # The scheme array's JSON key IS now verified -- it is
+        # `admApprovalSchemeWebService`, the only child array key found in
+        # 27,672 AA arrays across 250 random GPs (#163). Discovery is still by
+        # prefix plus a field signature rather than by that literal, on
+        # purpose: the survey proves what the portal emits today, not what it
+        # will emit next year, and a signature match degrades to "found
+        # nothing" where a hardcoded key would degrade to silently loading an
+        # unrelated array. So candidates are found by prefix, and --
         # but a direct AA child is only kept if it actually carries a
         # recognized scheme field. Without this, ANY unrelated AA child array
         # (attachments, comments, ...) would match the empty keyword, get
@@ -319,6 +338,14 @@ def populate(
         leftover = tuple(sorted(set(tables) - set(used) - {"quarantine"}))
         if leftover:
             unconsumed[f"{source_system}/{source_run_id}"] = leftover
+
+    # After the loop, deliberately: see profile_frames above.
+    all_gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+    for source_system, source_run_id, frame in profile_frames:
+        add_count("gp_profile", insert(con, "gp_profile", transform.gp_profile(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
     return counts, quarantine, consumed, unconsumed, resolutions

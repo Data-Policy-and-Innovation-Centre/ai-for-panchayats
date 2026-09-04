@@ -15,9 +15,11 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from warehouse.build import BuildResult, build
+from src.pipeline.manifest import RunPublisher
+from src.pipeline.normalize import normalize_run
+from warehouse.build import BuildResult, build, create_schema
 from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
-from warehouse.transform import RequiredFieldUnresolved
+from warehouse.transform import EmptyRequiredColumn, RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
 from _warehouse_helpers import approved, make_settings, normalize, publish_raw_run, registry, write_manual_snapshot
@@ -544,10 +546,14 @@ def test_manifest_hash_mismatch_stops_build_before_any_db_write(tmp_path: Path):
 
 
 def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
-    """The scheme/fund array's own JSON key name is unverified (see
-    transform.py's module docstring); the loader discovers it by prefix
-    (``aa__*``) rather than assuming a specific key, so this fixture uses an
-    arbitrary plausible key to prove that discovery path end to end."""
+    """The loader discovers the scheme array by prefix, not by its key name.
+
+    The key itself is no longer a guess: `admApprovalSchemeWebService` is the
+    only child array key found in 27,672 AA arrays across 250 random GPs
+    (#163), and this fixture uses it. Discovery stays signature-based anyway,
+    which is what this test exercises end to end -- a survey says what the
+    portal emits today, and a signature match degrades to finding nothing
+    where a hardcoded key would degrade to loading an unrelated array."""
 
     run = publish_raw_run(tmp_path, "run-1", {
         "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
@@ -584,7 +590,7 @@ def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
     comments, ...) must not be swept into ``admin_approval_scheme`` just
     because it sits one level below ``aa``. Before the fix, the empty
     keyword used to discover the scheme table (its own JSON key is
-    unverified, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
+    discovered by signature, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
     matched *any* direct AA child, so an attachments array would load as
     two all-null scheme rows and get marked consumed instead of reported
     unconsumed."""
@@ -703,3 +709,322 @@ def test_geography_reaches_the_built_table(tmp_path: Path):
     finally:
         con.close()
     assert row == [("115550", "Angarbandha", "21", "Odisha", "303", "Anugul", "3639", "Anugul")]
+
+
+# --------------------------------------------------------------------- gp_profile (#123)
+
+PROFILE_COLUMNS = (
+    "basic_info_lgd,param__gp_name,"
+    "demographic_details_total_gender_wise_population,"
+    "demographic_details_male_population,demographic_details_female_population,"
+    "demographic_details_transgender_population,demographic_details_children_population,"
+    "demographic_details_sc_population,demographic_details_st_population,"
+    "demographic_details_obc_population,demographic_details_general_population,"
+    "general_no_of_households"
+)
+
+
+def _profile_snapshot(tmp_path: Path, settings, run_id: str, body: str, *,
+                       columns: str = PROFILE_COLUMNS) -> None:
+    """Publish and normalize a profile CSV run into the build's canonical root."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", run_id) as publisher:
+        publisher.write_payload(
+            "eGramSwaraj_panchayat_master.csv", f"{columns}\n{body}".encode(),
+        )
+        run = publisher.publish()
+    normalize_run(run, settings.canonical_root)
+
+
+# GP 123 is the one `_pl_aa_run` scrapes, so it resolves; 999 does not exist
+# in gram_panchayat, and the third row carries no key at all -- the shape of
+# the 84 profile-less rows in the real extract.
+PROFILE_BODY = (
+    "123,Test GP,900,450,440,10,200,100,150,300,350,210\n"
+    "999,Ghost GP,10,5,5,0,1,1,1,1,7,3\n"
+    ",Unfilled GP,,,,,,,,,,"
+)
+
+
+def test_gp_profile_loads_and_both_kinds_of_bad_row_are_quarantined(tmp_path: Path):
+    """The three outcomes a profile row can have, in one build (#123).
+
+    Loaded, orphaned, or unkeyed -- and the last two are told apart on
+    purpose. An unkeyed row is a GP whose profile was never filled in (84 of
+    them upstream, which collide on the empty string and break the primary
+    key if let through); an orphan is a GP the scrape never saw. Both are
+    countable in the quarantine table rather than filtered away where nothing
+    would notice the source shrinking.
+    """
+
+    settings, spec_registry = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(tmp_path, settings, "profile-1", PROFILE_BODY)
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("profile-1", "egramswaraj_profile", "profile-1"),
+    )
+
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings, registry=spec_registry,
+    )
+    assert result.counts["gp_profile"] == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT gp_lgd_code, total_population, households FROM gp_profile"
+        ).fetchall() == [("123", 900, 210)]
+        # Zero orphans: every loaded code resolves against the dimension.
+        assert con.execute(
+            "SELECT count(*) FROM gp_profile p"
+            " LEFT JOIN gram_panchayat g USING (gp_lgd_code) WHERE g.gp_lgd_code IS NULL"
+        ).fetchone()[0] == 0
+        reasons = dict(con.execute(
+            "SELECT reason_code, sum(row_count) FROM quarantine"
+            " WHERE table_name = 'gp_profile' GROUP BY reason_code"
+        ).fetchall())
+        assert reasons == {"missing_key": 1, "orphan_reference": 1}
+    finally:
+        con.close()
+
+
+def test_gp_profile_resolves_its_key_whichever_order_the_snapshots_are_listed(tmp_path: Path):
+    """The profile load must not depend on which snapshot is processed first.
+
+    gp_profile has a FOREIGN KEY to gram_panchayat, which every scrape
+    snapshot contributes to. Loading it inside the per-snapshot loop would
+    mean that listing the profile snapshot first quarantined every row as an
+    orphan -- and the build would still finish green, because quarantining is
+    not a failure. That is #161's defect, and this pins that gp_profile does
+    not reintroduce it.
+    """
+
+    counts = {}
+    for order in (("snap-1", "profile-1"), ("profile-1", "snap-1")):
+        root = tmp_path / "-".join(order)
+        root.mkdir()
+        settings, _ = _build_settings_and_registry(root)
+        _profile_snapshot(root, settings, "profile-1", PROFILE_BODY)
+        result = build(
+            snapshot_ids=order, settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )
+        counts[order] = result.counts["gp_profile"]
+    assert counts[("snap-1", "profile-1")] == counts[("profile-1", "snap-1")] == 1
+
+
+def test_unfiltered_profile_rows_are_rejected_by_the_schema(tmp_path: Path):
+    """The trap the filtering exists to avoid, proven rather than asserted.
+
+    #123 recorded this as a primary-key collision: 84 blank-key rows all
+    become '' and 83 of them duplicate the first. With the FOREIGN KEY to
+    gram_panchayat in place the schema is stricter than that -- the *first*
+    blank row is already rejected, because '' is not a GP -- so all 84 fail,
+    not 83. Both refusals are asserted below, in that order, because relaxing
+    either one on its own still leaves the other standing and the comment
+    alone would not say so.
+    """
+
+    con = duckdb.connect(str(tmp_path / "trap.duckdb"))
+    try:
+        create_schema(con)
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('123', 'Test GP')")
+        with pytest.raises(duckdb.ConstraintException, match="foreign key"):
+            con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+
+        # And behind the FK, the collision #123 described.
+        con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('', NULL)")
+        con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+        with pytest.raises(duckdb.ConstraintException, match="[Pp]rimary key|unique"):
+            con.execute("INSERT INTO gp_profile (gp_lgd_code) VALUES ('')")
+    finally:
+        con.close()
+
+
+def test_gp_profile_fails_the_build_when_a_population_column_is_renamed(tmp_path: Path):
+    """An all-NULL demographics table would pass every other check.
+
+    Right row count, valid primary key, zero orphans -- and every population
+    null. `_first_present(..., required=True)` is what turns an upstream
+    rename into a stopped build instead of a silently empty one.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1", "123,Test GP,900,210",
+        columns="basic_info_lgd,param__gp_name,"
+                "demographic_details_total_population,general_no_of_households",
+    )
+    with pytest.raises(RequiredFieldUnresolved, match="total_population"):
+        build(
+            snapshot_ids=("snap-1", "profile-1"), settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )
+
+
+def test_gp_profile_fails_the_build_when_a_column_survives_but_its_values_do_not(tmp_path: Path):
+    """`required=True` proves a column NAME survived, not that values did.
+
+    The header can stay while the scrape starts emitting blanks, and `to_int`
+    turns every one of them into NULL without complaint. The columns are
+    nullable and no conformance rule reads their contents, so the build would
+    publish the right number of GPs with entirely empty demographics -- the
+    exact silent failure the required-field logic is there to prevent, reached
+    by the route it does not cover.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(tmp_path, settings, "profile-1", "123,Test GP,,,,,,,,,,")
+    with pytest.raises(EmptyRequiredColumn, match="total_population"):
+        build(
+            snapshot_ids=("snap-1", "profile-1"), settings=settings,
+            registry=registry(
+                approved("snap-1", "egramSwaraj", "run-1"),
+                approved("profile-1", "egramswaraj_profile", "profile-1"),
+            ),
+        )
+
+
+def test_gp_profile_quarantines_a_row_whose_measure_cannot_be_read(tmp_path: Path):
+    """A present-but-unreadable value is a parse failure, not an absent measure.
+
+    `to_int` coerces both to NA and cannot tell them apart, so the raw text is
+    checked while it is still in reach. The row is quarantined rather than
+    loaded with a hole: nine good measures do not make a tenth trustworthy,
+    and a silently-NULL cell is what this whole path exists to prevent.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,450,440,10,200,100,150,300,350,not-a-number\n"
+        "456,Other GP,800,400,390,10,180,90,140,280,300,190",
+    )
+    # 456 is not in gram_panchayat, so it is an orphan; 123 is the readable one.
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        reasons = dict(con.execute(
+            "SELECT reason_code, sum(row_count) FROM quarantine "
+            "WHERE table_name = 'gp_profile' GROUP BY reason_code"
+        ).fetchall())
+        assert reasons == {"unreadable_measure": 1, "orphan_reference": 1}
+    finally:
+        con.close()
+
+
+def test_gp_profile_quarantines_a_fractional_count_rather_than_rounding_it(tmp_path: Path):
+    """`to_int` rounds, so a null-check alone accepts an invented number.
+
+    `clean.to_int` ends in `numeric.round()`. A population of "1.5" therefore
+    parses cleanly to 2 and the unreadable-value check -- which asks whether
+    the cast produced NULL -- never sees it. A rounded count is not a
+    recovered count; it is a number nobody observed. Same predicate as
+    `activity_nsap`'s beneficiary counts (#116), which is why it now lives at
+    module scope rather than nested in one transform.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,450,440,10,200,100,150,300,350,1.5",
+    )
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
+            "AND reason_code = 'unreadable_measure'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_gp_profile_quarantines_a_negative_count(tmp_path: Path):
+    """`to_int` carries a negative through untouched.
+
+    It is not null, not fractional and not non-finite, so every other
+    predicate in the unreadable check accepts it -- and nobody ever counted
+    -1 people.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _profile_snapshot(
+        tmp_path, settings, "profile-1",
+        "123,Test GP,900,-1,440,10,200,100,150,300,350,210",
+    )
+    result = build(
+        snapshot_ids=("snap-1", "profile-1"), settings=settings,
+        registry=registry(
+            approved("snap-1", "egramSwaraj", "run-1"),
+            approved("profile-1", "egramswaraj_profile", "profile-1"),
+        ),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
+            "AND reason_code = 'unreadable_measure'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_admin_approval_scheme_activity_code_is_cleaned_like_every_other_one(tmp_path: Path):
+    """The one activity_code that was assigned raw rather than through to_code.
+
+    Eight other `activity_code` columns in `transform` go through
+    `clean.to_code`; this one took the provenance value straight through. The
+    same activity could therefore be spelled one way here and another in
+    `planned_activity` -- in a column whose only purpose is to join them.
+
+    Inert on today's data: every sampled `activityCd` is a JSON int, so
+    `str()` and `to_code()` agree. Asserted against `planned_activity` rather
+    than against a literal, because the property that matters is that the two
+    agree, not what either one says.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [
+                {"wrkSchmCd": "SC1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    result = build(
+        snapshot_ids=("snap-1",), settings=settings,
+        registry=registry(approved("snap-1", "egramSwaraj", "run-1")),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT s.activity_code FROM admin_approval_scheme s"
+            " JOIN planned_activity a ON a.activity_code = s.activity_code"
+        ).fetchall() == [("7",)], "scheme activity_code must join planned_activity"
+    finally:
+        con.close()

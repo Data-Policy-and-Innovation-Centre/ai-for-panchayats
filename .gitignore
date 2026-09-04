@@ -199,6 +199,17 @@ data/clean/*
 data/interim/*
 data/processed/*
 !data/raw/*.dvc
+# One level deeper, for eGramSwaraj only. `data/raw/*` stops git at the
+# top-level directory, so a pointer inside it is unreachable however many
+# `!` rules follow -- git does not look inside a directory it has already
+# excluded. Named explicitly rather than with `**` so that `git status` does
+# not walk the ~204,000 payload files of the Gram_Panchayat tree (#156) on
+# every invocation. One pointer per dataset directory, as SabhaSaar_MoMs.dvc
+# already is; a future Gram_Panchayat.dvc sits at this same level and needs
+# no further rule.
+!data/raw/eGramSwaraj_Data/
+data/raw/eGramSwaraj_Data/*
+!data/raw/eGramSwaraj_Data/*.dvc
 !data/clean/*.dvc
 !data/interim/*.dvc
 !data/processed/*.dvc

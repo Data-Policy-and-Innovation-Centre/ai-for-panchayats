@@ -385,3 +385,27 @@ def test_normalize_prints_a_pasteable_registry_stanza(tmp_path: Path, capsys):
     assert spec.run_id == "2026-09-03"
     assert spec.schema_version == "1"
     assert spec.status == "approved"
+
+
+def test_cli_normalize_picks_the_lane_from_the_run_manifest(tmp_path: Path, capsys):
+    """`main.py normalize` must not need to be told which normalizer to use.
+
+    The CLI called `normalize_egramswaraj` directly, so the lane a run takes
+    was decided by which function the caller happened to import rather than
+    by what the run actually is. Dispatching on the manifest's `source`
+    means a profile CSV cannot be pushed through the JSON normalizer -- which
+    would quarantine every file as `unknown_source_kind` and publish an empty
+    snapshot without failing (#123).
+    """
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-cli") as publisher:
+        publisher.write_payload("master.csv", b"basic_info_lgd,pop\n115550,120\n")
+        run = publisher.publish()
+
+    assert main([
+        "normalize", "--run-path", str(run),
+        "--output-root", str(tmp_path / "canonical"),
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "0 quarantined" in out
+    assert (tmp_path / "canonical" / "egramswaraj_profile" / "profile-cli" / "profile").is_dir()

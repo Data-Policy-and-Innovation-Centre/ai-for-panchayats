@@ -12,7 +12,7 @@ import yaml
 from pathlib import Path
 
 from .manifest import ManifestError, RunPublisher, validate_run
-from .normalize import normalize_egramswaraj
+from .normalize import normalize_run
 from .settings import load_settings
 
 
@@ -74,10 +74,13 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("validate-run", help="verify a published raw run")
     verify.add_argument("run_path", type=Path)
 
-    normalize = commands.add_parser(Stage.NORMALIZE.value, help="normalize an eGramSwaraj raw run")
+    normalize = commands.add_parser(Stage.NORMALIZE.value, help="normalize an approved raw run")
     normalize.add_argument("--run-path", required=True, type=Path)
     normalize.add_argument("--output-root", required=True, type=Path)
     normalize.add_argument("--chunk-size", type=int, default=100_000)
+    # eGramSwaraj JSON runs only; a flat-CSV run has one kind by definition
+    # and normalize_run drops this rather than making the caller know which
+    # lane their run takes.
     normalize.add_argument("--kinds", default=",".join(sorted({"PL", "AA", "TA", "PP", "RE"})))
     for name in (Stage.BUILD.value, Stage.EXPORT_CSV.value):
         commands.add_parser(name, help="reserved later pipeline stage")
@@ -231,7 +234,10 @@ def _registry_stanza(output_root: Path) -> str:
 
 
 def _normalize(args: argparse.Namespace) -> int:
-    result = normalize_egramswaraj(
+    # normalize_run, not a lane directly: the raw run's own `source` decides
+    # which normalizer it gets, so a profile CSV cannot be normalized as if
+    # it were the JSON scrape whatever is typed here (#123).
+    result = normalize_run(
         args.run_path,
         args.output_root,
         chunk_size=args.chunk_size,

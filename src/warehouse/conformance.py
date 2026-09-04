@@ -62,21 +62,28 @@ class Finding:
 # THE SPECIFICATION -- authoritative constants, easy to update in one place.
 # ---------------------------------------------------------------------------
 
-# Section 1: exactly these 19 tables must exist.
+# Section 1: exactly these tables must exist -- the spec's 19 plus gp_profile.
+# The count is deliberately not written into the check messages below: it
+# has drifted once already, and this set is the only place that should
+# have to change when it drifts again.
 EXPECTED_TABLES: frozenset[str] = frozenset({
     "gram_panchayat", "plan", "planned_activity", "activity_delegation",
     "activity_asset", "activity_fund", "activity_training", "activity_community_service",
     "activity_nsap", "activity_expenditure", "voucher", "activity_voucher",
     "admin_approval", "admin_approval_scheme", "technical_approval", "physical_progress",
     "dim_code", "dim_welfare_scheme", "dim_lsdg_theme",
+    # The twentieth: GP demographics from the panchayat profile extract
+    # (#123). The Box spec documents "19 tables" and needs the same
+    # amendment, or the checker and the documents now disagree.
+    "gp_profile",
 })
 
-# An internal bookkeeping table that may legitimately exist alongside the 19.
+# An internal bookkeeping table that may legitimately exist alongside the 20.
 # Its presence is informational, never a violation.
 ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"quarantine"})
 
 # The consumer-facing relations, materialised as tables by warehouse.views
-# (#51). They are derived from the 19 -- no new facts -- so they are allowed
+# (#51). They are derived from the fact tables -- no new facts -- so they are allowed
 # alongside them rather than counted among them. Checked for presence
 # separately: a warehouse missing them builds but is not consumable.
 DERIVED_RELATIONS: frozenset[str] = frozenset({
@@ -98,6 +105,7 @@ DYNAMIC_RELATIONS: frozenset[str] = frozenset({"v_activity"})
 # (activity_voucher, dim_lsdg_theme), not an omission.
 EXPECTED_PRIMARY_KEYS: dict[str, tuple[str, ...] | None] = {
     "gram_panchayat": ("gp_lgd_code",),
+    "gp_profile": ("gp_lgd_code",),
     "plan": ("plan_code",),
     "planned_activity": ("activity_code",),
     "activity_delegation": ("activity_code",),
@@ -131,6 +139,7 @@ NULLABLE_REQUIRED: tuple[str, str] = ("activity_voucher", "voucher_pk")
 # activity_expenditure.plan_code -> plan is deliberately excluded here too,
 # for the same "not verified to always resolve" reason NO_ENFORCED_FK is.
 EXPECTED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("gp_profile", "gp_lgd_code", "gram_panchayat"),
     ("plan", "gp_lgd_code", "gram_panchayat"),
     ("planned_activity", "plan_code", "plan"),
     ("planned_activity", "gp_lgd_code", "gram_panchayat"),
@@ -212,6 +221,23 @@ EXPECTED_BLOCK_COUNT = 314
 # is three orders of magnitude wide: the pilot is 20 GPs, the state is ~6,800.
 # Anything between is neither, and should be looked at by a person.
 MIN_GP_COVERAGE = 0.90
+
+# The demographic measures, spelled out here rather than imported from
+# `transform` on purpose: this module is written against the spec, not against
+# our loader's inputs, so a rename on one side has to fail loudly instead of
+# being followed silently by the checker meant to catch it.
+#
+# Listed in full for the reason the geography list is: naming a subset let a
+# table with 100% NULL district_code pass clean, which is what #61 is named
+# for. The same trap is already visible here -- the manifest test fixture
+# populated total_population and households and left the other eight NULL,
+# and every check passed.
+GP_PROFILE_TABLE = "gp_profile"
+GP_PROFILE_MEASURES: tuple[str, ...] = (
+    "total_population", "male_population", "female_population",
+    "transgender_population", "children_population", "sc_population",
+    "st_population", "obc_population", "general_population", "households",
+)
 
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
@@ -313,7 +339,7 @@ def _decimal_sum(con: duckdb.DuckDBPyConnection, table: str, column: str) -> Dec
 # ---------------------------------------------------------------------------
 
 def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """Section 1: exactly the 19 tables, missing/extra reported separately."""
+    """Section 1: exactly EXPECTED_TABLES, missing/extra reported separately."""
 
     findings: list[Finding] = []
     actual = _existing_tables(con)
@@ -328,13 +354,13 @@ def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     for table in sorted(unexpected):
         findings.append(Finding(
             check="tables.unexpected", severity="violation",
-            expected="only the 19 spec tables", actual=f"unexpected table {table!r}",
+            expected="only the expected tables", actual=f"unexpected table {table!r}",
         ))
 
     for table in sorted(actual & ALLOWED_EXTRA_TABLES):
         findings.append(Finding(
             check="tables.internal", severity="informational",
-            expected="not part of the spec's 19 tables", actual=f"{table!r} present",
+            expected="not part of the expected inventory", actual=f"{table!r} present",
             detail="internal bookkeeping table, not a violation",
         ))
     return findings
@@ -675,7 +701,7 @@ def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
     Behind its own ``skip_derived`` flag for the reason
     ``check_geography_completeness`` is behind ``skip_geography``: a fixture
-    that creates the 19 spec tables to exercise a schema rule is not wrong
+    that creates the spec tables to exercise a schema rule is not wrong
     for having no ``v_activity``. A real build is.
 
     Three things can be wrong, and this checks all three.
@@ -815,6 +841,70 @@ def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding
     return findings
 
 
+def check_gp_profile_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """gp_profile carries real demographics for the whole state (#123).
+
+    The artifact-level counterpart to ``transform.gp_profile``'s
+    ``EmptyRequiredColumn``, and not a duplicate of it. That one runs while
+    the table is being built, so it protects nothing about an artifact built
+    somewhere else, built by an older version, or hand-patched -- and this
+    script is what decides such an artifact is deployable.
+
+    Row count alone is exactly the mistake #61 was: 6,710 keys with every
+    measure NULL is the right count and no data. Checked the same three ways
+    geography is -- columns present, every row populated, count within the
+    roster -- plus non-negativity, because ``clean.to_int`` will happily carry
+    a -1 through and a negative population is not a number anyone observed.
+
+    Coverage, not equality: 84 of the 6,794 GPs have no profile upstream at
+    all, so demanding one row per GP would refuse a complete build.
+    """
+
+    table = GP_PROFILE_TABLE
+    if table not in _existing_tables(con):
+        return []  # already reported by check_table_existence
+    columns = _columns(con, table)
+    missing = tuple(col for col in GP_PROFILE_MEASURES if col not in columns)
+    if missing:
+        return [Finding(
+            check="gp_profile.columns", severity="violation",
+            expected=f"{table} has {list(GP_PROFILE_MEASURES)}",
+            actual=f"missing {list(missing)}",
+        )]
+
+    findings: list[Finding] = []
+    total = _row_count(con, table)
+    floor = int(EXPECTED_GP_COUNT * MIN_GP_COVERAGE)
+    if not floor <= total <= EXPECTED_GP_COUNT:
+        findings.append(Finding(
+            check="gp_profile.gp_count", severity="violation",
+            expected=f"between {floor} and {EXPECTED_GP_COUNT} rows",
+            actual=str(total),
+            detail="a build well short of the roster is a sample, not the state",
+        ))
+    blank = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} IS NULL" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if blank:
+        findings.append(Finding(
+            check="gp_profile.populated", severity="violation",
+            expected=f"every row has all of {', '.join(GP_PROFILE_MEASURES)}",
+            actual=f"{blank} row(s) with a null measure",
+        ))
+    negative = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} < 0" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if negative:
+        findings.append(Finding(
+            check="gp_profile.non_negative", severity="violation",
+            expected="no negative population or household count",
+            actual=f"{negative} row(s) with a negative measure",
+        ))
+    return findings
+
+
 def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """Section 6: the exact published totals from the reference build.
 
@@ -882,7 +972,9 @@ def check_conformance(
     build ever asserted its own scale. A 20-GP build reported "PASS".
 
     ``skip_reconciliation`` omits the exact published totals.
-    ``skip_geography`` omits full-state coverage; use it for synthetic
+    ``skip_geography`` omits full-state coverage -- geography AND gp_profile
+    demographics, which are the same question about two tables; use it for
+    synthetic
     fixtures, which are not wrong for holding three GPs.
     ``skip_derived`` omits the consumer relations (#51), for the same
     reason: a fixture exercising a schema rule need not materialise them.
@@ -894,7 +986,13 @@ def check_conformance(
     if not skip_derived:
         findings.extend(check_derived_relations(con))
     if not skip_geography:
+        # Both are full-state coverage checks and are skipped together: a
+        # synthetic fixture holding three GPs is not wrong for having three
+        # districts, and it is not wrong for having three profiles either.
+        # The flag keeps its name because that is what the CLI and the
+        # Makefile pass; what it means is "this is not the state".
         findings.extend(check_geography_completeness(con))
+        findings.extend(check_gp_profile_completeness(con))
     if not skip_reconciliation:
         findings.extend(check_reconciliation_totals(con))
     return findings

@@ -25,9 +25,14 @@ from src.pipeline.snapshots import (
 
 from .config import WarehouseSettings
 from .load import discover_tables
-from .schema import KIND_TABLES
+from .schema import KIND_TABLES, REQUIRED_KINDS
 
 KNOWN_KIND_PREFIXES = tuple(kind.lower() for kind in KIND_TABLES)
+# What `_classify` accepts is every kind the schema knows; what the build
+# demands is only the mutually dependent scrape (see schema.REQUIRED_KINDS).
+REQUIRED_KIND_PREFIXES = tuple(
+    kind.lower() for kind in KIND_TABLES if kind in REQUIRED_KINDS
+)
 
 # Kinds whose transforms filter their rows against the set of activities the
 # snapshot's own `pl` produced: an approval or progress row referencing an
@@ -176,7 +181,7 @@ def resolve_snapshots(
     # would have retroactively invalidated every snapshot already approved,
     # including the one production is about to serve.
     covered = {name for snapshot in resolved for name in snapshot.tables}
-    missing_kinds = tuple(kind for kind in KNOWN_KIND_PREFIXES if kind not in covered)
+    missing_kinds = tuple(kind for kind in REQUIRED_KIND_PREFIXES if kind not in covered)
     if missing_kinds:
         # A kind absent entirely (never requested at normalization time) is
         # not the same as a kind present with zero rows.

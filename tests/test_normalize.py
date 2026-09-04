@@ -11,6 +11,7 @@ from src.pipeline.normalize import (
     NormalizationError,
     _normalise_year,
     normalize_egramswaraj,
+    normalize_run,
     to_records,
     validate_canonical_manifest,
 )
@@ -681,3 +682,315 @@ def test_a_small_table_is_not_split_into_one_part_per_flush(tmp_path: Path):
         f"20 rows written as {len(parts)} part files; the small table is "
         f"being flushed alongside the big one"
     )
+
+
+# --------------------------------------------------------------------- flat CSV lane (#123)
+
+PROFILE_HEADER = "basic_info_lgd,param__gp_name,demographic_details_male_population"
+
+
+def profile_run(tmp_path: Path, run_id: str, body: str) -> Path:
+    """A raw run published the way the profile extract is: one CSV, its own source."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", run_id) as publisher:
+        publisher.write_payload(
+            "eGramSwaraj_panchayat_master.csv",
+            f"{PROFILE_HEADER}\n{body}".encode(),
+        )
+        return publisher.publish()
+
+
+def test_flat_csv_run_normalizes_to_one_canonical_table(tmp_path: Path):
+    """The lane the JSON normalizer cannot serve (#123).
+
+    A one-row-per-GP reference CSV has no `LGD_<code>_<name>` folder, no
+    fiscal year in its filename and no nested child arrays, so it matches
+    neither `_gp_context` nor `KIND_RE`. What it must still produce is the
+    same *output* contract -- provenance columns, atomic publication, a
+    canonical manifest -- because that is the half a snapshot depends on.
+    """
+
+    run = profile_run(tmp_path, "profile-1", "115550,Angarbandha,120\n115551,Badabandha,130")
+    result = normalize_run(run, tmp_path / "canonical")
+
+    assert set(result.tables) == {"profile"}
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 2
+    assert [row["basic_info_lgd"] for row in canonical] == ["115550", "115551"]
+    # The key column stands in for the JSON lane's activityCd.
+    assert [row["business_id"] for row in canonical] == ["115550", "115551"]
+    assert {row["source_kind"] for row in canonical} == {"PROFILE"}
+    assert {row["source_system"] for row in canonical} == {"egramswaraj_profile"}
+    # No fiscal year exists in this source, so none is invented -- and the
+    # rows are not filed under a `fiscal_year-unknown` partition that would
+    # read as missing data rather than as inapplicable.
+    assert {row["fiscal_year"] for row in canonical} == {None}
+    assert not list((result.output_root / "profile").glob("fiscal_year-*"))
+    assert (result.output_root / "canonical_manifest.json").is_file()
+
+
+def test_flat_csv_row_ids_follow_the_key_not_the_line_number(tmp_path: Path):
+    """Same guarantee as the JSON lane's identity tests, one source over (#110).
+
+    A reference extract is re-scraped periodically and there is nothing that
+    fixes its row order. Keying identity on the line number would make every
+    row_id -- and every link anything later builds on one -- move the first
+    time the portal returned the same GPs in a different order.
+    """
+
+    forward = normalize_run(
+        profile_run(tmp_path, "profile-fwd", "115550,Angarbandha,120\n115551,Badabandha,130"),
+        tmp_path / "canonical",
+    )
+    reverse = normalize_run(
+        profile_run(tmp_path, "profile-rev", "115551,Badabandha,130\n115550,Angarbandha,120"),
+        tmp_path / "canonical",
+    )
+
+    def by_key(result):
+        return {row["basic_info_lgd"]: row["row_id"] for row in rows(files(result, "profile")[0])}
+
+    assert by_key(forward) == by_key(reverse)
+    assert len(set(by_key(forward).values())) == 2
+
+
+def test_flat_csv_blank_keys_still_get_distinct_row_ids(tmp_path: Path):
+    """The 84 profile-less rows must survive normalization to be counted later.
+
+    Rejecting them here would make the warehouse's quarantine count wrong by
+    84 and hide a shrinking source. They carry no key, so identity falls back
+    to content -- which is why the two below must not collide.
+    """
+
+    result = normalize_run(
+        profile_run(tmp_path, "profile-blank", ",Angarbandha,\n,Badabandha,\n115550,Kendu,120"),
+        tmp_path / "canonical",
+    )
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 3
+    assert len({row["row_id"] for row in canonical}) == 3
+    assert sum(1 for row in canonical if row["business_id"] is None) == 2
+
+
+def test_flat_csv_run_refuses_an_ambiguous_or_unkeyed_payload(tmp_path: Path):
+    """Two failures that must stop the run rather than produce a partial table.
+
+    Two CSVs in one run would share a run_id and a canonical table, so their
+    rows would be indistinguishable in provenance. A missing key column would
+    give every row a content-derived identity and silently load a table whose
+    primary key is null throughout.
+    """
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-two") as publisher:
+        publisher.write_payload("a.csv", f"{PROFILE_HEADER}\n1,A,2".encode())
+        publisher.write_payload("b.csv", f"{PROFILE_HEADER}\n2,B,3".encode())
+        two = publisher.publish()
+    with pytest.raises(NormalizationError, match="exactly one .csv payload"):
+        normalize_run(two, tmp_path / "canonical")
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-unkeyed") as publisher:
+        publisher.write_payload("p.csv", b"gp_name,population\nAngarbandha,120")
+        unkeyed = publisher.publish()
+    with pytest.raises(NormalizationError, match="basic_info_lgd"):
+        normalize_run(unkeyed, tmp_path / "canonical")
+
+
+def test_flat_csv_keys_that_look_like_occurrence_suffixes_do_not_collide(tmp_path: Path):
+    """The lane mirrors the JSON lane's identity scheme rather than re-spelling it.
+
+    The pre-#110 form appended `#<n>` to the identity, which put the counter
+    inside the identity's own namespace: a key that literally reads `X#1`
+    produced the same key as the *second* row keyed `X`, so the two shared a
+    row_id. LGD codes are numeric and cannot trip this, but the lane is
+    generic -- #48's spreadsheet brings its own key column.
+    """
+
+    result = normalize_run(
+        profile_run(tmp_path, "profile-hash", "X,A,1\nX,B,2\nX#1,C,3"),
+        tmp_path / "canonical",
+    )
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 3
+    row_ids = [row["row_id"] for row in canonical]
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
+def test_flat_csv_rows_sharing_a_key_survive_reordering(tmp_path: Path):
+    """The duplicate-key tiebreaker reaches this lane too.
+
+    Two rows with the same key and different content would otherwise be told
+    apart by line number alone, and re-exporting the file in a different order
+    would swap their row_ids. The real extract has no duplicate keys -- 6,710
+    distinct, verified -- so this pins the generic property the lane offers
+    rather than a defect in the profile file.
+    """
+
+    def by_name(order):
+        result = normalize_run(
+            profile_run(tmp_path, f"dupkey-{order[0][0]}", "\n".join(
+                f"115550,{name},{pop}" for name, pop in order
+            )),
+            tmp_path / "canonical",
+        )
+        return {r["param__gp_name"]: r["row_id"] for r in rows(files(result, "profile")[0])}
+
+    forward = by_name([("A", "1"), ("B", "2")])
+    reverse = by_name([("B", "2"), ("A", "1")])
+    assert forward == reverse
+    assert len(set(forward.values())) == 2
+
+
+# --------------------------------------------------------------------- child identity keys (#163)
+
+def _scheme_run(tmp_path: Path, run_id: str, elements: list[dict]) -> Path:
+    return make_run(tmp_path, run_id, {
+        "2021_AA.json": [{"activityCd": "A1", "admApprovalSchemeWebService": elements}],
+    })
+
+
+def _scheme_rows(tmp_path: Path, run_id: str, elements: list[dict]) -> list[dict]:
+    result = normalize_egramswaraj(
+        _scheme_run(tmp_path, run_id, elements), tmp_path / "canonical",
+    )
+    return rows(files(result, "aa__admapprovalschemewebservice")[0])
+
+
+def test_a_child_with_its_own_key_keeps_its_row_id_when_an_amount_changes(tmp_path: Path):
+    """`ID_KEYS` sees activity-style fields only, so this fell back to content (#163).
+
+    An `admApprovalSchemeWebService` element carries `wrkSchmCd`/`wrkSchmCmpntCd`,
+    which none of `ID_KEYS` matches. Its identity was therefore a hash of the
+    whole element, and editing an amount -- an ordinary correction upstream --
+    re-identified a logically unchanged row and moved every descendant prefix
+    beneath it.
+
+    Measured across 250 random GPs: the composite is present, non-blank and
+    unique in all 27,672 scheme arrays observed.
+    """
+
+    before = _scheme_rows(tmp_path, "scheme-before", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    after = _scheme_rows(tmp_path, "scheme-after", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert before[0]["row_id"] == after[0]["row_id"]
+    assert before[0]["wrkAdmApprFndSnctnGen"] != after[0]["wrkAdmApprFndSnctnGen"]
+
+
+def test_a_child_keys_business_id_still_inherits_the_activity(tmp_path: Path):
+    """The identity key must not reach the `business_id` provenance column.
+
+    `transform._base_identity` and `transform.admin_approval_scheme` both read
+    `business_id` as an *activity* code. A child with no id of its own inherits
+    its parent's, which is what makes those two correct. If the collection key
+    were routed through `_business_id` instead of through identity alone, this
+    row's `business_id` would become a scheme code and a wrong value would be
+    loaded into `admin_approval_scheme.activity_code`.
+    """
+
+    row = _scheme_rows(tmp_path, "scheme-bid", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+    ])[0]
+    assert row["business_id"] == "A1", "business_id must stay the inherited activity code"
+
+
+def test_a_partial_composite_is_not_treated_as_a_key(tmp_path: Path):
+    """Half a composite is not an identity.
+
+    Two elements agreeing on the half that happens to be filled in would share
+    it, and the occurrence counter would then decide which was which -- exactly
+    the order dependence the key is meant to remove. A missing part must fall
+    back to content, which still tells these two apart.
+    """
+
+    canonical = _scheme_rows(tmp_path, "scheme-partial", [
+        {"wrkSchmCd": "S1", "wrkAdmApprFndSnctnGen": 100},
+        {"wrkSchmCd": "S1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert len(canonical) == 2
+    assert len({r["row_id"] for r in canonical}) == 2
+
+
+def test_a_child_without_a_known_collection_key_is_unchanged(tmp_path: Path):
+    """Collections not in the table keep the previous behaviour exactly.
+
+    The keys were chosen by measuring five collections; anything else still
+    falls back to its own business id, then to content. Adding the table must
+    not quietly re-identify arrays nobody surveyed.
+    """
+
+    result = normalize_egramswaraj(
+        make_run(tmp_path, "unknown-collection", {
+            "2021_PL.json": [{"activityCd": "P1", "someOtherArray": [
+                {"schemeCode": "S1", "componentCode": "C1", "amount": 5},
+            ]}],
+        }),
+        tmp_path / "canonical",
+    )
+    child = rows(files(result, "pl__someotherarray")[0])[0]
+    # `fundList`'s key would have matched these field names; the collection
+    # name is what gates it, so this row still inherits and hashes content.
+    assert child["business_id"] == "P1"
+
+
+def test_a_whitespace_only_key_part_is_not_a_key(tmp_path: Path):
+    """`" "` is as absent as `""`, and had to be tested before stripping.
+
+    Accepting it hands a lone row a stable-looking identity that survives
+    arbitrary content changes -- the exact opposite of what falling back to
+    content is for, and a silent one because a single-element array cannot
+    collide with anything to reveal it.
+
+    Whitespace is stripped inside the key as well, so `"S1"` and `" S1 "` are
+    one scheme rather than two.
+    """
+
+    blank = _scheme_rows(tmp_path, "scheme-ws-a", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    changed = _scheme_rows(tmp_path, "scheme-ws-b", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert blank[0]["row_id"] != changed[0]["row_id"], (
+        "a whitespace-only part must fall back to content identity"
+    )
+
+    padded = _scheme_rows(tmp_path, "scheme-ws-c", [
+        {"wrkSchmCd": " S1 ", "wrkSchmCmpntCd": " C1 ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    tight = _scheme_rows(tmp_path, "scheme-ws-d", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert padded[0]["row_id"] == tight[0]["row_id"], (
+        "padding is not a different scheme"
+    )
+
+
+def test_a_blank_business_id_is_absent_the_same_way_a_blank_key_part_is(tmp_path: Path):
+    """The two identity sources must agree on what "blank" means.
+
+    `_collection_key` and `_business_id` are alternatives in one expression,
+    so a `" "` accepted by one and rejected by the other would be an identity
+    that exists only because of which field it came from. Found by
+    self-review after the collection-key fix, not by a failure: no id value in
+    the scrape is padded or whitespace-only (420,821 sampled).
+
+    Stripping also matches the warehouse, where every `activity_code` goes
+    through `clean.to_code`. A padded id would otherwise make a parent's
+    stripped code and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+    """
+
+    result = normalize_egramswaraj(
+        make_run(tmp_path, "blank-bid", {
+            "2021_PL.json": [
+                {"activityCd": " ", "note": "whitespace-only"},
+                {"activityCd": " A1 ", "note": "padded"},
+            ],
+        }),
+        tmp_path / "canonical",
+    )
+    by_note = {r["note"]: r for r in rows(files(result, "pl")[0])}
+    assert by_note["whitespace-only"]["business_id"] is None
+    assert by_note["padded"]["business_id"] == "A1"

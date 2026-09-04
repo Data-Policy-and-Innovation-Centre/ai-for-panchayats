@@ -1,6 +1,6 @@
 """The consumer-facing relations, materialised as tables rather than views.
 
-The chatbot never queries the 19 spec tables directly. It queries seven
+The chatbot never queries the fact tables directly. It queries seven
 ``v_*`` relations, and ``v_activity`` alone is referenced ~324 times in its
 template catalogue (#51). Those definitions lived only in the consumer repo,
 so a warehouse built here was not consumable at all.

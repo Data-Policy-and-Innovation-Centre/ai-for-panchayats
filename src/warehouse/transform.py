@@ -173,6 +173,64 @@ class FieldResolutions:
         return tuple(r for r in self.records if r.matched_candidate is None)
 
 
+def _is_fractional(text: object) -> bool:
+    """A count that is not a whole number is malformed, not roundable.
+
+    ``clean.to_int`` ends in ``numeric.round()``, so "1.5" becomes 2 and looks
+    like a clean parse to anything that only checks for null afterwards. A
+    rounded count is an invented one.
+
+    Module level rather than nested in one transform: activity_nsap's
+    beneficiary counts and gp_profile's populations are the same question
+    about the same kind of column, and two copies of this predicate would
+    drift (#116, #123).
+    """
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    if not value.is_finite():
+        return False
+    return value != value.to_integral_value()
+
+
+def _is_non_finite(text: object) -> bool:
+    """NaN and Infinity: not fractional, and still not a count."""
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    return not value.is_finite()
+
+
+class EmptyRequiredColumn(ValueError):
+    """A required column resolved by name, but none of its values survived.
+
+    The sibling case ``RequiredFieldUnresolved`` does not cover, and the one
+    that is easier to reach: the header is still there and the values are not.
+    ``_first_present`` proves a column NAME exists; nothing proved the values
+    parsed. A scrape emitting blanks -- or text where a count belongs -- would
+    otherwise publish the right number of rows with entirely NULL measures,
+    past every check there is, because the columns are nullable and no
+    conformance rule reads their contents (#123).
+    """
+
+    def __init__(self, *, table: str, columns: tuple[str, ...], rows: int) -> None:
+        self.table = table
+        self.columns = columns
+        self.rows = rows
+        super().__init__(
+            f"{table}: required column(s) {columns!r} are null in all {rows:,} loaded "
+            "row(s); the source column is present but carries no readable values"
+        )
+
+
 def _dedupe(frame: pd.DataFrame, keys: list[str], table: str, quarantine: Quarantine,
             *, source_system: str, source_run_id: str) -> pd.DataFrame:
     """Collapse to one row per composite key, quarantining genuine conflicts.
@@ -318,6 +376,145 @@ def gram_panchayat(root_frames: list[pd.DataFrame], quarantine: Quarantine,
             lambda code, _c=column: lookup.get(code, {}).get(_c)
         ).astype("string")
     return deduped
+
+
+# --------------------------------------------------------------------- gp_profile
+
+# The profile CSV's own header spelling -> the DDL column. Ten of its 99
+# columns, written out rather than taken by prefix: the file's columns are
+# whatever the scrape happened to see, so a pattern match would silently
+# widen the table the next time the portal adds a field.
+GP_PROFILE_KEY = "basic_info_lgd"
+GP_PROFILE_RENAMES = {
+    "demographic_details_total_gender_wise_population": "total_population",
+    "demographic_details_male_population": "male_population",
+    "demographic_details_female_population": "female_population",
+    "demographic_details_transgender_population": "transgender_population",
+    "demographic_details_children_population": "children_population",
+    "demographic_details_sc_population": "sc_population",
+    "demographic_details_st_population": "st_population",
+    "demographic_details_obc_population": "obc_population",
+    "demographic_details_general_population": "general_population",
+    "general_no_of_households": "households",
+}
+GP_PROFILE_COLUMNS = [
+    "source_system", "source_run_id", "gp_lgd_code", *GP_PROFILE_RENAMES.values(),
+]
+
+
+def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+               *, source_system: str, source_run_id: str) -> pd.DataFrame:
+    """One row per GP, from the panchayat profile extract (#123).
+
+    Two rejections, kept apart because they mean different things:
+
+    * **84 rows carry no LGD code at all** -- placeholders for GPs whose
+      profile was never filled in. Loaded unfiltered, 83 of them collide on
+      the empty string and fail the primary key. They are quarantined rather
+      than filtered so the count stays visible; dropping them silently is how
+      a shrinking source goes unnoticed. Note they are not blank rows: they
+      still carry the scrape's own `param__*` request fields, which is why
+      "the row is empty" is not a safe test for them.
+    * **A keyed row whose GP is not in `gram_panchayat`** is an orphan, and
+      goes to quarantine under the standard reason code.
+
+    Every one of the ten measures is resolved with ``required=True``, and then
+    checked again after conversion. The two catch different failures and only
+    the pair is sufficient: ``required=True`` catches an upstream *rename*,
+    while ``EmptyRequiredColumn`` catches the header surviving with no readable
+    values behind it. Either way, loading 6,710 rows of all-NULL demographics
+    would pass every other check this repo has -- right row count, no orphans,
+    valid key -- and be wrong in the only way that matters.
+
+    A row carrying a value that is present but unreadable is quarantined
+    rather than loaded with a hole: nine good measures do not make a tenth
+    trustworthy, and a silently-NULL cell is the thing this whole function is
+    arranged to prevent. "Unreadable" includes values that parse *too*
+    willingly: ``to_int`` rounds, so a population of "1.5" would otherwise be
+    stored as 2 -- an invented number rather than a missing one -- and it
+    carries a negative through untouched, though nobody ever counted -1
+    people.
+    """
+
+    if profile.empty:
+        return pd.DataFrame(columns=GP_PROFILE_COLUMNS)
+
+    key, _ = _first_present(
+        profile, "gp_profile", "gp_lgd_code", (GP_PROFILE_KEY,), required=True,
+    )
+    out = pd.DataFrame({
+        "source_system": profile["source_system"],
+        "source_run_id": profile["source_run_id"],
+        "gp_lgd_code": to_code(key),
+    })
+    # A value that was present in the source and did NOT survive the cast is a
+    # parse failure, not an absent measure, and `to_int` cannot tell them apart
+    # -- it coerces both to NA. Tracked here, while the raw text is still in
+    # reach, so the row can be quarantined rather than loaded with a hole.
+    unreadable = pd.Series(False, index=profile.index)
+    for source, target in GP_PROFILE_RENAMES.items():
+        series, _ = _first_present(
+            profile, "gp_profile", target, (source,), required=True,
+        )
+        converted = to_int(series)
+        text = series.astype("string").str.strip()
+        # `to_int` rounds, so a fractional count parses cleanly and a
+        # null-check alone would accept an invented one. Same grouping cleanup
+        # and same two predicates as activity_nsap, which asks this about the
+        # same kind of column.
+        cleaned = text.map(
+            lambda value: ungroup_digits(value) if isinstance(value, str) else value
+        ).astype("string")
+        present = text.notna() & (text != "")
+        # A negative population or household count is impossible, and `to_int`
+        # carries it through untouched -- it is neither null, fractional nor
+        # non-finite, so every other predicate here accepts it.
+        unreadable |= present & (
+            converted.isna()
+            | cleaned.map(_is_fractional)
+            | cleaned.map(_is_non_finite)
+            | (converted < 0)
+        )
+        out[target] = converted
+
+    unkeyed = out["gp_lgd_code"].isna()
+    if unkeyed.any():
+        quarantine.add(
+            "gp_profile", "missing_key", "profile row carries no LGD code",
+            "gp_lgd_code", out.loc[unkeyed, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~unkeyed]
+
+    out = _dedupe(
+        out, ["gp_lgd_code"], "gp_profile", quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    out = _restrict(
+        out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+
+    bad = unreadable.reindex(out.index, fill_value=False)
+    if bad.any():
+        quarantine.add(
+            "gp_profile", "unreadable_measure",
+            "a population or household value could not be read as a whole number",
+            "gp_lgd_code", out.loc[bad, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~bad]
+
+    # Last, on the rows actually being loaded. `required=True` above only
+    # proves the column NAME survived upstream; this is what makes the
+    # docstring's claim true rather than aspirational.
+    if not out.empty:
+        empty = tuple(
+            column for column in GP_PROFILE_RENAMES.values() if out[column].isna().all()
+        )
+        if empty:
+            raise EmptyRequiredColumn(table="gp_profile", columns=empty, rows=len(out))
+    return out[GP_PROFILE_COLUMNS]
 
 
 # --------------------------------------------------------------------- PL: plan + planned_activity + satellites
@@ -534,26 +731,6 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
         lambda text: ungroup_digits(text) if isinstance(text, str) else text
     ).astype("string")
     malformed = raw.notna() & (raw != "") & cleaned.isna()
-
-    def _is_fractional(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        if not value.is_finite():
-            return False
-        return value != value.to_integral_value()
-
-    def _is_non_finite(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        return not value.is_finite()
 
     fractional = cleaned.map(_is_fractional)
     non_finite = cleaned.map(_is_non_finite)
@@ -809,7 +986,14 @@ def admin_approval_scheme(child: pd.DataFrame, parent_row_ids: set[str], quarant
     out["source_run_id"] = out["source_run_id"]
     out["row_id"] = out["row_id"]
     out["parent_row_id"] = out["parent_row_id"]
-    out["activity_code"] = out["business_id"]
+    # Through to_code like every other activity_code column in this module
+    # (eight of them). This was the one that assigned the raw provenance value
+    # straight through, so the same activity could be spelled one way here and
+    # another in planned_activity -- in a column whose only purpose is to join
+    # them. Inert on today's data (every sampled activityCd is a JSON int, so
+    # str() and to_code() agree), which is why it is a one-line alignment
+    # rather than an issue.
+    out["activity_code"] = to_code(out["business_id"])
     out = _ensure_columns(out, columns)
     frame = out[columns].copy()
     for column in AA_SCHEME_MONEY_COLUMNS:
