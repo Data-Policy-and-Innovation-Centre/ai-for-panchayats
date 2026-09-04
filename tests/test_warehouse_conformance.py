@@ -733,7 +733,7 @@ def test_reconciliation_skippable_for_synthetic_fixtures(tmp_path):
     build_full_schema(con)
     # No voucher/expenditure/planned-cost rows inserted at all -- would
     # normally fail every reconciliation total (0.00 != the real totals).
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert not any(f.check.startswith("reconciliation.") for f in findings)
     con.close()
 
@@ -741,7 +741,7 @@ def test_reconciliation_skippable_for_synthetic_fixtures(tmp_path):
 def test_reconciliation_included_by_default_and_fails_on_empty_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    findings = check_conformance(con, skip_reconciliation=False)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=False)
     reconciliation_findings = [f for f in findings if f.check.startswith("reconciliation.")]
     assert len(reconciliation_findings) == 3
     assert all(f.severity == "violation" for f in reconciliation_findings)
@@ -815,11 +815,11 @@ def test_geography_has_its_own_opt_out(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
 
-    skipped = check_conformance(con, skip_reconciliation=True, skip_geography=True)
+    skipped = check_conformance(con, skip_derived=True, skip_reconciliation=True, skip_geography=True)
     assert not any(f.check.startswith("geography.") for f in skipped)
 
     # Skipping only the totals must still assert scale.
-    checked = check_conformance(con, skip_reconciliation=True)
+    checked = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert any(f.check.startswith("geography.") for f in checked)
     con.close()
 
@@ -872,7 +872,7 @@ def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path
     con.execute("INSERT INTO activity_fund VALUES ('A1')")
     con.execute("INSERT INTO activity_training VALUES ('A1')")
     con.execute("INSERT INTO activity_community_service VALUES ('A1')")
-    findings = check_conformance(con, skip_reconciliation=False)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=False)
     assert findings == []
     assert not has_violations(findings)
     assert format_report(findings) == "PASS: no deviations from spec found."
@@ -883,7 +883,7 @@ def test_check_conformance_fails_and_reports_on_broken_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
     con.execute("DROP TABLE dim_welfare_scheme")
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert has_violations(findings)
     report = format_report(findings)
     assert "VIOLATION" in report
@@ -920,7 +920,7 @@ def test_check_conformance_rejects_schema_previously_passed_as_conformant(tmp_pa
             FOREIGN KEY (gp_lgd_code) REFERENCES gram_panchayat (gp_lgd_code)
         )
     """)
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     checks_fired = {f.check for f in findings}
     assert "type.money.voucher.amount" in checks_fired
     assert "constraint.foreign_key.planned_activity.plan_code" in checks_fired

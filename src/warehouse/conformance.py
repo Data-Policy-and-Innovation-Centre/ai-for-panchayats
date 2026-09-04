@@ -75,6 +75,14 @@ EXPECTED_TABLES: frozenset[str] = frozenset({
 # Its presence is informational, never a violation.
 ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"quarantine"})
 
+# The consumer-facing relations, materialised as tables by warehouse.views
+# (#51). They are derived from the 19 -- no new facts -- so they are allowed
+# alongside them rather than counted among them. Checked for presence
+# separately: a warehouse missing them builds but is not consumable.
+DERIVED_RELATIONS: frozenset[str] = frozenset({
+    "v_exp", "v_approval", "v_activity", "v_plan", "v_asset", "v_progress", "v_voucher",
+})
+
 # Section 2: primary keys. ``None`` means "no primary key is expected" --
 # a table appearing here with None is a documented fact from the spec
 # (activity_voucher, dim_lsdg_theme), not an omission.
@@ -306,7 +314,7 @@ def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
             expected=f"table {table!r} exists", actual="absent",
         ))
 
-    unexpected = actual - EXPECTED_TABLES - ALLOWED_EXTRA_TABLES
+    unexpected = actual - EXPECTED_TABLES - ALLOWED_EXTRA_TABLES - DERIVED_RELATIONS
     for table in sorted(unexpected):
         findings.append(Finding(
             check="tables.unexpected", severity="violation",
@@ -652,6 +660,48 @@ def check_dim_code_uniqueness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     )]
 
 
+def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """The consumer relations exist and are tables, not views.
+
+    Behind its own ``skip_derived`` flag for the reason
+    ``check_geography_completeness`` is behind ``skip_geography``: a fixture
+    that creates the 19 spec tables to exercise a schema rule is not wrong
+    for having no ``v_activity``. A real build is.
+
+    Both halves matter. Absence means the chatbot has nothing to query --
+    it reads these and nothing else, so a warehouse without them is not
+    consumable however complete its facts are. And a *view* where a table
+    was expected means the join graph is still being re-run per question,
+    which is the 36x cost #51 exists to remove (#99, #98).
+    """
+
+    relations = {
+        name: kind for name, kind in con.execute(
+            "SELECT table_name, table_type FROM information_schema.tables "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+    }
+    findings: list[Finding] = []
+    missing = DERIVED_RELATIONS - set(relations)
+    if missing:
+        findings.append(Finding(
+            check="relations.derived", severity="violation",
+            expected=f"the {len(DERIVED_RELATIONS)} consumer relations",
+            actual=f"missing {sorted(missing)}",
+        ))
+    not_stored = sorted(
+        name for name in DERIVED_RELATIONS & set(relations)
+        if relations[name] != "BASE TABLE"
+    )
+    if not_stored:
+        findings.append(Finding(
+            check="relations.materialized", severity="violation",
+            expected="stored tables, so the joins are paid once at build time",
+            actual=f"still views: {not_stored}",
+        ))
+    return findings
+
+
 def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """gram_panchayat carries geography for the whole state.
 
@@ -788,6 +838,7 @@ ALL_CHECKS = (
 def check_conformance(
     con: duckdb.DuckDBPyConnection, *,
     skip_reconciliation: bool = False, skip_geography: bool = False,
+    skip_derived: bool = False,
 ) -> list[Finding]:
     """Run every check and return the combined findings, in a stable order.
 
@@ -800,11 +851,15 @@ def check_conformance(
     ``skip_reconciliation`` omits the exact published totals.
     ``skip_geography`` omits full-state coverage; use it for synthetic
     fixtures, which are not wrong for holding three GPs.
+    ``skip_derived`` omits the consumer relations (#51), for the same
+    reason: a fixture exercising a schema rule need not materialise them.
     """
 
     findings: list[Finding] = []
     for check in ALL_CHECKS:
         findings.extend(check(con))
+    if not skip_derived:
+        findings.extend(check_derived_relations(con))
     if not skip_geography:
         findings.extend(check_geography_completeness(con))
     if not skip_reconciliation:
