@@ -51,7 +51,9 @@ from typing import Iterable, Mapping
 
 import pandas as pd
 
-from .clean import strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int
+from .clean import (
+    strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int, ungroup_digits,
+)
 from .geography import GEOGRAPHY_COLUMNS
 
 # --------------------------------------------------------------------- quarantine
@@ -521,7 +523,17 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
     # beneficiary_count is a COUNT, not money: parsed as a nullable integer
     # (see warehouse.schema's activity_nsap DDL), never routed through
     # decimal money parsing.
-    cleaned = melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip()
+    # Digit grouping is validated here, not stripped, for the same reason
+    # clean.to_int validates it (#127): "1,2" is malformed, not twelve.
+    # Checked in this function as well as in to_int because the detectors
+    # below read `cleaned` -- and because a value that only became NA inside
+    # to_int would be dropped by the notna() filter with no quarantine row,
+    # which is the one outcome this function exists to prevent.
+    raw = melted["beneficiary_count"].astype("string").str.strip()
+    cleaned = raw.map(
+        lambda text: ungroup_digits(text) if isinstance(text, str) else text
+    ).astype("string")
+    malformed = raw.notna() & (raw != "") & cleaned.isna()
 
     def _is_fractional(text: object) -> bool:
         if pd.isna(text) or text == "":
@@ -553,8 +565,15 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
             "activity_code", melted.loc[fractional, "activity_code"],
             source_system=source_system, source_run_id=source_run_id,
         )
+    if malformed.any():
+        quarantine.add(
+            "activity_nsap", "malformed_beneficiary_count",
+            "beneficiary_count has malformed digit grouping",
+            "activity_code", melted.loc[malformed, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
     # NaN/Infinity are non-fractional but still unparseable by to_int.
-    melted = melted[~fractional & ~non_finite]
+    melted = melted[~fractional & ~non_finite & ~malformed]
     melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
