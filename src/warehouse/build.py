@@ -32,6 +32,7 @@ import pandas as pd
 
 from . import transform
 from .config import WarehouseSettings, load_settings
+from .dimensions import dimension_frames
 from .geography import gp_geography
 from .load import DEFAULT_BATCH_SIZE, insert, read_table
 from .schema import CREATE_ORDER, DDL, RESET_ORDER
@@ -147,6 +148,13 @@ def populate(
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
+
+    # The code dictionaries are build-wide, not per-snapshot: they are the
+    # same 717/17/12 rows whatever was scraped, so they are loaded once here
+    # rather than inside the loop, where every snapshot after the first would
+    # collide on dim_code's (variable, code) primary key.
+    for table_name, frame in dimension_frames().items():
+        add_count(table_name, insert(con, table_name, frame, batch_size=batch_size))
 
     for snapshot in selected:
         source_system, source_run_id = snapshot.spec.source, snapshot.spec.run_id

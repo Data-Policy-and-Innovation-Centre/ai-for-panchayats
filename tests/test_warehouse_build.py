@@ -23,6 +23,10 @@ from warehouse.validate import ValidationFailed
 from _warehouse_helpers import approved, make_settings, normalize, publish_raw_run, registry, write_manual_snapshot
 
 
+# The code dictionaries, which load on every build regardless of selection.
+DIMENSION_TABLES = ("dim_code", "dim_lsdg_theme", "dim_welfare_scheme")
+
+
 def _pl_aa_run(tmp_path: Path, run_id: str = "run-1", *, activity_code: int = 7):
     # One fund line, one asset line: activity_asset/activity_fund are
     # strictly 1:1 with planned_activity (see schema.py), so this fixture
@@ -163,10 +167,23 @@ def test_kind_with_zero_records_is_explicit_empty_not_missing(tmp_path: Path):
 
 
 def test_empty_selection_still_publishes_a_valid_empty_warehouse(tmp_path: Path):
+    """No snapshots means no *evidence* -- but the dictionaries still load.
+
+    dim_code, dim_lsdg_theme and dim_welfare_scheme are conformed reference
+    data, not something a scrape observed (see warehouse.dimensions), so they
+    are the same rows whether five snapshots were selected or none. Asserting
+    they are empty here would be asserting the opposite of what they are.
+    """
+
     settings = make_settings(tmp_path)
     result = build(snapshot_ids=(), settings=settings, registry=registry())
     assert result.target.exists()
-    assert all(count == 0 for count in result.counts.values())
+    derived = {
+        table: count for table, count in result.counts.items()
+        if table not in DIMENSION_TABLES
+    }
+    assert all(count == 0 for count in derived.values()), derived
+    assert [result.counts.get(table) for table in DIMENSION_TABLES] == [717, 17, 12]
 
 
 # --------------------------------------------------------------------- analytical grain
