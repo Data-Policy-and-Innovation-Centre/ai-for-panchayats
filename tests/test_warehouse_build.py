@@ -546,10 +546,14 @@ def test_manifest_hash_mismatch_stops_build_before_any_db_write(tmp_path: Path):
 
 
 def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
-    """The scheme/fund array's own JSON key name is unverified (see
-    transform.py's module docstring); the loader discovers it by prefix
-    (``aa__*``) rather than assuming a specific key, so this fixture uses an
-    arbitrary plausible key to prove that discovery path end to end."""
+    """The loader discovers the scheme array by prefix, not by its key name.
+
+    The key itself is no longer a guess: `admApprovalSchemeWebService` is the
+    only child array key found in 27,672 AA arrays across 250 random GPs
+    (#163), and this fixture uses it. Discovery stays signature-based anyway,
+    which is what this test exercises end to end -- a survey says what the
+    portal emits today, and a signature match degrades to finding nothing
+    where a hardcoded key would degrade to loading an unrelated array."""
 
     run = publish_raw_run(tmp_path, "run-1", {
         "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
@@ -586,7 +590,7 @@ def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
     comments, ...) must not be swept into ``admin_approval_scheme`` just
     because it sits one level below ``aa``. Before the fix, the empty
     keyword used to discover the scheme table (its own JSON key is
-    unverified, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
+    discovered by signature, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
     matched *any* direct AA child, so an attachments array would load as
     two all-null scheme rows and get marked consumed instead of reported
     unconsumed."""
