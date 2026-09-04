@@ -2,7 +2,7 @@
 """Time normalization at several input sizes, and fingerprint what it produced.
 
     uv run python scripts/benchmark_normalize.py --gps 20 --gps 100 --gps 500 \
-        --out /tmp/bench.json
+        --work /tmp/bench --out /tmp/bench.json
 
 Two questions, one run. *How fast* is the obvious one. *Did the output
 change* is the one that decides whether a speedup is allowed to ship: run
