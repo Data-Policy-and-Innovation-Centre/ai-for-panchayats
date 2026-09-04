@@ -546,10 +546,14 @@ def test_manifest_hash_mismatch_stops_build_before_any_db_write(tmp_path: Path):
 
 
 def test_admin_approval_scheme_is_discovered_as_aa_child_table(tmp_path: Path):
-    """The scheme/fund array's own JSON key name is unverified (see
-    transform.py's module docstring); the loader discovers it by prefix
-    (``aa__*``) rather than assuming a specific key, so this fixture uses an
-    arbitrary plausible key to prove that discovery path end to end."""
+    """The loader discovers the scheme array by prefix, not by its key name.
+
+    The key itself is no longer a guess: `admApprovalSchemeWebService` is the
+    only child array key found in 27,672 AA arrays across 250 random GPs
+    (#163), and this fixture uses it. Discovery stays signature-based anyway,
+    which is what this test exercises end to end -- a survey says what the
+    portal emits today, and a signature match degrades to finding nothing
+    where a hardcoded key would degrade to loading an unrelated array."""
 
     run = publish_raw_run(tmp_path, "run-1", {
         "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
@@ -586,7 +590,7 @@ def test_unrelated_aa_child_array_is_not_loaded_as_a_scheme(tmp_path: Path):
     comments, ...) must not be swept into ``admin_approval_scheme`` just
     because it sits one level below ``aa``. Before the fix, the empty
     keyword used to discover the scheme table (its own JSON key is
-    unverified, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
+    discovered by signature, see ``test_admin_approval_scheme_is_discovered_as_aa_child_table``)
     matched *any* direct AA child, so an attachments array would load as
     two all-null scheme rows and get marked consumed instead of reported
     unconsumed."""
@@ -983,5 +987,44 @@ def test_gp_profile_quarantines_a_negative_count(tmp_path: Path):
             "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
             "AND reason_code = 'unreadable_measure'"
         ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_admin_approval_scheme_activity_code_is_cleaned_like_every_other_one(tmp_path: Path):
+    """The one activity_code that was assigned raw rather than through to_code.
+
+    Eight other `activity_code` columns in `transform` go through
+    `clean.to_code`; this one took the provenance value straight through. The
+    same activity could therefore be spelled one way here and another in
+    `planned_activity` -- in a column whose only purpose is to join them.
+
+    Inert on today's data: every sampled `activityCd` is a JSON int, so
+    `str()` and `to_code()` agree. Asserted against `planned_activity` rather
+    than against a literal, because the property that matters is that the two
+    agree, not what either one says.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [
+                {"wrkSchmCd": "SC1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    result = build(
+        snapshot_ids=("snap-1",), settings=settings,
+        registry=registry(approved("snap-1", "egramSwaraj", "run-1")),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT s.activity_code FROM admin_approval_scheme s"
+            " JOIN planned_activity a ON a.activity_code = s.activity_code"
+        ).fetchall() == [("7",)], "scheme activity_code must join planned_activity"
     finally:
         con.close()

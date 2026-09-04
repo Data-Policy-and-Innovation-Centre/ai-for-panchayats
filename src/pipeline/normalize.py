@@ -45,6 +45,37 @@ FLAT_CSV_SOURCES: dict[str, tuple[str, str]] = {
     "egramswaraj_profile": ("PROFILE", "basic_info_lgd"),
 }
 ID_KEYS = ("activityCd", "activity_cd", "activityId", "activity_id", "id")
+# Identity keys for child collections, by the array's own JSON key (#163).
+#
+# `ID_KEYS` recognizes activity-style fields only, so every one of these
+# collections fell back to hashing the whole element: an ordinary edit to an
+# amount re-identified a logically unchanged row and moved every descendant
+# prefix beneath it.
+#
+# Chosen by measurement, not by reading field names. Across 250 random GPs
+# and every kind, each key below is present, non-blank, and unique within its
+# array in 100% of the arrays observed:
+#
+#   fundList                                    76,902 arrays  (max len   4)
+#   physicalProgressAssetStageWebService        28,502 arrays  (max len  41)
+#   admApprovalSchemeWebService                 27,672 arrays  (max len   2)
+#   physicalProgressAssetStageUploadWebService  23,773 arrays  (max len 177)
+#   budgetaryAllocationSchemeWebService          1,500 arrays  (max len  58)
+#
+# Composites are used where the collection has a natural parent code, even
+# though the component code alone was also unique in the sample: a component
+# code is only meaningful under its scheme, and a key that is more specific
+# than it needs to be costs nothing -- it moves only when a code moves, which
+# is the same as the row being a different row.
+#
+# These feed `_record_identity` only. `business_id` is untouched.
+CHILD_IDENTITY_KEYS: dict[str, tuple[str, ...]] = {
+    "fundList": ("schemeCode", "componentCode"),
+    "admApprovalSchemeWebService": ("wrkSchmCd", "wrkSchmCmpntCd"),
+    "budgetaryAllocationSchemeWebService": ("schemeCode", "schemeComponentCode"),
+    "physicalProgressAssetStageWebService": ("physclPrgrssAstStgCd",),
+    "physicalProgressAssetStageUploadWebService": ("fileUploadId",),
+}
 PROVENANCE_COLUMNS = (
     "row_id", "parent_row_id", "pos", "source_system", "source_run_id",
     "source_record_id", "schema_version", "source_file", "source_kind",
@@ -362,10 +393,32 @@ def _gp_context(path: Path, payload_root: Path) -> tuple[str | None, str | None]
 
 
 def _business_id(record: Mapping[str, Any]) -> str | None:
+    """The record's own business identifier, or None.
+
+    Stripped, and blank-after-stripping is treated as absent -- the same test
+    `_collection_key` applies to its parts. The two are alternatives in one
+    expression (`_collection_key(...) or _business_id(...)`), so a `" "`
+    accepted here while rejected there would be an identity that exists only
+    because of which field it happened to come from.
+
+    Stripping also matches the warehouse side rather than diverging from it:
+    every `activity_code` column is written through `clean.to_code`, which
+    strips. A padded id would otherwise make a parent's stripped
+    `activity_code` and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+
+    No value in the scrape needs either: 420,821 id values sampled across 200
+    GPs, none padded and none whitespace-only. This is here so the two
+    spellings cannot disagree, not because they currently do.
+    """
+
     for key in ID_KEYS:
         value = record.get(key)
-        if value not in (None, "") and not isinstance(value, (list, dict)):
-            return str(value)
+        if value is None or isinstance(value, (list, dict)):
+            continue
+        text = value.strip() if isinstance(value, str) else str(value)
+        if text:
+            return text
     return None
 
 
@@ -469,15 +522,57 @@ def _record_identity(record: Any, business_id: str | None) -> str:
     return "content:" + hashlib.sha256(_canonical_json(record).encode("utf-8")).hexdigest()
 
 
-def _element_identity(element: Any) -> str:
+def _collection_key(collection: str | None, element: Mapping[str, Any]) -> str | None:
+    """The identity key for one element of a known child collection.
+
+    Returns ``None`` unless EVERY part is present and non-blank. A partial
+    composite is not an identity: two elements agreeing on the half that
+    happens to be filled in would share it, and the caller would treat that
+    as a stable key rather than falling back to content.
+
+    The parts are joined as JSON rather than with a separator, so a value
+    containing the separator cannot forge another element's key.
+    """
+
+    parts = CHILD_IDENTITY_KEYS.get(collection or "")
+    if not parts:
+        return None
+    values: list[str] = []
+    for part in parts:
+        value = element.get(part)
+        if value is None or isinstance(value, (list, dict)):
+            return None
+        # Stripped before the blank test, not after: `" "` is as absent as
+        # `""`, and accepting it would hand a lone row a stable-looking key
+        # that survives arbitrary content changes -- the opposite of what a
+        # missing key is supposed to do here. Stripped in the key too, so
+        # `"S1"` and `" S1 "` are the same scheme rather than two.
+        text = value.strip() if isinstance(value, str) else str(value)
+        if not text:
+            return None
+        values.append(text)
+    return _canonical_json(values)
+
+
+def _element_identity(element: Any, *, collection: str | None = None) -> str:
     """`_record_identity` for anything that may not be a mapping.
 
     Child arrays hold scalars as well as records, and a scalar has no
     business id to look up.
+
+    ``collection`` is the array's own JSON key, which selects the child
+    identity key. It is used for identity ONLY -- the `business_id`
+    provenance column is computed separately by the caller and keeps its
+    inherit-from-parent behaviour, because two loaders read that column as an
+    activity code (`transform._base_identity`, `transform.admin_approval_scheme`).
+    Letting a scheme code reach it would put a wrong value in a loaded column,
+    which is worse than the instability this fixes (#163).
     """
 
+    if not isinstance(element, Mapping):
+        return _record_identity(element, None)
     return _record_identity(
-        element, _business_id(element) if isinstance(element, Mapping) else None
+        element, _collection_key(collection, element) or _business_id(element)
     )
 
 
@@ -581,7 +676,10 @@ def _child_rows(
         # same key are told apart while identical elements under *different*
         # keys do not interfere.
         occurrences: dict[str, int] = {}
-        repeated = _repeated_identities(_element_identity(e) for e in value)
+        collection = str(key)
+        repeated = _repeated_identities(
+            _element_identity(e, collection=collection) for e in value
+        )
         for position, element in enumerate(value):
             # The element's OWN business id, not the inherited one: inheriting
             # the parent's id here would give every sibling the same identity
@@ -590,7 +688,7 @@ def _child_rows(
                 _business_id(element) if isinstance(element, Mapping) else None
             )
             identity = _refine_identity(
-                element, _record_identity(element, own_business_id), repeated
+                element, _element_identity(element, collection=collection), repeated
             )
             seen = occurrences.get(identity, 0)
             occurrences[identity] = seen + 1

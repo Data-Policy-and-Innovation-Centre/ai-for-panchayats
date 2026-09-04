@@ -274,8 +274,14 @@ def populate(
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
         parent_row_ids = set(approvals["row_id"].dropna())
 
-        # The scheme array's own JSON key is unverified (see transform.py's
-        # module docstring), so candidates are still found by prefix alone --
+        # The scheme array's JSON key IS now verified -- it is
+        # `admApprovalSchemeWebService`, the only child array key found in
+        # 27,672 AA arrays across 250 random GPs (#163). Discovery is still by
+        # prefix plus a field signature rather than by that literal, on
+        # purpose: the survey proves what the portal emits today, not what it
+        # will emit next year, and a signature match degrades to "found
+        # nothing" where a hardcoded key would degrade to silently loading an
+        # unrelated array. So candidates are found by prefix, and --
         # but a direct AA child is only kept if it actually carries a
         # recognized scheme field. Without this, ANY unrelated AA child array
         # (attachments, comments, ...) would match the empty keyword, get

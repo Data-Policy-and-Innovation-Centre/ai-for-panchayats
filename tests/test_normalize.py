@@ -838,3 +838,159 @@ def test_flat_csv_rows_sharing_a_key_survive_reordering(tmp_path: Path):
     reverse = by_name([("B", "2"), ("A", "1")])
     assert forward == reverse
     assert len(set(forward.values())) == 2
+
+
+# --------------------------------------------------------------------- child identity keys (#163)
+
+def _scheme_run(tmp_path: Path, run_id: str, elements: list[dict]) -> Path:
+    return make_run(tmp_path, run_id, {
+        "2021_AA.json": [{"activityCd": "A1", "admApprovalSchemeWebService": elements}],
+    })
+
+
+def _scheme_rows(tmp_path: Path, run_id: str, elements: list[dict]) -> list[dict]:
+    result = normalize_egramswaraj(
+        _scheme_run(tmp_path, run_id, elements), tmp_path / "canonical",
+    )
+    return rows(files(result, "aa__admapprovalschemewebservice")[0])
+
+
+def test_a_child_with_its_own_key_keeps_its_row_id_when_an_amount_changes(tmp_path: Path):
+    """`ID_KEYS` sees activity-style fields only, so this fell back to content (#163).
+
+    An `admApprovalSchemeWebService` element carries `wrkSchmCd`/`wrkSchmCmpntCd`,
+    which none of `ID_KEYS` matches. Its identity was therefore a hash of the
+    whole element, and editing an amount -- an ordinary correction upstream --
+    re-identified a logically unchanged row and moved every descendant prefix
+    beneath it.
+
+    Measured across 250 random GPs: the composite is present, non-blank and
+    unique in all 27,672 scheme arrays observed.
+    """
+
+    before = _scheme_rows(tmp_path, "scheme-before", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    after = _scheme_rows(tmp_path, "scheme-after", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert before[0]["row_id"] == after[0]["row_id"]
+    assert before[0]["wrkAdmApprFndSnctnGen"] != after[0]["wrkAdmApprFndSnctnGen"]
+
+
+def test_a_child_keys_business_id_still_inherits_the_activity(tmp_path: Path):
+    """The identity key must not reach the `business_id` provenance column.
+
+    `transform._base_identity` and `transform.admin_approval_scheme` both read
+    `business_id` as an *activity* code. A child with no id of its own inherits
+    its parent's, which is what makes those two correct. If the collection key
+    were routed through `_business_id` instead of through identity alone, this
+    row's `business_id` would become a scheme code and a wrong value would be
+    loaded into `admin_approval_scheme.activity_code`.
+    """
+
+    row = _scheme_rows(tmp_path, "scheme-bid", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+    ])[0]
+    assert row["business_id"] == "A1", "business_id must stay the inherited activity code"
+
+
+def test_a_partial_composite_is_not_treated_as_a_key(tmp_path: Path):
+    """Half a composite is not an identity.
+
+    Two elements agreeing on the half that happens to be filled in would share
+    it, and the occurrence counter would then decide which was which -- exactly
+    the order dependence the key is meant to remove. A missing part must fall
+    back to content, which still tells these two apart.
+    """
+
+    canonical = _scheme_rows(tmp_path, "scheme-partial", [
+        {"wrkSchmCd": "S1", "wrkAdmApprFndSnctnGen": 100},
+        {"wrkSchmCd": "S1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert len(canonical) == 2
+    assert len({r["row_id"] for r in canonical}) == 2
+
+
+def test_a_child_without_a_known_collection_key_is_unchanged(tmp_path: Path):
+    """Collections not in the table keep the previous behaviour exactly.
+
+    The keys were chosen by measuring five collections; anything else still
+    falls back to its own business id, then to content. Adding the table must
+    not quietly re-identify arrays nobody surveyed.
+    """
+
+    result = normalize_egramswaraj(
+        make_run(tmp_path, "unknown-collection", {
+            "2021_PL.json": [{"activityCd": "P1", "someOtherArray": [
+                {"schemeCode": "S1", "componentCode": "C1", "amount": 5},
+            ]}],
+        }),
+        tmp_path / "canonical",
+    )
+    child = rows(files(result, "pl__someotherarray")[0])[0]
+    # `fundList`'s key would have matched these field names; the collection
+    # name is what gates it, so this row still inherits and hashes content.
+    assert child["business_id"] == "P1"
+
+
+def test_a_whitespace_only_key_part_is_not_a_key(tmp_path: Path):
+    """`" "` is as absent as `""`, and had to be tested before stripping.
+
+    Accepting it hands a lone row a stable-looking identity that survives
+    arbitrary content changes -- the exact opposite of what falling back to
+    content is for, and a silent one because a single-element array cannot
+    collide with anything to reveal it.
+
+    Whitespace is stripped inside the key as well, so `"S1"` and `" S1 "` are
+    one scheme rather than two.
+    """
+
+    blank = _scheme_rows(tmp_path, "scheme-ws-a", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    changed = _scheme_rows(tmp_path, "scheme-ws-b", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert blank[0]["row_id"] != changed[0]["row_id"], (
+        "a whitespace-only part must fall back to content identity"
+    )
+
+    padded = _scheme_rows(tmp_path, "scheme-ws-c", [
+        {"wrkSchmCd": " S1 ", "wrkSchmCmpntCd": " C1 ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    tight = _scheme_rows(tmp_path, "scheme-ws-d", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert padded[0]["row_id"] == tight[0]["row_id"], (
+        "padding is not a different scheme"
+    )
+
+
+def test_a_blank_business_id_is_absent_the_same_way_a_blank_key_part_is(tmp_path: Path):
+    """The two identity sources must agree on what "blank" means.
+
+    `_collection_key` and `_business_id` are alternatives in one expression,
+    so a `" "` accepted by one and rejected by the other would be an identity
+    that exists only because of which field it came from. Found by
+    self-review after the collection-key fix, not by a failure: no id value in
+    the scrape is padded or whitespace-only (420,821 sampled).
+
+    Stripping also matches the warehouse, where every `activity_code` goes
+    through `clean.to_code`. A padded id would otherwise make a parent's
+    stripped code and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+    """
+
+    result = normalize_egramswaraj(
+        make_run(tmp_path, "blank-bid", {
+            "2021_PL.json": [
+                {"activityCd": " ", "note": "whitespace-only"},
+                {"activityCd": " A1 ", "note": "padded"},
+            ],
+        }),
+        tmp_path / "canonical",
+    )
+    by_note = {r["note"]: r for r in rows(files(result, "pl")[0])}
+    assert by_note["whitespace-only"]["business_id"] is None
+    assert by_note["padded"]["business_id"] == "A1"
