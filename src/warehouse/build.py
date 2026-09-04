@@ -217,6 +217,18 @@ def populate(
             asset_children: list[str] = []
             fund_frames: list[pd.DataFrame] = []
             fund_children: list[str] = []
+            # `pl` itself is an asset source, not only its child tables (#159).
+            # `assetDetails` arrives as a MAPPING in the real payload, so
+            # normalize folds it into this frame as `assetDetails_*` rather
+            # than emitting a child table. Considered first so the ordering
+            # matches the DDL comment's "one row per activity"; the signature
+            # test below is what decides, not the position.
+            #
+            # Not added to `asset_children`: that list feeds `used`, which
+            # tracks which canonical DATASETS were consumed, and `pl` is
+            # already counted there. Adding it would double-count.
+            if set(pl.columns) & set(transform.ASSET_CHILD_RENAMES):
+                asset_frames.append(pl)
             for name in _child_tables(tables, "pl", ""):
                 frame = _read(root, tables, name)
                 if set(frame.columns) & set(transform.ASSET_CHILD_RENAMES):

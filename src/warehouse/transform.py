@@ -588,7 +588,7 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
 
 # --------------------------------------------------------------------- PL children: asset, fund
 
-ASSET_CHILD_RENAMES = {
+_ASSET_FIELDS = {
     "astTyp": "asset_type", "astCtgry": "asset_category", "astSubCtgry": "asset_subcategory",
     "astCvrgCd": "asset_coverage_code", "astNm": "asset_name", "astUntTyp": "asset_unit_type",
     "astNumOfUnt": "asset_unit_count", "astUnitCost": "asset_unit_cost",
@@ -598,6 +598,30 @@ ASSET_CHILD_RENAMES = {
     "assetLocationDetails_astPlnUntTyp": "asset_loc_unit_type",
     "assetLocationDetails_astNoOfUnt": "asset_loc_unit_count",
     "assetLocationDetails_astUnitCostTot": "asset_loc_unit_cost_total",
+}
+
+# Both spellings the same fields arrive under, because `assetDetails` is not
+# always the same JSON type (#159).
+#
+# When it is a LIST, `normalize._child_rows` emits a `pl__*` child table whose
+# columns are the bare names above. When it is a MAPPING -- which is what the
+# full-state eGramSwaraj payload actually sends, `None` or `dict` and never a
+# list across every record sampled -- `_child_rows` does not descend at all,
+# and `_flatten_scalars` folds it into the parent `pl` frame prefixed
+# `assetDetails_`.
+#
+# Only the bare spelling was recognised, so on the real source nothing matched
+# the asset signature, `activity_asset` received an empty frame, and all
+# 4,073,745 rows were 1:1 filler with every asset column NULL -- against
+# 1,861,715 real rows in the externally built database. The data was never
+# lost; it was sitting in `pl`, unread.
+#
+# The two key sets are disjoint, so one map handles both shapes and a source
+# that changes type does not need a second code path. `pandas.rename` ignores
+# keys a frame does not carry.
+ASSET_CHILD_RENAMES = {
+    **_ASSET_FIELDS,
+    **{f"assetDetails_{source}": target for source, target in _ASSET_FIELDS.items()},
 }
 
 ACTIVITY_ASSET_COLUMNS = [

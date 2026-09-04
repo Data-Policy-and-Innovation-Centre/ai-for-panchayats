@@ -185,6 +185,60 @@ def test_activity_asset_orphan_activity_code_is_quarantined():
     assert quarantine.records[0]["reason_code"] == "orphan_reference"
 
 
+def test_activity_asset_reads_assetdetails_folded_into_the_parent(tmp_path=None):
+    """`assetDetails` is a MAPPING in the real payload, not a list (#159).
+
+    `normalize._child_rows` only descends into lists, so a dict is never a
+    child table -- `_flatten_scalars` folds it into the parent `pl` frame
+    prefixed `assetDetails_`. Only the bare spelling was recognised, so on
+    the real source nothing matched the asset signature and all 4,073,745
+    rows of `activity_asset` were 1:1 filler with every column NULL, against
+    1,861,715 real rows in the externally built database.
+
+    Sampled across 400 full-state payloads (38,673 records), `assetDetails`
+    was `None` 23,461 times and a dict 15,212 times, and a list zero times.
+    """
+
+    parent = pd.DataFrame([_row(
+        business_id="7",
+        assetDetails_astTyp="well",
+        assetDetails_astCtgry="3",
+        assetDetails_astNumOfUnt="2",
+        assetDetails_astUnitCost="1000.00",
+    )])
+    out = t.activity_asset(
+        parent, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1",
+    )
+    payload = [c for c in out.columns if c.startswith("asset_")]
+    assert not out[payload].isna().all(axis=1).all(), (
+        "every asset column is NULL -- this is exactly the shape #159 describes, "
+        "a table of 1:1 filler that passes every structural conformance check"
+    )
+    row = out.loc[out["activity_code"] == "7"].iloc[0]
+    assert row["asset_type"] == "well"
+    assert row["asset_category"] == "3"
+    assert row["asset_unit_count"] == "2"
+    assert str(row["asset_unit_cost"]) == "1000.00"
+
+
+def test_activity_asset_still_reads_a_real_child_array():
+    """The prefixed spelling must not displace the bare one.
+
+    Both key sets live in one rename map precisely so a source that changes
+    `assetDetails` from a mapping to a list -- or a run that predates the
+    change -- keeps working. Adding a spelling that broke its sibling would
+    trade one silent emptiness for another.
+    """
+
+    child = pd.DataFrame([_row(row_id="r0", business_id="7", astTyp="well", astCtgry="3")])
+    out = t.activity_asset(
+        child, {"7"}, t.Quarantine(), source_system="egramSwaraj", source_run_id="run-1",
+    )
+    row = out.loc[out["activity_code"] == "7"].iloc[0]
+    assert row["asset_type"] == "well"
+    assert row["asset_category"] == "3"
+
+
 def test_activity_asset_synthesizes_null_row_for_childless_activity():
     """A planning activity with no asset child array at all (activity "8"
     below, alongside "7" which does have one) still gets exactly one
