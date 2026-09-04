@@ -26,6 +26,16 @@ import pyarrow.dataset as ds
 
 DEFAULT_BATCH_SIZE = 50_000
 
+# DuckDB types an object column of ``decimal.Decimal`` values by sampling its
+# first ``pandas_analyze_sample`` rows (default 1000) and then fails the whole
+# load when a later row does not fit the width it picked. Every money column
+# in ``transform`` is exactly that shape -- ``clean.to_decimal_money`` returns
+# Decimals -- so a real ``fund_tied_general`` of 1000000.00 arriving after a
+# thousand five-digit ones is rejected against an inferred DECIMAL(8,2). Test
+# fixtures never reach the sample size, so this only ever appears at scale.
+# Analyzing every row costs one pass over data already in memory.
+PANDAS_ANALYZE_ROWS = 2**62
+
 
 def read_table(snapshot_root: Path, relative_paths: tuple[str, ...]) -> pd.DataFrame:
     """Read every part file of one canonical table into a single DataFrame."""
@@ -59,6 +69,7 @@ def insert(
 
     if frame.empty:
         return 0
+    con.execute(f"SET pandas_analyze_sample = {PANDAS_ANALYZE_ROWS}")
     columns = [row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()]
     payload = frame.reindex(columns=columns)
     total = 0

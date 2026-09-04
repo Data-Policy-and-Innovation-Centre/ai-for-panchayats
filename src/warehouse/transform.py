@@ -919,6 +919,29 @@ RE_MONEY_COLUMNS = [
 # lack.
 RE_REQUIRED_FIELDS = frozenset({"plan_code", "s_no"})
 
+# Every spelling activity_expenditure knows how to read. A frame carrying
+# none of them is not an expenditure extract at all -- notably the `re`
+# canonical kind, which is getLbAllocatedAmountData (budgetary allocation:
+# planYear, planUnitCode, and a scheme-allocation child list), not
+# expenditure. See src/ingest/egramSwaraj_API/config.py for the endpoint
+# map. activity_expenditure's real source is the separate expenditure
+# extract in #49, which has no loader yet.
+RE_SOURCE_COLUMNS = frozenset(
+    candidate for candidates in RE_CANDIDATES.values() for candidate in candidates
+)
+
+
+def is_expenditure_frame(frame: pd.DataFrame) -> bool:
+    """Does this frame claim to be an expenditure extract at all?
+
+    Distinguishes "wrong source wired in" from "right source, renamed
+    column": the second must keep failing loudly through
+    ``RE_REQUIRED_FIELDS``, so this asks only whether *any* expenditure
+    spelling is present, never whether the required ones are.
+    """
+
+    return bool(RE_SOURCE_COLUMNS & set(frame.columns))
+
 
 def activity_expenditure(
     re: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,

@@ -541,5 +541,12 @@ KIND_TABLES: dict[str, tuple[str, ...]] = {
     "AA": ("admin_approval", "admin_approval_scheme"),
     "TA": ("technical_approval",),
     "PP": ("physical_progress",),
-    "RE": ("activity_expenditure",),
+    # RE is getLbAllocatedAmountData -- budgetary allocation, not
+    # expenditure (src/ingest/egramSwaraj_API/config.py). It has no target
+    # table yet: activity_expenditure is filled from the separate
+    # expenditure extract in #49, and this kind's own allocation rows are
+    # reported unconsumed by build.populate until something claims them.
+    # The key still belongs here -- select.py requires every kind to be
+    # present in a snapshot -- so the empty value is the accurate one.
+    "RE": (),
 }

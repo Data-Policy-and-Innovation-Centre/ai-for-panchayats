@@ -305,6 +305,41 @@ def test_activity_expenditure_missing_required_alias_fails_build_and_does_not_pu
     assert not target.exists()
 
 
+def test_allocation_shaped_re_builds_and_is_reported_unconsumed(tmp_path: Path):
+    """The scraped `re` kind is allocation data, and must not be forced
+    into activity_expenditure.
+
+    ``API_TYPES["RE"]`` is ``getLbAllocatedAmountData`` -- budgetary
+    allocation, carrying planYear/planUnitCode and a scheme-allocation child
+    list, with no expenditure field of any spelling. Feeding it to
+    ``transform.activity_expenditure`` raised RequiredFieldUnresolved for a
+    ``plan_code`` the source never had, which took down the whole build on
+    real data. The table's real source is the separate expenditure extract
+    (#49), so it stays empty -- and `re` must be reported as declared but
+    unconsumed rather than counted as loaded.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_RE.json": {"data": [{
+            "planYear": "2020-2021", "planUnitCode": 123,
+            "budgetaryAllocationSchemeWebService": [
+                {"schemeCode": 38, "alocationAmountGen": 2538218, "totalBudjAmount": 2538218},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    spec_registry = registry(approved("snap-1", "egramSwaraj", "run-1"))
+
+    result = build(snapshot_ids=("snap-1",), settings=settings, registry=spec_registry)
+
+    assert result.counts["activity_expenditure"] == 0
+    unconsumed = result.unconsumed_tables["egramSwaraj/run-1"]
+    assert "re" in unconsumed
+    assert "re" not in result.consumed_tables["egramSwaraj/run-1"]
+
+
 def test_build_result_records_re_field_resolutions(tmp_path: Path):
     """Every RE_CANDIDATES field's resolution outcome -- which candidate
     matched, or that none did -- must be surfaced on BuildResult, not just
