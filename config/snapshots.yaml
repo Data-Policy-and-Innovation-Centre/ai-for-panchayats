@@ -1,0 +1,5 @@
+version: 1
+
+# Only snapshots that have been explicitly reviewed for the pipeline contract
+# belong here. Source adapters or release tooling add exact immutable run IDs.
+snapshots: []

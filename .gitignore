@@ -181,6 +181,9 @@ cython_debug/
 .cursorindexingignore
 
 data/raw/*
+# config/staging.env puts a staging run's raw tree here, outside every
+# rule above it -- ~600 payload files that would otherwise be committable.
+data/raw-staging/*
 data/clean/*
 data/interim/*
 data/processed/*
