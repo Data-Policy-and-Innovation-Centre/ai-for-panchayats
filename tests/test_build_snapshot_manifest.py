@@ -333,6 +333,64 @@ def test_the_sample_recipe_survives_pipefail_on_a_full_size_tree(tmp_path: Path)
     assert len(list(out.glob("*/2021_PL.json"))) == 20
 
 
+def _code_sha(cwd: Path) -> str:
+    import re
+    import subprocess
+
+    out = subprocess.run(
+        ["make", "-n", "run"], cwd=cwd, capture_output=True, text=True, check=True,
+    ).stdout
+    match = re.search(r"--code-sha (\S+)", out)
+    assert match, out
+    return match.group(1)
+
+
+def test_the_dirty_marker_sees_an_untracked_file_but_not_an_ignored_one(tmp_path: Path):
+    """`-dirty` has to mean "this is not the code at that commit".
+
+    `git diff --quiet HEAD` only inspects *tracked* files, so a module that
+    was written but never `git add`ed -- the most ordinary way a tree stops
+    matching its commit -- stamped a clean sha on the artifact (#137). The
+    other half matters just as much: throwaway agent worktrees and
+    per-developer settings must not produce a false `-dirty`, or the marker
+    is on permanently and stops meaning anything.
+
+    Exercised in a throwaway repo built from the *working tree's* Makefile
+    and .gitignore, not a worktree of HEAD -- a worktree would check out the
+    committed Makefile and pass no matter what the file under edit says.
+    """
+
+    import shutil
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "repo"
+    (repo / "src" / "warehouse").mkdir(parents=True)
+    (repo / "config").mkdir()
+    for name in ("Makefile", ".gitignore"):
+        shutil.copy(root / name, repo / name)
+    for name in ("prod.env", "staging.env"):
+        shutil.copy(root / "config" / name, repo / "config" / name)
+    (repo / "src" / "warehouse" / "kept.py").write_text("x = 1\n")
+
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True)
+
+    assert not _code_sha(repo).endswith("-dirty")
+
+    ignored = repo / ".worktrees" / "agent-x"
+    ignored.mkdir(parents=True)
+    (ignored / "file.py").write_text("x = 1\n")
+    assert not _code_sha(repo).endswith("-dirty"), \
+        "an ignored path must not mark the tree dirty"
+
+    (repo / "src" / "warehouse" / "_untracked_probe.py").write_text("x = 1\n")
+    assert _code_sha(repo).endswith("-dirty"), \
+        "an untracked source file means the tree is not the commit"
+
+
 def test_make_run_stamps_real_provenance_on_the_raw_run():
     """`ingest` defaults code_sha and config_hash to "unknown", and
     normalization copies those into raw_manifest_identity -- so two artifacts
