@@ -29,6 +29,24 @@ from .schema import KIND_TABLES
 
 KNOWN_KIND_PREFIXES = tuple(kind.lower() for kind in KIND_TABLES)
 
+# Kinds whose transforms filter their rows against the set of activities the
+# snapshot's own `pl` produced: an approval or progress row referencing an
+# activity that is not in that set is quarantined as an orphan.
+#
+# They must therefore travel WITH the `pl` they reference. `build.populate`
+# walks snapshots one at a time and derives that set from the snapshot in
+# hand, so a snapshot carrying these without a `pl` has every row of them
+# quarantined -- and quarantine is not a build failure, so the warehouse
+# would publish with those facts silently missing.
+#
+# Refused here rather than supported, deliberately. Making the loader
+# order-independent means loading every snapshot's `pl` before transforming
+# any dependent snapshot, which restructures the loop that builds the whole
+# warehouse; that is #161. Nothing needs it yet: #123 and #129 each add a
+# NEW kind in its own snapshot, which this permits.
+DEPENDENT_KINDS: tuple[str, ...] = ("aa", "ta", "pp")
+PLANNING_KIND = "pl"
+
 
 class SelectionError(ValueError):
     """Raised when a requested snapshot selection cannot be safely built."""
@@ -110,6 +128,14 @@ def resolve_snapshots(
             raise SelectionError(
                 f"snapshot {snapshot_id!r} declares unrecognized dataset(s) {unknown}; "
                 "teach warehouse.schema.KIND_TABLES about them before building"
+            )
+        dependent = tuple(k for k in DEPENDENT_KINDS if k in tables)
+        if dependent and PLANNING_KIND not in tables:
+            raise SelectionError(
+                f"snapshot {snapshot_id!r} carries {dependent} without {PLANNING_KIND!r}; "
+                "these kinds are filtered against the activities their own snapshot's "
+                "pl produces, so every row would be quarantined as an orphan "
+                "without failing the build (#161)"
             )
         resolved.append(SelectedSnapshot(
             spec=spec, snapshot_root=snapshot_root, manifest=manifest, tables=tables,
