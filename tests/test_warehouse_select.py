@@ -251,8 +251,50 @@ def test_approvals_without_their_own_pl_are_refused_not_quarantined(tmp_path: Pa
         approved("snap-a", "egramSwaraj", "run-a"),
         approved("snap-b", "egramSwaraj", "run-b"),
     )
-    with pytest.raises(SelectionError, match="without 'pl'"):
+    with pytest.raises(SelectionError, match="no 'pl' rows"):
         resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+
+def test_approvals_with_a_declared_but_empty_pl_are_refused_too(tmp_path: Path):
+    """Presence is not the test; rows are.
+
+    The normalizer writes a schema-correct EMPTY table for every kind that
+    was requested, so a snapshot scraped as `--kinds PL,AA` that found no
+    plans still declares `pl`. A presence-only guard waves that through, and
+    `populate` then derives an empty activity_codes set from it and
+    quarantines every approval -- the exact outcome the guard exists to
+    prevent, reached by a different route.
+
+    The sibling case is asserted in the same test on purpose: a *declared but
+    empty* aa has no rows to orphan, so tightening this must not start
+    refusing it. A guard that fires on both pins nothing.
+    """
+
+    run_a = publish_raw_run(tmp_path, "run-a", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+    })
+    # `pl` is requested here and yields nothing: declared, empty, and useless
+    # to the `aa` rows alongside it.
+    run_b = publish_raw_run(tmp_path, "run-b", {
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{"activityCd": 7}]},
+    })
+    run_c = publish_raw_run(tmp_path, "run-c", {
+        "LGD_123_Test_GP/2021_TA.json": {"data": []},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run_a, settings.canonical_root, chunk_size=100, kinds={"PL", "TA", "PP", "RE"})
+    normalize(run_b, settings.canonical_root, chunk_size=100, kinds={"PL", "AA"})
+    normalize(run_c, settings.canonical_root, chunk_size=100, kinds={"PL", "TA", "AA"})
+    spec_registry = registry(
+        approved("snap-a", "egramSwaraj", "run-a"),
+        approved("snap-b", "egramSwaraj", "run-b"),
+        approved("snap-c", "egramSwaraj", "run-c"),
+    )
+    with pytest.raises(SelectionError, match=r"snapshot 'snap-b'.*no 'pl' rows"):
+        resolve_snapshots(settings, ("snap-a", "snap-b"), registry=spec_registry)
+
+    # snap-c: empty pl AND empty aa/ta. Nothing to orphan, so it must resolve.
+    assert len(resolve_snapshots(settings, ("snap-a", "snap-c"), registry=spec_registry)) == 2
 
 
 def test_snapshot_with_all_kinds_explicitly_empty_is_still_accepted(tmp_path: Path):

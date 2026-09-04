@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from src.pipeline.normalize import NormalizationError, validate_canonical_manifest
 from src.pipeline.snapshots import (
@@ -46,6 +46,18 @@ KNOWN_KIND_PREFIXES = tuple(kind.lower() for kind in KIND_TABLES)
 # NEW kind in its own snapshot, which this permits.
 DEPENDENT_KINDS: tuple[str, ...] = ("aa", "ta", "pp")
 PLANNING_KIND = "pl"
+
+
+def _row_count(manifest: Mapping[str, Any], name: str) -> int:
+    """Rows the manifest declares for one canonical table; 0 when absent.
+
+    ``validate_canonical_manifest`` has already checked this against the
+    Parquet actually on disk, so it is a verified figure rather than a claim
+    the snapshot makes about itself.
+    """
+
+    table = manifest["tables"].get(name)
+    return int(table["row_count"]) if table else 0
 
 
 class SelectionError(ValueError):
@@ -129,13 +141,23 @@ def resolve_snapshots(
                 f"snapshot {snapshot_id!r} declares unrecognized dataset(s) {unknown}; "
                 "teach warehouse.schema.KIND_TABLES about them before building"
             )
-        dependent = tuple(k for k in DEPENDENT_KINDS if k in tables)
-        if dependent and PLANNING_KIND not in tables:
+        # Row counts, not presence. The normalizer writes a schema-correct
+        # empty table for every kind that was *requested*, so a snapshot
+        # scraped with `--kinds PL,AA` that found no plans still declares
+        # `pl` -- and a presence-only guard would wave it through to a
+        # `populate` that derives an empty activity_codes set from it and
+        # quarantines every approval. Zero pl rows cannot support any
+        # dependent row, however the table got there.
+        #
+        # Symmetrically, a *declared but empty* aa/ta/pp is not dependent on
+        # anything: it has no rows to orphan, so it must not trip the guard.
+        dependent = tuple(k for k in DEPENDENT_KINDS if _row_count(manifest, k))
+        if dependent and not _row_count(manifest, PLANNING_KIND):
             raise SelectionError(
-                f"snapshot {snapshot_id!r} carries {dependent} without {PLANNING_KIND!r}; "
-                "these kinds are filtered against the activities their own snapshot's "
-                "pl produces, so every row would be quarantined as an orphan "
-                "without failing the build (#161)"
+                f"snapshot {snapshot_id!r} carries {dependent} with no {PLANNING_KIND!r} "
+                "rows; these kinds are filtered against the activities their own "
+                "snapshot's pl produces, so every row would be quarantined as an "
+                "orphan without failing the build (#161)"
             )
         resolved.append(SelectedSnapshot(
             spec=spec, snapshot_root=snapshot_root, manifest=manifest, tables=tables,
