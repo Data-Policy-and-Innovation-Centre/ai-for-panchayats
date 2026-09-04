@@ -74,6 +74,22 @@ def test_a_code_meaning_two_things_is_refused(tmp_path: Path):
         _load("dim_code", tmp_path)
 
 
+def test_a_collapsed_theme_mapping_is_labelled_as_collapsed():
+    """focus_area -> LSDG theme is many-to-many, and this table is one row
+    per focus area, so it is a reduction. The columns that say so have to
+    survive the load, or a consumer cannot tell Sanitation (3 themes
+    collapsed into 1) from Roads (genuinely 1).
+    """
+
+    frame = dimension_frames()["dim_lsdg_theme"]
+    assert {"distinct_themes", "source_rows"} <= set(frame.columns)
+    collapsed = frame[frame["distinct_themes"] > 1]
+    assert len(collapsed) == 9, "9 of the 17 focus areas span several themes"
+    assert frame.loc[frame["focus_area_name"] == "Roads", "distinct_themes"].iloc[0] == 1
+    # Counts, not "3.0" -- they are rendered to users in provenance notes.
+    assert str(frame["distinct_themes"].dtype) == "Int64"
+
+
 def test_labels_are_stripped(tmp_path: Path):
     """The real file has "Theme 5 - Clean and Green Village " with a trailing
     space, and a trailing space in a label is visible to a user."""
@@ -86,8 +102,11 @@ def test_labels_are_stripped(tmp_path: Path):
     )
     frame = _load("dim_lsdg_theme", tmp_path)
     assert frame["lsdg_theme"].iloc[0] == "Theme 5 - Clean and Green Village"
-    # The two assembly-time counts in the file are not part of the dimension.
-    assert list(frame.columns) == ["focus_area_name", "lsdg_theme"]
+    # n_rows is renamed to say what it counts; both counts are kept, because
+    # they are what marks this table as a reduction rather than a mapping.
+    assert list(frame.columns) == [
+        "focus_area_name", "lsdg_theme", "distinct_themes", "source_rows",
+    ]
 
 
 def test_a_missing_dictionary_is_loud(tmp_path: Path):

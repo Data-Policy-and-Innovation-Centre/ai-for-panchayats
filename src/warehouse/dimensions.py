@@ -19,6 +19,15 @@ the same reason ``ingest/egramSwaraj_API/lgd_codes.json`` is: 44 KB of
 ``code -> meaning`` is closer to schema than to data, it names no panchayat
 and records no observation, and a clean clone should be able to build.
 
+``dim_lsdg_theme`` is a **reduction, not a mapping**, and is labelled as
+one. focus_area -> LSDG theme is many-to-many in the source: 9 of the 17
+focus areas carry activities under more than one theme, and the reference
+file records a single theme for each. ``distinct_themes`` is the column that
+says so (3 for Sanitation, 1 for Roads) and ``source_rows`` is the support
+behind it. Dropping them -- as an earlier revision of this module did,
+calling them assembly-time diagnostics -- turns a many-to-many into an
+authoritative one-to-one with nothing left to notice it by.
+
 ``source`` and ``confidence`` are carried through deliberately. In the real
 dictionary only 51 of 717 mappings are Confirmed and only 373 are
 high-confidence, so **94% are not confirmed-high**. A chatbot turning a
@@ -39,13 +48,22 @@ from .load_common import CsvSchemaError, read_csv
 
 REFERENCE_DIR = Path(__file__).resolve().parent / "reference"
 
-# What each table takes from its CSV, in DDL order. The file may carry more:
-# dim_lsdg_theme.csv also has `distinct_themes` and `n_rows`, which are counts
-# from whoever assembled it rather than part of the dimension, and are dropped.
+# What each table takes from its CSV, in DDL order.
 DIMENSION_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "dim_code": ("variable", "code", "description", "source", "confidence"),
-    "dim_lsdg_theme": ("focus_area_name", "lsdg_theme"),
+    "dim_lsdg_theme": ("focus_area_name", "lsdg_theme", "distinct_themes", "n_rows"),
     "dim_welfare_scheme": ("scheme_code", "scheme_name"),
+}
+
+# CSV spelling -> column name in the DDL. `n_rows` says nothing on its own
+# about which rows; it is the number of source activities behind the mapping.
+DIMENSION_RENAMES: Mapping[str, Mapping[str, str]] = {
+    "dim_lsdg_theme": {"n_rows": "source_rows"},
+}
+
+# Columns that are counts, not text, and are cast rather than stripped.
+DIMENSION_INTEGERS: Mapping[str, tuple[str, ...]] = {
+    "dim_lsdg_theme": ("distinct_themes", "source_rows"),
 }
 
 # Columns whose duplication is a contradiction rather than a repetition,
@@ -79,10 +97,19 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
         raise DimensionError(f"code dictionary unreadable: {path}: {exc}") from exc
 
     frame = frame.loc[:, list(kept)]
-    for column in kept:
+    frame = frame.rename(columns=dict(DIMENSION_RENAMES.get(name, {})))
+    integers = DIMENSION_INTEGERS.get(name, ())
+    for column in [c for c in frame.columns if c not in integers]:
         # Values arrive with stray whitespace ("Theme 5 - Clean and Green
         # Village "), and a trailing space in a label is visible to a user.
         frame[column] = frame[column].astype("string").str.strip()
+
+    for column in integers:
+        # Written by pandas as "3.0"/"350.0"; they are counts, and a theme
+        # count of 3.0 in a report reads as a defect.
+        frame[column] = (
+            pd.to_numeric(frame[column], errors="coerce").round().astype("Int64")
+        )
 
     keys = DIMENSION_KEYS.get(name, ())
     if keys:
