@@ -965,3 +965,32 @@ def test_a_whitespace_only_key_part_is_not_a_key(tmp_path: Path):
     assert padded[0]["row_id"] == tight[0]["row_id"], (
         "padding is not a different scheme"
     )
+
+
+def test_a_blank_business_id_is_absent_the_same_way_a_blank_key_part_is(tmp_path: Path):
+    """The two identity sources must agree on what "blank" means.
+
+    `_collection_key` and `_business_id` are alternatives in one expression,
+    so a `" "` accepted by one and rejected by the other would be an identity
+    that exists only because of which field it came from. Found by
+    self-review after the collection-key fix, not by a failure: no id value in
+    the scrape is padded or whitespace-only (420,821 sampled).
+
+    Stripping also matches the warehouse, where every `activity_code` goes
+    through `clean.to_code`. A padded id would otherwise make a parent's
+    stripped code and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+    """
+
+    result = normalize_egramswaraj(
+        make_run(tmp_path, "blank-bid", {
+            "2021_PL.json": [
+                {"activityCd": " ", "note": "whitespace-only"},
+                {"activityCd": " A1 ", "note": "padded"},
+            ],
+        }),
+        tmp_path / "canonical",
+    )
+    by_note = {r["note"]: r for r in rows(files(result, "pl")[0])}
+    assert by_note["whitespace-only"]["business_id"] is None
+    assert by_note["padded"]["business_id"] == "A1"

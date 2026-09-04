@@ -989,3 +989,42 @@ def test_gp_profile_quarantines_a_negative_count(tmp_path: Path):
         ).fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_admin_approval_scheme_activity_code_is_cleaned_like_every_other_one(tmp_path: Path):
+    """The one activity_code that was assigned raw rather than through to_code.
+
+    Eight other `activity_code` columns in `transform` go through
+    `clean.to_code`; this one took the provenance value straight through. The
+    same activity could therefore be spelled one way here and another in
+    `planned_activity` -- in a column whose only purpose is to join them.
+
+    Inert on today's data: every sampled `activityCd` is a JSON int, so
+    `str()` and `to_code()` agree. Asserted against `planned_activity` rather
+    than against a literal, because the property that matters is that the two
+    agree, not what either one says.
+    """
+
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {"data": [{"activityCd": 7, "totalCost": 100}]},
+        "LGD_123_Test_GP/2021_AA.json": {"data": [{
+            "activityCd": 7, "wrkAdmApprNo": "007",
+            "admApprovalSchemeWebService": [
+                {"wrkSchmCd": "SC1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 100},
+            ],
+        }]},
+    })
+    settings = make_settings(tmp_path)
+    normalize(run, settings.canonical_root, chunk_size=100)
+    result = build(
+        snapshot_ids=("snap-1",), settings=settings,
+        registry=registry(approved("snap-1", "egramSwaraj", "run-1")),
+    )
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT s.activity_code FROM admin_approval_scheme s"
+            " JOIN planned_activity a ON a.activity_code = s.activity_code"
+        ).fetchall() == [("7",)], "scheme activity_code must join planned_activity"
+    finally:
+        con.close()

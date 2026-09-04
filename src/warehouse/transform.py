@@ -986,7 +986,14 @@ def admin_approval_scheme(child: pd.DataFrame, parent_row_ids: set[str], quarant
     out["source_run_id"] = out["source_run_id"]
     out["row_id"] = out["row_id"]
     out["parent_row_id"] = out["parent_row_id"]
-    out["activity_code"] = out["business_id"]
+    # Through to_code like every other activity_code column in this module
+    # (eight of them). This was the one that assigned the raw provenance value
+    # straight through, so the same activity could be spelled one way here and
+    # another in planned_activity -- in a column whose only purpose is to join
+    # them. Inert on today's data (every sampled activityCd is a JSON int, so
+    # str() and to_code() agree), which is why it is a one-line alignment
+    # rather than an issue.
+    out["activity_code"] = to_code(out["business_id"])
     out = _ensure_columns(out, columns)
     frame = out[columns].copy()
     for column in AA_SCHEME_MONEY_COLUMNS:

@@ -393,10 +393,32 @@ def _gp_context(path: Path, payload_root: Path) -> tuple[str | None, str | None]
 
 
 def _business_id(record: Mapping[str, Any]) -> str | None:
+    """The record's own business identifier, or None.
+
+    Stripped, and blank-after-stripping is treated as absent -- the same test
+    `_collection_key` applies to its parts. The two are alternatives in one
+    expression (`_collection_key(...) or _business_id(...)`), so a `" "`
+    accepted here while rejected there would be an identity that exists only
+    because of which field it happened to come from.
+
+    Stripping also matches the warehouse side rather than diverging from it:
+    every `activity_code` column is written through `clean.to_code`, which
+    strips. A padded id would otherwise make a parent's stripped
+    `activity_code` and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+
+    No value in the scrape needs either: 420,821 id values sampled across 200
+    GPs, none padded and none whitespace-only. This is here so the two
+    spellings cannot disagree, not because they currently do.
+    """
+
     for key in ID_KEYS:
         value = record.get(key)
-        if value not in (None, "") and not isinstance(value, (list, dict)):
-            return str(value)
+        if value is None or isinstance(value, (list, dict)):
+            continue
+        text = value.strip() if isinstance(value, str) else str(value)
+        if text:
+            return text
     return None
 
 
