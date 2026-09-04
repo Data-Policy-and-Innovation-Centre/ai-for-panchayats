@@ -456,6 +456,60 @@ def _record_identity(record: Any, business_id: str | None) -> str:
     return "content:" + hashlib.sha256(_canonical_json(record).encode("utf-8")).hexdigest()
 
 
+def _element_identity(element: Any) -> str:
+    """`_record_identity` for anything that may not be a mapping.
+
+    Child arrays hold scalars as well as records, and a scalar has no
+    business id to look up.
+    """
+
+    return _record_identity(
+        element, _business_id(element) if isinstance(element, Mapping) else None
+    )
+
+
+def _repeated_identities(elements: Iterable[Any]) -> frozenset[str]:
+    """Identities that more than one sibling carries.
+
+    The first of the two passes `_refine_identity` needs. Holds one entry per
+    *distinct* identity, which is what the occurrence counter downstream
+    already costs, so this adds no term to the memory the caller was paying.
+    """
+
+    seen: set[str] = set()
+    repeated: set[str] = set()
+    for element in elements:
+        identity = _element_identity(element)
+        if identity in seen:
+            repeated.add(identity)
+        seen.add(identity)
+    return frozenset(repeated)
+
+
+def _refine_identity(element: Any, identity: str, repeated: frozenset[str]) -> str:
+    """Break a tie between siblings sharing an identity, using their content.
+
+    Two elements carrying the same business id but differing in their other
+    fields hash to the same identity, so the occurrence counter alone decided
+    which was which -- and reversing the array swapped their row_ids and every
+    descendant link beneath them. That is the defect the business id was meant
+    to close, reappearing wherever the id is not unique among its siblings.
+
+    Content stays a *tiebreaker*, deliberately. Folding it into every identity
+    is the obvious spelling and is worse: a record's content includes its own
+    child arrays in order, so reordering a grandchild would move the parent
+    and orphan the children underneath it. Only an identity a sibling
+    duplicates gets refined, so an unambiguous record is untouched.
+
+    Elements duplicated in both id and content are interchangeable; those
+    still fall back to order of appearance, which is all that is left.
+    """
+
+    if identity not in repeated:
+        return identity
+    return _canonical_json([identity, _record_identity(element, None)])
+
+
 def _record_rows(
     record: Mapping[str, Any],
     *,
@@ -511,6 +565,7 @@ def _child_rows(
         # same key are told apart while identical elements under *different*
         # keys do not interfere.
         occurrences: dict[str, int] = {}
+        repeated = _repeated_identities(value)
         for position, element in enumerate(value):
             # The element's OWN business id, not the inherited one: inheriting
             # the parent's id here would give every sibling the same identity
@@ -518,7 +573,9 @@ def _child_rows(
             own_business_id = (
                 _business_id(element) if isinstance(element, Mapping) else None
             )
-            identity = _record_identity(element, own_business_id)
+            identity = _refine_identity(
+                element, _record_identity(element, own_business_id), repeated
+            )
             seen = occurrences.get(identity, 0)
             occurrences[identity] = seen + 1
             identity_key = _occurrence_key(identity, seen)
@@ -595,9 +652,14 @@ def _iter_run_items(
         gp_code, gp_name = _gp_context(path, payload_root)
         table_name = source_kind.lower()
         identity_counts: dict[str, int] = {}
+        # A second call rather than a materialized list: `to_records` is a pure
+        # function of the already-parsed payload, so it hands back a fresh
+        # generator and the identity pass stays as streaming as the row pass.
+        repeated = _repeated_identities(to_records(payload)[0])
         for record in records:
-            business_id = _business_id(record)
-            identity = _record_identity(record, business_id)
+            identity = _refine_identity(
+                record, _element_identity(record), repeated
+            )
             occurrence = identity_counts.get(identity, 0)
             identity_counts[identity] = occurrence + 1
             identity_key = _occurrence_key(identity, occurrence)
