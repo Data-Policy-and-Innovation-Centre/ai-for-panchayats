@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 from warehouse import transform as t
-from warehouse.clean import to_decimal_money
+from warehouse.clean import to_decimal_money, to_int
 
 
 def _row(**overrides) -> dict:
@@ -48,6 +48,43 @@ def test_decimal_money_handles_currency_noise_and_negative():
     assert values.iloc[1] == Decimal("-100.00")  # ROUND_HALF_UP at 2 places
     assert values.iloc[2] is None
     assert values.iloc[3] is None
+
+
+@pytest.mark.parametrize("text", ["1,2", "12,,34", "1,23,4", "1,2345", ",100", "1,00,00"])
+def test_malformed_digit_grouping_is_null_not_a_plausible_number(text: str):
+    """Stripping commas unconditionally invents a number (#127).
+
+    "1,2" became 12.00 and "12,,34" became 1234.00 -- an expenditure amount
+    nobody downstream could tell was wrong, on the live transform path. A
+    null is recoverable; a confident wrong figure is not.
+    """
+
+    assert to_decimal_money(pd.Series([text])).iloc[0] is None
+    assert pd.isna(to_int(pd.Series([text])).iloc[0])
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("1,00,000", "100000.00"),   # one lakh, Indian grouping
+        ("1,23,45,678", "12345678.00"),
+        ("12,345,678", "12345678.00"),  # Western grouping
+        ("1,234.50", "1234.50"),
+        ("1000.00", "1000.00"),      # ungrouped still parses
+        ("Rs. 1,25,000", "125000.00"),
+    ],
+)
+def test_well_grouped_amounts_still_parse(text: str, expected: str):
+    """The half that makes the guard safe rather than a regression.
+
+    Indian grouping puts the last three digits together and every group
+    before that in twos, so 1,00,000 is one lakh and not a malformed
+    100,000. A validator that only knew three-digit groups would reject
+    Odisha financial data wholesale -- trading silent corruption of a few
+    rows for rejection of nearly all of them.
+    """
+
+    assert to_decimal_money(pd.Series([text])).iloc[0] == Decimal(expected)
 
 
 # --------------------------------------------------------------------- planned_activity
@@ -251,6 +288,33 @@ def test_activity_nsap_fractional_count_is_quarantined_not_rounded():
     assert ("old_age", "lt80", "male") not in rows
     assert rows[("widow", "na", "female")] == 2
     assert "fractional_beneficiary_count" in quarantine.frame()["reason_code"].tolist()
+
+
+def test_activity_nsap_malformed_grouping_is_quarantined_not_silently_dropped():
+    """A count that cannot be read must leave a record, not vanish.
+
+    `"1,2"` used to be stripped to `12` and loaded as a real count. Making
+    clean.to_int reject it (#127) is only half the fix: the value would then
+    become NA inside to_int and be removed by the notna() filter, so the row
+    would disappear with no quarantine row and no count -- the one outcome
+    this function exists to prevent. The detectors here read the same
+    grouping rule so the row is excluded *with a reason*.
+    """
+
+    pl = pd.DataFrame([_row(
+        row_id="r0", business_id="7",
+        activityNsap_old_age_below_eighty_male="1,2",
+        activityNsap_widow_female="1,00,000",  # valid Indian grouping, must survive
+    )])
+    quarantine = t.Quarantine()
+    out = t.activity_nsap(pl, {"7"}, quarantine, source_system="egramSwaraj", source_run_id="run-1")
+
+    rows = {(r.category, r.age_band, r.gender): r.beneficiary_count for r in out.itertuples()}
+    assert ("old_age", "lt80", "male") not in rows
+    assert rows[("widow", "na", "female")] == 100000
+    reasons = quarantine.frame()["reason_code"].tolist()
+    assert "malformed_beneficiary_count" in reasons
+    assert "fractional_beneficiary_count" not in reasons
 
 
 def test_activity_nsap_subfloat_precision_fraction_is_still_quarantined():
