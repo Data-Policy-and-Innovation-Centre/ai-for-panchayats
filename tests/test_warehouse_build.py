@@ -445,6 +445,52 @@ def test_cross_source_activity_code_collision_fails_build_by_design(tmp_path: Pa
         build(snapshot_ids=("snap-1", "snap-2"), settings=settings, registry=spec_registry)
 
 
+def test_approvals_in_a_second_snapshot_are_not_quarantined_as_orphans(tmp_path: Path):
+    """The scenario #123 made legal, and that this build could not handle.
+
+    Lifting the source-kind check off the individual snapshot allows `pl` in
+    one snapshot and `aa` in another. `activity_codes` was derived from the
+    CURRENT snapshot's `pl` frame and reset to an empty set when it had none,
+    so every approval in the second snapshot was quarantined as an orphan --
+    and quarantine is not a build failure, so the warehouse would publish
+    with those approvals silently gone.
+
+    The distinction that fixes it is load-bearing and easy to get backwards:
+    the 1:1 satellites PAD (one row per activity) so they must see only this
+    snapshot's codes or they collide on the primary key -- which is exactly
+    what a first attempt at this fix did, caught by
+    `test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes`.
+    Approvals and progress FILTER, so they must see the whole build.
+    """
+
+    settings = make_settings(tmp_path)
+    run = _pl_aa_run(tmp_path, "run-1", activity_code=7)
+    normalize(run, settings.canonical_root, chunk_size=100)
+
+    # A second snapshot carrying an approval for activity 7, and no `pl`.
+    write_manual_snapshot(
+        settings.canonical_root, source="othersystem", run_id="run-9",
+        tables={
+            "pl": [],
+            "aa": [{
+                "row_id": "a1", "source_system": "othersystem", "source_run_id": "run-9",
+                "business_id": "7", "gp_code": "123", "gram_panchayat_name": "Test GP",
+                "fiscal_year": "2021-2022", "admApprovalNo": "AA-7",
+            }],
+            "ta": [], "pp": [], "re": [],
+        },
+    )
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("snap-2", "othersystem", "run-9"),
+    )
+    result = build(snapshot_ids=("snap-1", "snap-2"), settings=settings, registry=spec_registry)
+
+    # The approval from the second snapshot survived rather than being
+    # quarantined against an empty activity set.
+    assert result.counts["admin_approval"] >= 2, result.counts
+
+
 def test_gram_panchayat_dimension_conforms_across_sources_with_disjoint_codes(tmp_path: Path):
     """Two different source systems, same GP, but genuinely disjoint
     activity codes: this does not hit the single-run-per-build collision

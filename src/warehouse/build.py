@@ -88,6 +88,21 @@ def _read(root: Path, tables: dict[str, tuple[str, ...]], name: str) -> pd.DataF
     return read_table(root, tables.get(name, ()))
 
 
+def _loaded_codes(con: duckdb.DuckDBPyConnection, table: str, column: str) -> set[str]:
+    """Keys already in the warehouse, across every snapshot loaded so far.
+
+    Read from the database rather than from the current snapshot's frame,
+    the way ``gp_codes`` already is. Since #123 lifted the source-kind check
+    off the individual snapshot, a build may legitimately take ``pl`` from
+    one snapshot and ``aa``/``ta``/``pp`` from another. Scoping these keys to
+    the snapshot in hand would then quarantine every approval and progress
+    row in the second one as an orphan -- and quarantine is not a build
+    failure, so the warehouse would publish with those facts silently gone.
+    """
+
+    return set(con.execute(f"SELECT {column} FROM {table}").fetchdf()[column])  # noqa: S608
+
+
 def _merge_gram_panchayat(
     con: duckdb.DuckDBPyConnection, frame: pd.DataFrame, quarantine: Quarantine,
     *, source_system: str, source_run_id: str, batch_size: int,
@@ -194,6 +209,10 @@ def populate(
                 pl, quarantine, source_system=source_system, source_run_id=source_run_id,
             )
             add_count("planned_activity", insert(con, "planned_activity", activities, batch_size=batch_size))
+            # THIS snapshot's activities. The 1:1 satellites below emit one
+            # row per code, so a build-wide set would re-emit filler for
+            # activities an earlier snapshot already covered and collide on
+            # the primary key.
             activity_codes = set(activities["activity_code"].dropna())
 
             add_count("activity_delegation", insert(con, "activity_delegation", transform.activity_delegation(
@@ -241,9 +260,16 @@ def populate(
             activity_codes = set()
 
         gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+        # Build-wide, unlike `activity_codes` above, and the distinction is
+        # load-bearing. The satellites PAD -- one row per activity -- so they
+        # must see only this snapshot's codes or they collide on the primary
+        # key. Approvals and progress FILTER, so they must see every activity
+        # the build has loaded, or a snapshot contributing aa/ta/pp without a
+        # `pl` of its own has all of it quarantined as orphans (#123).
+        known_activity_codes = _loaded_codes(con, "planned_activity", "activity_code")
 
         approvals = transform.admin_approval(
-            aa, activity_codes, gp_codes, quarantine,
+            aa, known_activity_codes, gp_codes, quarantine,
             source_system=source_system, source_run_id=source_run_id,
         )
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
@@ -270,11 +296,11 @@ def populate(
         used.extend(scheme_children)
 
         add_count("technical_approval", insert(con, "technical_approval", transform.technical_approval(
-            ta, activity_codes, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            ta, known_activity_codes, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
 
         add_count("physical_progress", insert(con, "physical_progress", transform.physical_progress(
-            pp, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            pp, known_activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
 
         # The scraped `re` kind is getLbAllocatedAmountData -- budgetary
