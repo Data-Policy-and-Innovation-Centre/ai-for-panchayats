@@ -401,24 +401,41 @@ def _provenance(
     }
 
 
-def _record_identity(record: Mapping[str, Any], business_id: str | None) -> str:
-    """A stable, content-derived identity for a top-level record.
+def _canonical_json(value: Any) -> str:
+    """A byte-stable serialisation of a record, nested content included.
+
+    ``sort_keys`` makes mapping order irrelevant; list order is preserved,
+    because for these payloads the order of a child array is content rather
+    than presentation.
+    """
+
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), default=str,
+    )
+
+
+def _record_identity(record: Any, business_id: str | None) -> str:
+    """A stable, content-derived identity for a record or a child element.
 
     Prefers a business identifier (e.g. activityCd) when present. Falling
     back to array position would let two records swap identities (and all
-    child links) if the source ever returns them in a different order across
-    runs, so the fallback instead hashes the record's own scalar content.
-    Genuine duplicates (identical business_id or identical content) are
-    disambiguated deterministically by their order of appearance within the
-    same file, not by raw array position.
+    child links) if the source ever returned them in a different order across
+    runs, so the fallback hashes the record's own content instead. Genuine
+    duplicates (identical business_id or identical content) are disambiguated
+    deterministically by their order of appearance among their siblings, not
+    by raw array position.
+
+    The hash covers the **whole** record, nested arrays included. Hashing only
+    the flattened scalars -- as this did until #110 -- gave the same identity
+    to two records that differed solely in their children, so the occurrence
+    suffix decided which was which and reordering the two swapped every
+    `row_id` and child link between them.
     """
+
     if business_id is not None:
         return f"id:{business_id}"
-    content = json.dumps(
-        _flatten_scalars(record), sort_keys=True, ensure_ascii=False,
-        separators=(",", ":"), default=str,
-    )
-    return "content:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return "content:" + hashlib.sha256(_canonical_json(record).encode("utf-8")).hexdigest()
 
 
 def _record_rows(
@@ -472,11 +489,30 @@ def _child_rows(
         if not isinstance(value, list):
             continue
         child_table = f"{table_name}__{_sanitize(str(key))}"
+        # Occurrence counts are per array, so two identical elements under the
+        # same key are told apart while identical elements under *different*
+        # keys do not interfere.
+        occurrences: dict[str, int] = {}
         for position, element in enumerate(value):
-            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{position}"
-            business_id = (
+            # The element's OWN business id, not the inherited one: inheriting
+            # the parent's id here would give every sibling the same identity
+            # and put us straight back on positional row_ids.
+            own_business_id = (
                 _business_id(element) if isinstance(element, Mapping) else None
-            ) or inherited_business_id
+            )
+            identity = _record_identity(element, own_business_id)
+            seen = occurrences.get(identity, 0)
+            occurrences[identity] = seen + 1
+            identity_key = identity if seen == 0 else f"{identity}#{seen}"
+            # Identity-derived rather than positional (#110). `pos` below still
+            # carries the array index, so ordering is retained as metadata --
+            # it just no longer decides which row is which. Truncated to 16 hex
+            # (64 bits) because it only has to be unique among one parent's
+            # children, and a full digest at every level makes a deeply nested
+            # row_id unreadable without buying anything.
+            token = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:16]
+            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{token}"
+            business_id = own_business_id or inherited_business_id
             provenance = _provenance(
                 manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,

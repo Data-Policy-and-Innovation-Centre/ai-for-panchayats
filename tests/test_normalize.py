@@ -295,6 +295,78 @@ def test_row_id_survives_record_reordering_across_runs(tmp_path: Path):
     assert first_by_id["A1"]["row_id"] != first_by_id["A2"]["row_id"]
 
 
+def test_row_id_survives_reordering_records_that_differ_only_in_children(tmp_path: Path):
+    """The fallback identity must see nested content, not just scalars (#110).
+
+    The sibling test above covers records carrying a business id. These do
+    not, so they take the content-hash fallback -- and until #110 that hash
+    was computed over `_flatten_scalars`, which drops every list. Two records
+    with identical scalars and *different child arrays* therefore hashed
+    identically, the occurrence suffix decided which was which, and swapping
+    their order in the file swapped every row_id and child link between them.
+
+    Child arrays are the only thing distinguishing these two records, which
+    is exactly the case the old hash could not see.
+    """
+
+    def payload(order):
+        return {"2021_PL.json": order}
+
+    a = {"note": "same", "assets": [{"assetNm": "well"}]}
+    b = {"note": "same", "assets": [{"assetNm": "road"}, {"assetNm": "drain"}]}
+
+    first = normalize_egramswaraj(
+        make_run(tmp_path, "run-nested-a", payload([a, b])), tmp_path / "canonical")
+    second = normalize_egramswaraj(
+        make_run(tmp_path, "run-nested-b", payload([b, a])), tmp_path / "canonical")
+
+    # Key by child count, the one thing that tells the two records apart.
+    def by_shape(result):
+        parents = {row["row_id"]: row for row in rows(files(result, "pl")[0])}
+        counts = {}
+        for child in rows(files(result, "pl__assets")[0]):
+            counts[child["parent_row_id"]] = counts.get(child["parent_row_id"], 0) + 1
+        return {counts[rid]: rid for rid in parents if rid in counts}
+
+    assert by_shape(first) == by_shape(second)
+    assert len(by_shape(first)) == 2, "both records must be present and distinguishable"
+
+
+def test_child_row_ids_survive_reordering_a_child_array(tmp_path: Path):
+    """Child row_id derives from child identity; `pos` is ordering only (#110).
+
+    Child ids used to be `{prefix}/{key}:{position}` even though the child's
+    own business id was extracted on the very next line. Reorder an array and
+    every element took the previous occupant's row_id, with nested descendants
+    inheriting the swapped prefix -- the same defect the top-level fix closed,
+    one level down.
+
+    `pos` must still report the array index: ordering is retained as metadata,
+    it just no longer decides identity.
+    """
+
+    def run(order):
+        return normalize_egramswaraj(
+            make_run(tmp_path, f"run-child-{'-'.join(o['activityCd'] for o in order)}", {
+                "2021_PL.json": [{"activityCd": "PARENT", "assets": order}],
+            }),
+            tmp_path / "canonical",
+        )
+
+    x = {"activityCd": "X", "assetNm": "well"}
+    y = {"activityCd": "Y", "assetNm": "road"}
+
+    forward = {r["business_id"]: r for r in rows(files(run([x, y]), "pl__assets")[0])}
+    reverse = {r["business_id"]: r for r in rows(files(run([y, x]), "pl__assets")[0])}
+
+    assert forward["X"]["row_id"] == reverse["X"]["row_id"]
+    assert forward["Y"]["row_id"] == reverse["Y"]["row_id"]
+    assert forward["X"]["row_id"] != forward["Y"]["row_id"]
+    # Ordering survives as metadata rather than as identity.
+    assert (forward["X"]["pos"], forward["Y"]["pos"]) == (0, 1)
+    assert (reverse["Y"]["pos"], reverse["X"]["pos"]) == (0, 1)
+
+
 def test_row_id_deduplicates_records_without_a_business_id_deterministically(tmp_path: Path):
     """Records with no business id fall back to content, not position.
 

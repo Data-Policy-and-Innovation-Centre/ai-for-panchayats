@@ -145,6 +145,41 @@ def test_write_payload_removes_partial_temp_file_after_stream_failure(tmp_path: 
     assert validate_run(run_path)
 
 
+def test_write_payload_removes_the_temp_file_when_the_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The sibling case above, one line later (#110).
+
+    The cleanup handler used to end *before* `os.replace`. Streaming could
+    therefore succeed, the rename fail, and the fully-written temp file stay
+    in payloads/ under its random name -- and a caller that caught the error
+    and carried on to publish() would inventory it as a source file. Worse
+    than the partial-stream case it sat next to, because the file is complete
+    and looks entirely legitimate.
+
+    `os.replace` is patched rather than provoked: the natural provocation --
+    a target that already exists -- is refused earlier by write_payload's own
+    duplicate-path guard, so it cannot reach the rename.
+    """
+
+    def refuse(src, dst):
+        raise OSError("synthetic replace failure")
+
+    with RunPublisher(tmp_path / "raw", "synthetic", "fail-replace") as publisher:
+        staging_payloads = list(
+            (tmp_path / "raw" / "synthetic").glob(".fail-replace.staging-*")
+        )[0] / "payloads"
+        monkeypatch.setattr("src.pipeline.manifest.os.replace", refuse)
+        with pytest.raises(OSError, match="synthetic replace failure"):
+            publisher.write_payload("stream.bin", b"complete-data")
+        assert list(staging_payloads.iterdir()) == [], "temp file left in payloads/"
+        monkeypatch.undo()
+        run_path = publisher.publish()
+
+    assert list((run_path / "payloads").iterdir()) == []
+    assert validate_run(run_path)
+
+
 def test_snapshot_registry_resolves_an_exact_run_id(tmp_path: Path):
     registry_file = tmp_path / "snapshots.yaml"
     registry_file.write_text(
