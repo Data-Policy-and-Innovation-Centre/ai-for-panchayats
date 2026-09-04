@@ -23,7 +23,7 @@ def make_snapshot(path: Path, *, gp_rows: int = 3, with_view: bool = True) -> Pa
         conn.execute("CREATE TABLE plan(plan_code VARCHAR, gp_lgd_code VARCHAR, total_cost DOUBLE)")
         for index in range(gp_rows):
             conn.execute(
-                "INSERT INTO gram_panchayat VALUES (?, ?)",
+                "INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES (?, ?)",
                 [f"{100000 + index}", f"GP-{index}"],
             )
             conn.execute(
