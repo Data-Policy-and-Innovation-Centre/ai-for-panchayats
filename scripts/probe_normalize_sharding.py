@@ -40,6 +40,16 @@ from loguru import logger
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Run the documented way -- `uv run python scripts/probe_normalize_sharding.py`
+# -- Python puts `scripts/` on sys.path, not the repository root, so the
+# sibling import below fails with ModuleNotFoundError without this.
+# `scripts/build_warehouse.py` carries the same line for the same reason,
+# and `tests/test_build_warehouse_cli.py` documents why a pytest run does
+# not notice: pythonpath = ["src", "."] already puts both roots on the path.
+sys.path.append(str(ROOT))
+
+from scripts.benchmark_normalize import _positive  # noqa: E402
+
 
 def build_shards(tree: Path, gps: int, shards: int, work: Path) -> list[Path]:
     """Split the first `gps` GP folders into `shards` disjoint trees."""
@@ -94,8 +104,14 @@ def normalize_one(args: tuple[str, str]) -> tuple[float, int]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tree", type=Path, required=True)
-    parser.add_argument("--gps", type=int, default=1000)
-    parser.add_argument("--shards", type=int, default=8)
+    # Both are counts this probe multiplies work by, and both are
+    # expensive to get wrong: `--gps -1` slices to every folder but the
+    # last, so a typo meant to shrink the run normalizes the whole tree
+    # twice instead, and `--shards 0` runs the full unsharded pass before
+    # ProcessPoolExecutor rejects max_workers=0. Reusing the benchmark's
+    # type rather than restating it: same rule, same message, one place.
+    parser.add_argument("--gps", type=_positive, default=1000)
+    parser.add_argument("--shards", type=_positive, default=8)
     parser.add_argument("--work", type=Path, required=True)
     args = parser.parse_args(argv)
 
