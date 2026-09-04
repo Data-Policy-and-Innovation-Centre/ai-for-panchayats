@@ -367,6 +367,56 @@ def test_child_row_ids_survive_reordering_a_child_array(tmp_path: Path):
     assert (reverse["Y"]["pos"], reverse["X"]["pos"]) == (0, 1)
 
 
+def test_a_business_id_that_looks_like_an_occurrence_suffix_does_not_collide(tmp_path: Path):
+    """The occurrence counter must not live in the identity's namespace.
+
+    Appending "#<n>" to the identity puts the counter where a business id can
+    reach: a SECOND element with id `A` and a FIRST element whose id genuinely
+    is `A#1` both produce the same key, so they share a row_id and their
+    descendants collide under the shared prefix.
+
+    This is a regression the identity fix could have introduced and the
+    positional child ids could not -- `assets:0`/`assets:1` were unique by
+    construction. Both spellings of the trap are covered: children (where the
+    positional scheme was replaced) and top level (where the "#" suffix was
+    already in use before #110).
+    """
+
+    run = make_run(tmp_path, "run-hash", {
+        "2021_PL.json": [{
+            "activityCd": "PARENT",
+            "assets": [
+                {"activityCd": "A", "n": 1},
+                {"activityCd": "A", "n": 2},      # -> occurrence 1 of "A"
+                {"activityCd": "A#1", "n": 3},    # -> occurrence 0 of "A#1"
+            ],
+        }],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    children = list(rows(files(result, "pl__assets")[0]))
+    assert len(children) == 3
+    row_ids = [c["row_id"] for c in children]
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
+def test_top_level_records_whose_ids_look_like_occurrence_suffixes_do_not_collide(
+    tmp_path: Path,
+):
+    """The same trap one level up, where the "#" suffix predates #110."""
+
+    run = make_run(tmp_path, "run-hash-top", {
+        "2021_PL.json": [
+            {"activityCd": "A", "note": "first"},
+            {"activityCd": "A", "note": "second"},   # -> occurrence 1 of "A"
+            {"activityCd": "A#1", "note": "third"},  # -> occurrence 0 of "A#1"
+        ],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    row_ids = [r["row_id"] for r in rows(files(result, "pl")[0])]
+    assert len(row_ids) == 3
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
 def test_row_id_deduplicates_records_without_a_business_id_deterministically(tmp_path: Path):
     """Records with no business id fall back to content, not position.
 

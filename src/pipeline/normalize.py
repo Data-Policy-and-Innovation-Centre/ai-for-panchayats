@@ -415,6 +415,24 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _occurrence_key(identity: str, occurrence: int) -> str:
+    """Identity plus its occurrence, as two components that cannot be confused.
+
+    The obvious spelling -- the identity alone when first, and the identity
+    with a "#" and a counter appended after -- puts the counter inside the
+    identity's own namespace. A second element with business id ``A`` then
+    yields the same key as a *first* element whose business id genuinely is
+    ``A#1``, so the two share a ``row_id`` and their nested descendants
+    collide under the shared prefix. Encoding both as a JSON pair keeps them
+    separate whatever the business id contains.
+
+    The positional child ids this replaced could not collide, so getting it
+    wrong would have traded an ordering bug for a uniqueness one.
+    """
+
+    return _canonical_json([identity, occurrence])
+
+
 def _record_identity(record: Any, business_id: str | None) -> str:
     """A stable, content-derived identity for a record or a child element.
 
@@ -503,7 +521,7 @@ def _child_rows(
             identity = _record_identity(element, own_business_id)
             seen = occurrences.get(identity, 0)
             occurrences[identity] = seen + 1
-            identity_key = identity if seen == 0 else f"{identity}#{seen}"
+            identity_key = _occurrence_key(identity, seen)
             # Identity-derived rather than positional (#110). `pos` below still
             # carries the array index, so ordering is retained as metadata --
             # it just no longer decides which row is which. Truncated to 16 hex
@@ -582,7 +600,7 @@ def _iter_run_items(
             identity = _record_identity(record, business_id)
             occurrence = identity_counts.get(identity, 0)
             identity_counts[identity] = occurrence + 1
-            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
+            identity_key = _occurrence_key(identity, occurrence)
             yield from _record_rows(
                 record, manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, identity_key=identity_key,
