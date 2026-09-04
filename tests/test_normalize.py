@@ -932,3 +932,36 @@ def test_a_child_without_a_known_collection_key_is_unchanged(tmp_path: Path):
     # `fundList`'s key would have matched these field names; the collection
     # name is what gates it, so this row still inherits and hashes content.
     assert child["business_id"] == "P1"
+
+
+def test_a_whitespace_only_key_part_is_not_a_key(tmp_path: Path):
+    """`" "` is as absent as `""`, and had to be tested before stripping.
+
+    Accepting it hands a lone row a stable-looking identity that survives
+    arbitrary content changes -- the exact opposite of what falling back to
+    content is for, and a silent one because a single-element array cannot
+    collide with anything to reveal it.
+
+    Whitespace is stripped inside the key as well, so `"S1"` and `" S1 "` are
+    one scheme rather than two.
+    """
+
+    blank = _scheme_rows(tmp_path, "scheme-ws-a", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    changed = _scheme_rows(tmp_path, "scheme-ws-b", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": " ", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert blank[0]["row_id"] != changed[0]["row_id"], (
+        "a whitespace-only part must fall back to content identity"
+    )
+
+    padded = _scheme_rows(tmp_path, "scheme-ws-c", [
+        {"wrkSchmCd": " S1 ", "wrkSchmCmpntCd": " C1 ", "wrkAdmApprFndSnctnGen": 100},
+    ])
+    tight = _scheme_rows(tmp_path, "scheme-ws-d", [
+        {"wrkSchmCd": "S1", "wrkSchmCmpntCd": "C1", "wrkAdmApprFndSnctnGen": 250},
+    ])
+    assert padded[0]["row_id"] == tight[0]["row_id"], (
+        "padding is not a different scheme"
+    )

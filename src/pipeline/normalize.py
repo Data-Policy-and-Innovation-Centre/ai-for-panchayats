@@ -518,9 +518,17 @@ def _collection_key(collection: str | None, element: Mapping[str, Any]) -> str |
     values: list[str] = []
     for part in parts:
         value = element.get(part)
-        if value is None or value == "" or isinstance(value, (list, dict)):
+        if value is None or isinstance(value, (list, dict)):
             return None
-        values.append(str(value))
+        # Stripped before the blank test, not after: `" "` is as absent as
+        # `""`, and accepting it would hand a lone row a stable-looking key
+        # that survives arbitrary content changes -- the opposite of what a
+        # missing key is supposed to do here. Stripped in the key too, so
+        # `"S1"` and `" S1 "` are the same scheme rather than two.
+        text = value.strip() if isinstance(value, str) else str(value)
+        if not text:
+            return None
+        values.append(text)
     return _canonical_json(values)
 
 
