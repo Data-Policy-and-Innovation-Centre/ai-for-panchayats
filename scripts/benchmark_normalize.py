@@ -92,14 +92,28 @@ def fingerprint(snapshot: Path) -> tuple[dict[str, dict[str, object]], dict[str,
         files = sorted(str(p) for p in table_dir.rglob("*.parquet"))
         if not files:
             continue
-        frame = ds.dataset(files, format="parquet").to_table().to_pandas()
+        table = ds.dataset(files, format="parquet").to_table()
+        frame = table.to_pandas()
         if "row_id" in frame.columns:
             frame = frame.sort_values("row_id", kind="stable")
         frame = frame.reindex(columns=sorted(frame.columns)).reset_index(drop=True)
+        # Schema first, values second. `hash_pandas_object` hashes cells and
+        # not column labels, so on values alone a renamed column hashes
+        # identically, and an empty table contributes no row hashes at all --
+        # meaning a schema change to a table that happens to be empty would
+        # read as "output unchanged". Since this digest is the thing standing
+        # between a speedup and a silent data change, it has to cover the
+        # schema too.
+        schema = sorted(
+            (field.name, str(field.type)) for field in table.schema
+        )
         digest = hashlib.sha256(
-            pd.util.hash_pandas_object(frame, index=False).values.tobytes()
+            repr(schema).encode("utf-8")
+            + pd.util.hash_pandas_object(frame, index=False).values.tobytes()
         ).hexdigest()
-        content[table_dir.name] = {"rows": len(frame), "sha256": digest[:16]}
+        content[table_dir.name] = {
+            "rows": len(frame), "columns": len(schema), "sha256": digest[:16],
+        }
         parts[table_dir.name] = len(files)
     return content, parts
 
