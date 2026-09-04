@@ -481,18 +481,21 @@ def _element_identity(element: Any) -> str:
     )
 
 
-def _repeated_identities(elements: Iterable[Any]) -> frozenset[str]:
+def _repeated_identities(identities: Iterable[str]) -> frozenset[str]:
     """Identities that more than one sibling carries.
 
     The first of the two passes `_refine_identity` needs. Holds one entry per
     *distinct* identity, which is what the occurrence counter downstream
     already costs, so this adds no term to the memory the caller was paying.
+
+    Takes identities rather than elements so that a lane whose key is not one
+    of `ID_KEYS` -- the flat-CSV lane, whose key column is named by its
+    caller -- reuses this rather than growing a second copy beside it.
     """
 
     seen: set[str] = set()
     repeated: set[str] = set()
-    for element in elements:
-        identity = _element_identity(element)
+    for identity in identities:
         if identity in seen:
             repeated.add(identity)
         seen.add(identity)
@@ -578,7 +581,7 @@ def _child_rows(
         # same key are told apart while identical elements under *different*
         # keys do not interfere.
         occurrences: dict[str, int] = {}
-        repeated = _repeated_identities(value)
+        repeated = _repeated_identities(_element_identity(e) for e in value)
         for position, element in enumerate(value):
             # The element's OWN business id, not the inherited one: inheriting
             # the parent's id here would give every sibling the same identity
@@ -668,7 +671,9 @@ def _iter_run_items(
         # A second call rather than a materialized list: `to_records` is a pure
         # function of the already-parsed payload, so it hands back a fresh
         # generator and the identity pass stays as streaming as the row pass.
-        repeated = _repeated_identities(to_records(payload)[0])
+        repeated = _repeated_identities(
+            _element_identity(record) for record in to_records(payload)[0]
+        )
         for record in records:
             identity = _refine_identity(
                 record, _element_identity(record), repeated
@@ -947,11 +952,13 @@ def normalize_flat_csv(
     publication, the same canonical manifest -- and that is the half a
     snapshot has to honour.
 
-    The rows are held in memory rather than streamed. These extracts are one
-    row per entity, so the ceiling is the number of GPs in Odisha (6,794 x 99
-    string columns, ~3 MB on disk); the JSON lane's chunked multi-table budget
-    exists for a 204,000-file walk and would be machinery with nothing to do
-    here. `chunk_size` still bounds the part files that get written.
+    The records are held in memory rather than streamed, which the identity
+    pass requires anyway -- deciding which keys are duplicated needs the whole
+    file before any row can be written. These extracts are one row per entity,
+    so the ceiling is the number of GPs in Odisha (6,794 x 99 string columns,
+    ~3 MB on disk); the JSON lane's chunked multi-table budget exists for a
+    204,000-file walk and would be machinery with nothing to do here.
+    `chunk_size` still bounds the part files that get written.
     """
 
     report = approve_run(run_path)
@@ -974,8 +981,6 @@ def normalize_flat_csv(
     source_file = csv_path.relative_to(payload_root).as_posix()
     table_name = source_kind.lower()
 
-    rows: list[dict[str, Any]] = []
-    identity_counts: dict[str, int] = {}
     with csv_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or key_column not in reader.fieldnames:
@@ -983,27 +988,45 @@ def normalize_flat_csv(
                 f"{source_file} has no {key_column!r} column; "
                 f"found {list(reader.fieldnames or ())}"
             )
-        for record in reader:
-            # A blank key is not an error here -- 84 of the profile rows carry
-            # one, and they must reach the warehouse's quarantine rather than
-            # be dropped where nothing counts them. `_record_identity` falls
-            # back to content, so they still get distinct row_ids.
-            business_id = (record.get(key_column) or "").strip() or None
-            identity = _record_identity(record, business_id)
-            occurrence = identity_counts.get(identity, 0)
-            identity_counts[identity] = occurrence + 1
-            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
-            root_key = hashlib.sha256("|".join(
-                (manifest.source, source_kind, source_file, "", "", identity_key)
-            ).encode("utf-8")).hexdigest()
-            row = _flatten_scalars(record)
-            row.update(_provenance(
-                manifest=manifest, source_file=source_file, source_kind=source_kind,
-                year=None, gp_code=None, gp_name=None, row_id=root_key,
-                source_record_id=root_key, parent_row_id=None, pos=None,
-                business_id=business_id,
-            ))
-            rows.append(row)
+        records = list(reader)
+
+    # A blank key is not an error here -- 84 of the profile rows carry one, and
+    # they must reach the warehouse's quarantine rather than be dropped where
+    # nothing counts them. `_record_identity` falls back to content, so they
+    # still get distinct row_ids.
+    #
+    # The key column stands in for the JSON lane's `_business_id`; everything
+    # after that is the same two passes, using the same helpers. Mirroring
+    # rather than re-spelling matters: the pre-#110 `f"{identity}#{n}"` form
+    # put the counter inside the identity's own namespace, so a key that
+    # literally read `X#1` collided with the second occurrence of `X`. LGD
+    # codes are numeric and cannot, but this lane is generic -- #48's
+    # spreadsheet brings its own key column.
+    business_ids = [(r.get(key_column) or "").strip() or None for r in records]
+    identities = [
+        _record_identity(record, business_id)
+        for record, business_id in zip(records, business_ids)
+    ]
+    repeated = _repeated_identities(identities)
+
+    rows: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}
+    for record, business_id, identity in zip(records, business_ids, identities):
+        identity = _refine_identity(record, identity, repeated)
+        seen = occurrences.get(identity, 0)
+        occurrences[identity] = seen + 1
+        root_key = hashlib.sha256("|".join(
+            (manifest.source, source_kind, source_file, "", "",
+             _occurrence_key(identity, seen))
+        ).encode("utf-8")).hexdigest()
+        row = _flatten_scalars(record)
+        row.update(_provenance(
+            manifest=manifest, source_file=source_file, source_kind=source_kind,
+            year=None, gp_code=None, gp_name=None, row_id=root_key,
+            source_record_id=root_key, parent_row_id=None, pos=None,
+            business_id=business_id,
+        ))
+        rows.append(row)
 
     types = dict(PROVENANCE_SCHEMA)
     _merge_table_types(types, rows)

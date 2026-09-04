@@ -793,3 +793,48 @@ def test_flat_csv_run_refuses_an_ambiguous_or_unkeyed_payload(tmp_path: Path):
         unkeyed = publisher.publish()
     with pytest.raises(NormalizationError, match="basic_info_lgd"):
         normalize_run(unkeyed, tmp_path / "canonical")
+
+
+def test_flat_csv_keys_that_look_like_occurrence_suffixes_do_not_collide(tmp_path: Path):
+    """The lane mirrors the JSON lane's identity scheme rather than re-spelling it.
+
+    The pre-#110 form appended `#<n>` to the identity, which put the counter
+    inside the identity's own namespace: a key that literally reads `X#1`
+    produced the same key as the *second* row keyed `X`, so the two shared a
+    row_id. LGD codes are numeric and cannot trip this, but the lane is
+    generic -- #48's spreadsheet brings its own key column.
+    """
+
+    result = normalize_run(
+        profile_run(tmp_path, "profile-hash", "X,A,1\nX,B,2\nX#1,C,3"),
+        tmp_path / "canonical",
+    )
+    canonical = rows(files(result, "profile")[0])
+    assert len(canonical) == 3
+    row_ids = [row["row_id"] for row in canonical]
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
+def test_flat_csv_rows_sharing_a_key_survive_reordering(tmp_path: Path):
+    """The duplicate-key tiebreaker reaches this lane too.
+
+    Two rows with the same key and different content would otherwise be told
+    apart by line number alone, and re-exporting the file in a different order
+    would swap their row_ids. The real extract has no duplicate keys -- 6,710
+    distinct, verified -- so this pins the generic property the lane offers
+    rather than a defect in the profile file.
+    """
+
+    def by_name(order):
+        result = normalize_run(
+            profile_run(tmp_path, f"dupkey-{order[0][0]}", "\n".join(
+                f"115550,{name},{pop}" for name, pop in order
+            )),
+            tmp_path / "canonical",
+        )
+        return {r["param__gp_name"]: r["row_id"] for r in rows(files(result, "profile")[0])}
+
+    forward = by_name([("A", "1"), ("B", "2")])
+    reverse = by_name([("B", "2"), ("A", "1")])
+    assert forward == reverse
+    assert len(set(forward.values())) == 2
