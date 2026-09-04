@@ -106,3 +106,19 @@ def test_a_partial_profile_exits_nonzero_and_says_so(snapshot: Path, capsys):
     assert "FAILED" in captured.out
     assert "probe(s) FAILED, excluded" in captured.out
     assert "this profile is incomplete" in captured.err
+
+
+def test_explain_does_not_rerun_a_failed_probe(snapshot: Path, capsys):
+    """A gap introduced by the previous fix: collecting failures did not guard
+    the later EXPLAIN loop, so `--explain` on a failed probe re-ran the same
+    invalid SQL outside the handler -- aborting before `con.close()` and
+    before the failure report, replacing it with a traceback."""
+
+    assert main([
+        str(snapshot), "--materialized", str(snapshot), "--repeat", "1", "--explain", "v_activity",
+    ]) == 1
+    captured = capsys.readouterr()
+    assert "skipped, probe failed" in captured.out
+    # The structured report still reaches stderr, which is the thing the
+    # traceback was displacing.
+    assert "this profile is incomplete" in captured.err

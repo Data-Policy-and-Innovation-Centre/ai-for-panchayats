@@ -231,10 +231,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{label_total:<{width}}  {total * 1000:>9,.0f} ms")
 
     if args.explain:
+        failed_names = {entry.split(" (")[0] for entry in failed}
         for probe in probes:
-            if args.explain.lower() in probe.name.lower():
-                print(f"\n===== EXPLAIN ANALYZE: {probe.name} =====")
+            if args.explain.lower() not in probe.name.lower():
+                continue
+            if probe.name in failed_names:
+                # Re-running SQL that already raised would throw outside the
+                # probe handler, aborting before con.close() and before the
+                # failure report below -- replacing a structured result with a
+                # traceback. The failure is already reported; say why there is
+                # no plan and move on.
+                print(f"\n===== EXPLAIN ANALYZE: {probe.name} -- skipped, probe failed =====")
+                continue
+            print(f"\n===== EXPLAIN ANALYZE: {probe.name} =====")
+            try:
                 print(con.execute(f"EXPLAIN ANALYZE {probe.sql}").fetchall()[0][1])
+            except Exception as exc:  # noqa: BLE001 - a plan is diagnostics, not the run
+                print(f"  EXPLAIN failed: {type(exc).__name__}: {exc}")
     con.close()
 
     if failed:
