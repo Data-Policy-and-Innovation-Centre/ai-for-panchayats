@@ -35,26 +35,17 @@ from typing import Mapping
 
 import pandas as pd
 
-from .load_common import read_csv
+from .load_common import CsvSchemaError, read_csv
 
 REFERENCE_DIR = Path(__file__).resolve().parent / "reference"
 
-# Column *sets* the CSVs must supply, and the subset each table keeps. They
-# differ for dim_lsdg_theme: the file carries `distinct_themes` and `n_rows`,
-# which are counts from whoever assembled it, not part of the dimension.
-DIMENSION_COLUMNS: Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "dim_code": (
-        ("variable", "code", "description", "source", "confidence"),
-        ("variable", "code", "description", "source", "confidence"),
-    ),
-    "dim_lsdg_theme": (
-        ("focus_area_name", "lsdg_theme"),
-        ("focus_area_name", "lsdg_theme"),
-    ),
-    "dim_welfare_scheme": (
-        ("scheme_code", "scheme_name"),
-        ("scheme_code", "scheme_name"),
-    ),
+# What each table takes from its CSV, in DDL order. The file may carry more:
+# dim_lsdg_theme.csv also has `distinct_themes` and `n_rows`, which are counts
+# from whoever assembled it rather than part of the dimension, and are dropped.
+DIMENSION_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "dim_code": ("variable", "code", "description", "source", "confidence"),
+    "dim_lsdg_theme": ("focus_area_name", "lsdg_theme"),
+    "dim_welfare_scheme": ("scheme_code", "scheme_name"),
 }
 
 # Columns whose duplication is a contradiction rather than a repetition,
@@ -71,9 +62,9 @@ class DimensionError(RuntimeError):
     """Raised when a code dictionary is missing, malformed, or contradictory."""
 
 
-def _load(name: str) -> pd.DataFrame:
-    required, kept = DIMENSION_COLUMNS[name]
-    path = REFERENCE_DIR / f"{name}.csv"
+def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
+    kept = DIMENSION_COLUMNS[name]
+    path = (directory or REFERENCE_DIR) / f"{name}.csv"
     if not path.is_file():
         raise DimensionError(f"code dictionary not found: {path}")
     try:
@@ -83,8 +74,8 @@ def _load(name: str) -> pd.DataFrame:
         # integer would eat a leading zero and stop it matching the
         # CAST-to-VARCHAR join the consumer's views use. No dtype is passed
         # because passing one would only restate that default.
-        frame = read_csv(path, required_columns=required)
-    except Exception as exc:  # noqa: BLE001 - re-raised as this module's error
+        frame = read_csv(path, required_columns=kept)
+    except (CsvSchemaError, OSError, UnicodeDecodeError, pd.errors.ParserError) as exc:
         raise DimensionError(f"code dictionary unreadable: {path}: {exc}") from exc
 
     frame = frame.loc[:, list(kept)]
@@ -115,12 +106,15 @@ def _load(name: str) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
-@lru_cache(maxsize=1)
-def dimension_frames() -> Mapping[str, pd.DataFrame]:
+@lru_cache(maxsize=2)
+def dimension_frames(directory: str | Path | None = None) -> Mapping[str, pd.DataFrame]:
     """The three code dictionaries, validated, keyed by table name.
 
     Cached: they are static, and a build would otherwise re-read and
-    re-validate them once per snapshot.
+    re-validate them once per snapshot. ``directory`` exists for tests and
+    mirrors ``geography.gp_geography``'s optional path -- keyed separately by
+    the cache, so a fixture cannot poison the real load or vice versa.
     """
 
-    return {name: _load(name) for name in DIMENSION_COLUMNS}
+    root = Path(directory) if directory is not None else None
+    return {name: _load(name, root) for name in DIMENSION_COLUMNS}

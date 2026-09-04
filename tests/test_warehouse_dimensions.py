@@ -34,7 +34,7 @@ def test_the_committed_dictionaries_match_what_the_issue_documents():
     assert (dim_code["source"] == "Confirmed").sum() == 51
 
 
-def test_codes_stay_text_so_a_leading_zero_survives(tmp_path: Path, monkeypatch):
+def test_codes_stay_text_so_a_leading_zero_survives(tmp_path: Path):
     """`code` is VARCHAR in the DDL and joined with CAST(... AS VARCHAR).
 
     If it ever arrives as an integer, `01` becomes `1` and the join returns
@@ -53,11 +53,10 @@ def test_codes_stay_text_so_a_leading_zero_survives(tmp_path: Path, monkeypatch)
         "focus_area,01,Leading zero,Confirmed,high\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("src.warehouse.dimensions.REFERENCE_DIR", tmp_path)
-    assert _load("dim_code")["code"].iloc[0] == "01"
+    assert _load("dim_code", tmp_path)["code"].iloc[0] == "01"
 
 
-def test_a_code_meaning_two_things_is_refused(tmp_path: Path, monkeypatch):
+def test_a_code_meaning_two_things_is_refused(tmp_path: Path):
     """(variable, code) is dim_code's PRIMARY KEY.
 
     Keeping the last of a duplicate pair silently picks one of two meanings
@@ -71,12 +70,11 @@ def test_a_code_meaning_two_things_is_refused(tmp_path: Path, monkeypatch):
         "focus_area,3,Drinking water,Derived,medium\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("src.warehouse.dimensions.REFERENCE_DIR", tmp_path)
     with pytest.raises(DimensionError, match="variable/code is not unique"):
-        _load("dim_code")
+        _load("dim_code", tmp_path)
 
 
-def test_labels_are_stripped(tmp_path: Path, monkeypatch):
+def test_labels_are_stripped(tmp_path: Path):
     """The real file has "Theme 5 - Clean and Green Village " with a trailing
     space, and a trailing space in a label is visible to a user."""
 
@@ -86,17 +84,15 @@ def test_labels_are_stripped(tmp_path: Path, monkeypatch):
         "Sanitation,Theme 5 - Clean and Green Village ,3.0,350.0\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("src.warehouse.dimensions.REFERENCE_DIR", tmp_path)
-    frame = _load("dim_lsdg_theme")
+    frame = _load("dim_lsdg_theme", tmp_path)
     assert frame["lsdg_theme"].iloc[0] == "Theme 5 - Clean and Green Village"
     # The two assembly-time counts in the file are not part of the dimension.
     assert list(frame.columns) == ["focus_area_name", "lsdg_theme"]
 
 
-def test_a_missing_dictionary_is_loud(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("src.warehouse.dimensions.REFERENCE_DIR", tmp_path)
+def test_a_missing_dictionary_is_loud(tmp_path: Path):
     with pytest.raises(DimensionError, match="not found"):
-        _load("dim_code")
+        _load("dim_code", tmp_path)
 
 
 def test_the_decode_join_needs_its_cast_and_not_for_the_reason_the_issue_gives():
