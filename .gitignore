@@ -180,6 +180,17 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Claude Code. Only two things under .claude/ are per-developer: the agent
+# worktrees (throwaway checkouts -- 5 GB of them here) and settings.local.json.
+# Named individually rather than ignoring the directory, so project skills,
+# agents, commands and a shared settings.json are tracked the moment they
+# appear, without anyone having to remember to edit this file.
+.claude/worktrees/
+.claude/settings.local.json
+
+# Git worktrees for parallel branch work.
+.worktrees/
+
 data/raw/*
 # config/staging.env puts a staging run's raw tree here, outside every
 # rule above it -- ~600 payload files that would otherwise be committable.

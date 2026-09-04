@@ -87,8 +87,28 @@ push: _require_data _check_git_clean
 # CODE_SHA carries a -dirty suffix when the tree has uncommitted changes: a
 # bare commit hash for a build that did not come from that commit is worse
 # than "unknown", because it looks authoritative.
+#
+# `git status --porcelain` rather than `git diff --quiet HEAD` (#137): the
+# latter only sees modifications to *tracked* files, so a new module that was
+# never `git add`ed -- the most common way a working tree stops matching its
+# commit -- stamped a clean sha. Porcelain also lists untracked files, and
+# respects .gitignore, so throwaway worktrees and per-developer settings do
+# not produce a false -dirty.
+#
+# Two ways this could quietly go back to lying, both closed here:
+#
+#   --untracked-files=normal is passed explicitly, because a developer with
+#   status.showUntrackedFiles=no in their git config would otherwise get
+#   empty porcelain output and a clean sha over an untracked module. What
+#   provenance a build records must not depend on a personal git setting.
+#
+#   The exit status is checked, not just the output. `git status` failing --
+#   an unreadable index, say -- also produces empty output, and treating
+#   that as "clean" would be the worst possible reading. Anything other than
+#   "succeeded and said nothing" is -dirty.
 CODE_SHA    := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$(shell \
-                 git diff --quiet HEAD 2>/dev/null || echo -dirty)
+                 if status=$$(git status --porcelain --untracked-files=normal 2>/dev/null) \
+                    && test -z "$$status"; then :; else echo -dirty; fi)
 # The mode file is what decides every path this run reads and writes, so it
 # is the configuration a rebuild would need to reproduce.
 CONFIG_HASH  = $(shell shasum -a 256 $(MODE_ENV) 2>/dev/null | cut -c1-12 || echo unknown)
