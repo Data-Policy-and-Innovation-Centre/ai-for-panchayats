@@ -1,6 +1,7 @@
 .DEFAULT_GOAL  := help
-.PHONY: help setup pull ingest publish-raw push run run-staging warehouse \
-        warehouse-staging sample exhibits deliver box-paths status _require_mode_env
+.PHONY: help setup pull ingest publish-raw push run run-staging run-profile \
+        run-profile-staging warehouse warehouse-staging sample exhibits deliver \
+        box-paths status _require_mode_env
 BOX_REMOTE      ?= box
 BOX_PROJECT_ROOT ?= /2. Projects/11. PR&DW/AI for Panchayats
 INCOMING_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Data/Raw/'
@@ -18,6 +19,7 @@ help:
 	@echo "  make setup           First-time setup on a new machine"
 	@echo "  make pull            Get latest code, deps, and approved DVC data"
 	@echo "  make ingest DATA=f.csv Copy an original source file from Box"
+	@echo "  make run-profile      Publish+normalize the GP profile extract (#123)"
 	@echo "  make publish-raw DATA=f.csv Copy a local raw file to Box"
 	@echo "  make push DATA=f.csv Version and share a locally-ingested file via DVC"
 	@echo "  make run             Publish + normalize the scraped tree (full state)"
@@ -183,6 +185,46 @@ sample:
 
 run-staging: sample
 	@$(MAKE) run MODE=staging PIPELINE_TREE=$(SAMPLE_TREE)
+
+# The same two stages for the flat-CSV reference extract (#123), which is a
+# separate source with its own run and its own snapshot.
+#
+# This exists because doing it by hand is a trap, not for convenience. The
+# printed "paste this into ..." stanza names $(PIPELINE_SNAPSHOTS), which is
+# only set because `-include $(MODE_ENV)` above exports it -- so a hand-typed
+# `python main.py ingest` outside make prints the PRODUCTION registry path
+# whatever mode you believe you are in, and following that hint parks a
+# staging snapshot in the real registry. Going through make is what keeps the
+# two modes apart.
+PROFILE_SOURCE  ?= egramswaraj_profile
+PROFILE_RUN_ID  ?= $(RUN_ID)
+PROFILE_CSV     ?= data/raw/eGramSwaraj_Data/Panchayat_profile/eGramSwaraj_panchayat_master.csv
+PROFILE_RUN     := $(PIPELINE_RAW_ROOT)/$(PROFILE_SOURCE)/$(PROFILE_RUN_ID)
+
+run-profile: _require_mode_env
+	@test -f "$(PROFILE_CSV)" || { \
+	  echo "No profile extract at $(PROFILE_CSV); pull it with"; \
+	  echo "  make ingest DATA='eGramSwaraj_Data/Panchayat_profile/$(notdir $(PROFILE_CSV))'"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing profile run $(PROFILE_RUN_ID) from $(PROFILE_CSV)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(PROFILE_SOURCE) --run-id $(PROFILE_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload $(notdir $(PROFILE_CSV))=$(PROFILE_CSV)
+	@echo "[$(MODE)] verifying the published file against its hash..."
+	uv run python main.py validate-run $(PROFILE_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(PROFILE_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with BOTH snapshots --"
+	@echo "  make warehouse MODE=$(MODE) SNAPSHOT_ID='<scrape-id> --snapshot-id <profile-id>'"
+
+# The sample shares the whole 6,794-row extract on purpose: gp_profile rows
+# for GPs outside the sample are quarantined as orphans, which is the path
+# worth exercising rather than avoiding.
+run-profile-staging:
+	@$(MAKE) run-profile MODE=staging
 
 # Stage 3-4: build the warehouse from an approved snapshot, then check it.
 #
