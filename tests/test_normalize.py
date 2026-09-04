@@ -295,6 +295,195 @@ def test_row_id_survives_record_reordering_across_runs(tmp_path: Path):
     assert first_by_id["A1"]["row_id"] != first_by_id["A2"]["row_id"]
 
 
+def test_row_id_survives_reordering_records_that_differ_only_in_children(tmp_path: Path):
+    """The fallback identity must see nested content, not just scalars (#110).
+
+    The sibling test above covers records carrying a business id. These do
+    not, so they take the content-hash fallback -- and until #110 that hash
+    was computed over `_flatten_scalars`, which drops every list. Two records
+    with identical scalars and *different child arrays* therefore hashed
+    identically, the occurrence suffix decided which was which, and swapping
+    their order in the file swapped every row_id and child link between them.
+
+    Child arrays are the only thing distinguishing these two records, which
+    is exactly the case the old hash could not see.
+    """
+
+    def payload(order):
+        return {"2021_PL.json": order}
+
+    a = {"note": "same", "assets": [{"assetNm": "well"}]}
+    b = {"note": "same", "assets": [{"assetNm": "road"}, {"assetNm": "drain"}]}
+
+    first = normalize_egramswaraj(
+        make_run(tmp_path, "run-nested-a", payload([a, b])), tmp_path / "canonical")
+    second = normalize_egramswaraj(
+        make_run(tmp_path, "run-nested-b", payload([b, a])), tmp_path / "canonical")
+
+    # Key by child count, the one thing that tells the two records apart.
+    def by_shape(result):
+        parents = {row["row_id"]: row for row in rows(files(result, "pl")[0])}
+        counts = {}
+        for child in rows(files(result, "pl__assets")[0]):
+            counts[child["parent_row_id"]] = counts.get(child["parent_row_id"], 0) + 1
+        return {counts[rid]: rid for rid in parents if rid in counts}
+
+    assert by_shape(first) == by_shape(second)
+    assert len(by_shape(first)) == 2, "both records must be present and distinguishable"
+
+
+def test_child_row_ids_survive_reordering_a_child_array(tmp_path: Path):
+    """Child row_id derives from child identity; `pos` is ordering only (#110).
+
+    Child ids used to be `{prefix}/{key}:{position}` even though the child's
+    own business id was extracted on the very next line. Reorder an array and
+    every element took the previous occupant's row_id, with nested descendants
+    inheriting the swapped prefix -- the same defect the top-level fix closed,
+    one level down.
+
+    `pos` must still report the array index: ordering is retained as metadata,
+    it just no longer decides identity.
+    """
+
+    def run(order):
+        return normalize_egramswaraj(
+            make_run(tmp_path, f"run-child-{'-'.join(o['activityCd'] for o in order)}", {
+                "2021_PL.json": [{"activityCd": "PARENT", "assets": order}],
+            }),
+            tmp_path / "canonical",
+        )
+
+    x = {"activityCd": "X", "assetNm": "well"}
+    y = {"activityCd": "Y", "assetNm": "road"}
+
+    forward = {r["business_id"]: r for r in rows(files(run([x, y]), "pl__assets")[0])}
+    reverse = {r["business_id"]: r for r in rows(files(run([y, x]), "pl__assets")[0])}
+
+    assert forward["X"]["row_id"] == reverse["X"]["row_id"]
+    assert forward["Y"]["row_id"] == reverse["Y"]["row_id"]
+    assert forward["X"]["row_id"] != forward["Y"]["row_id"]
+    # Ordering survives as metadata rather than as identity.
+    assert (forward["X"]["pos"], forward["Y"]["pos"]) == (0, 1)
+    assert (reverse["Y"]["pos"], reverse["X"]["pos"]) == (0, 1)
+
+
+def test_a_business_id_that_looks_like_an_occurrence_suffix_does_not_collide(tmp_path: Path):
+    """The occurrence counter must not live in the identity's namespace.
+
+    Appending "#<n>" to the identity puts the counter where a business id can
+    reach: a SECOND element with id `A` and a FIRST element whose id genuinely
+    is `A#1` both produce the same key, so they share a row_id and their
+    descendants collide under the shared prefix.
+
+    This is a regression the identity fix could have introduced and the
+    positional child ids could not -- `assets:0`/`assets:1` were unique by
+    construction. Both spellings of the trap are covered: children (where the
+    positional scheme was replaced) and top level (where the "#" suffix was
+    already in use before #110).
+    """
+
+    run = make_run(tmp_path, "run-hash", {
+        "2021_PL.json": [{
+            "activityCd": "PARENT",
+            "assets": [
+                {"activityCd": "A", "n": 1},
+                {"activityCd": "A", "n": 2},      # -> occurrence 1 of "A"
+                {"activityCd": "A#1", "n": 3},    # -> occurrence 0 of "A#1"
+            ],
+        }],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    children = list(rows(files(result, "pl__assets")[0]))
+    assert len(children) == 3
+    row_ids = [c["row_id"] for c in children]
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
+def test_top_level_records_whose_ids_look_like_occurrence_suffixes_do_not_collide(
+    tmp_path: Path,
+):
+    """The same trap one level up, where the "#" suffix predates #110."""
+
+    run = make_run(tmp_path, "run-hash-top", {
+        "2021_PL.json": [
+            {"activityCd": "A", "note": "first"},
+            {"activityCd": "A", "note": "second"},   # -> occurrence 1 of "A"
+            {"activityCd": "A#1", "note": "third"},  # -> occurrence 0 of "A#1"
+        ],
+    })
+    result = normalize_egramswaraj(run, tmp_path / "canonical")
+    row_ids = [r["row_id"] for r in rows(files(result, "pl")[0])]
+    assert len(row_ids) == 3
+    assert len(set(row_ids)) == 3, f"row_id collision: {row_ids}"
+
+
+def test_row_ids_survive_reordering_siblings_that_share_a_business_id(tmp_path: Path):
+    """A shared business id must not put identity back on array position (#110).
+
+    The reordering tests above pin the two clean cases: distinct business ids,
+    and no business id at all. This is the case between them -- two siblings
+    carrying the *same* activityCd but differing in their other fields. Both
+    hash to the identity `id:SAME`, so the occurrence counter alone decided
+    which was which, and reversing the array swapped their row_ids and every
+    descendant link, exactly the defect the business id was supposed to close.
+
+    Asserted at both levels, because the two loops number occurrences
+    independently and a fix to one leaves the other broken.
+    """
+
+    def child_run(order):
+        result = normalize_egramswaraj(
+            make_run(tmp_path, f"dupid-child-{'-'.join(o['assetNm'] for o in order)}", {
+                "2021_PL.json": [{"activityCd": "PARENT", "assets": order}],
+            }),
+            tmp_path / "canonical",
+        )
+        return {r["assetNm"]: r["row_id"] for r in rows(files(result, "pl__assets")[0])}
+
+    def record_run(order):
+        result = normalize_egramswaraj(
+            make_run(tmp_path, f"dupid-top-{'-'.join(o['note'] for o in order)}", {"2021_PL.json": order}),
+            tmp_path / "canonical",
+        )
+        return {r["note"]: r["row_id"] for r in rows(files(result, "pl")[0])}
+
+    well = {"activityCd": "SAME", "assetNm": "well"}
+    road = {"activityCd": "SAME", "assetNm": "road"}
+    forward, reverse = child_run([well, road]), child_run([road, well])
+    assert forward == reverse
+    assert len(set(forward.values())) == 2
+
+    first = {"activityCd": "SAME", "note": "first"}
+    second = {"activityCd": "SAME", "note": "second"}
+    forward, reverse = record_run([first, second]), record_run([second, first])
+    assert forward == reverse
+    assert len(set(forward.values())) == 2
+
+
+def test_reordering_a_child_array_does_not_move_its_parent(tmp_path: Path):
+    """Content is a tiebreaker only, never part of an unambiguous identity.
+
+    The obvious fix for the test above -- fold the element's content into
+    every identity -- trades one order bug for a wider one. A record's content
+    includes its child arrays in order, so reordering a *grandchild* would
+    change the parent's row_id and orphan every child link beneath it. The
+    refinement therefore applies only to identities a sibling duplicates.
+    """
+
+    def run(name, assets):
+        result = normalize_egramswaraj(
+            make_run(tmp_path, name, {
+                "2021_PL.json": [{"activityCd": "P", "assets": assets}],
+            }),
+            tmp_path / "canonical",
+        )
+        return rows(files(result, "pl")[0])[0]["row_id"]
+
+    x = {"activityCd": "X", "assetNm": "well"}
+    y = {"activityCd": "Y", "assetNm": "road"}
+    assert run("parent-fwd", [x, y]) == run("parent-rev", [y, x])
+
+
 def test_row_id_deduplicates_records_without_a_business_id_deterministically(tmp_path: Path):
     """Records with no business id fall back to content, not position.
 

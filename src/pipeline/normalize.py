@@ -401,24 +401,113 @@ def _provenance(
     }
 
 
-def _record_identity(record: Mapping[str, Any], business_id: str | None) -> str:
-    """A stable, content-derived identity for a top-level record.
+def _canonical_json(value: Any) -> str:
+    """A byte-stable serialisation of a record, nested content included.
+
+    ``sort_keys`` makes mapping order irrelevant; list order is preserved,
+    because for these payloads the order of a child array is content rather
+    than presentation.
+    """
+
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), default=str,
+    )
+
+
+def _occurrence_key(identity: str, occurrence: int) -> str:
+    """Identity plus its occurrence, as two components that cannot be confused.
+
+    The obvious spelling -- the identity alone when first, and the identity
+    with a "#" and a counter appended after -- puts the counter inside the
+    identity's own namespace. A second element with business id ``A`` then
+    yields the same key as a *first* element whose business id genuinely is
+    ``A#1``, so the two share a ``row_id`` and their nested descendants
+    collide under the shared prefix. Encoding both as a JSON pair keeps them
+    separate whatever the business id contains.
+
+    The positional child ids this replaced could not collide, so getting it
+    wrong would have traded an ordering bug for a uniqueness one.
+    """
+
+    return _canonical_json([identity, occurrence])
+
+
+def _record_identity(record: Any, business_id: str | None) -> str:
+    """A stable, content-derived identity for a record or a child element.
 
     Prefers a business identifier (e.g. activityCd) when present. Falling
     back to array position would let two records swap identities (and all
-    child links) if the source ever returns them in a different order across
-    runs, so the fallback instead hashes the record's own scalar content.
-    Genuine duplicates (identical business_id or identical content) are
-    disambiguated deterministically by their order of appearance within the
-    same file, not by raw array position.
+    child links) if the source ever returned them in a different order across
+    runs, so the fallback hashes the record's own content instead. Genuine
+    duplicates (identical business_id or identical content) are disambiguated
+    deterministically by their order of appearance among their siblings, not
+    by raw array position.
+
+    The hash covers the **whole** record, nested arrays included. Hashing only
+    the flattened scalars -- as this did until #110 -- gave the same identity
+    to two records that differed solely in their children, so the occurrence
+    suffix decided which was which and reordering the two swapped every
+    `row_id` and child link between them.
     """
+
     if business_id is not None:
         return f"id:{business_id}"
-    content = json.dumps(
-        _flatten_scalars(record), sort_keys=True, ensure_ascii=False,
-        separators=(",", ":"), default=str,
+    return "content:" + hashlib.sha256(_canonical_json(record).encode("utf-8")).hexdigest()
+
+
+def _element_identity(element: Any) -> str:
+    """`_record_identity` for anything that may not be a mapping.
+
+    Child arrays hold scalars as well as records, and a scalar has no
+    business id to look up.
+    """
+
+    return _record_identity(
+        element, _business_id(element) if isinstance(element, Mapping) else None
     )
-    return "content:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _repeated_identities(elements: Iterable[Any]) -> frozenset[str]:
+    """Identities that more than one sibling carries.
+
+    The first of the two passes `_refine_identity` needs. Holds one entry per
+    *distinct* identity, which is what the occurrence counter downstream
+    already costs, so this adds no term to the memory the caller was paying.
+    """
+
+    seen: set[str] = set()
+    repeated: set[str] = set()
+    for element in elements:
+        identity = _element_identity(element)
+        if identity in seen:
+            repeated.add(identity)
+        seen.add(identity)
+    return frozenset(repeated)
+
+
+def _refine_identity(element: Any, identity: str, repeated: frozenset[str]) -> str:
+    """Break a tie between siblings sharing an identity, using their content.
+
+    Two elements carrying the same business id but differing in their other
+    fields hash to the same identity, so the occurrence counter alone decided
+    which was which -- and reversing the array swapped their row_ids and every
+    descendant link beneath them. That is the defect the business id was meant
+    to close, reappearing wherever the id is not unique among its siblings.
+
+    Content stays a *tiebreaker*, deliberately. Folding it into every identity
+    is the obvious spelling and is worse: a record's content includes its own
+    child arrays in order, so reordering a grandchild would move the parent
+    and orphan the children underneath it. Only an identity a sibling
+    duplicates gets refined, so an unambiguous record is untouched.
+
+    Elements duplicated in both id and content are interchangeable; those
+    still fall back to order of appearance, which is all that is left.
+    """
+
+    if identity not in repeated:
+        return identity
+    return _canonical_json([identity, _record_identity(element, None)])
 
 
 def _record_rows(
@@ -472,11 +561,33 @@ def _child_rows(
         if not isinstance(value, list):
             continue
         child_table = f"{table_name}__{_sanitize(str(key))}"
+        # Occurrence counts are per array, so two identical elements under the
+        # same key are told apart while identical elements under *different*
+        # keys do not interfere.
+        occurrences: dict[str, int] = {}
+        repeated = _repeated_identities(value)
         for position, element in enumerate(value):
-            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{position}"
-            business_id = (
+            # The element's OWN business id, not the inherited one: inheriting
+            # the parent's id here would give every sibling the same identity
+            # and put us straight back on positional row_ids.
+            own_business_id = (
                 _business_id(element) if isinstance(element, Mapping) else None
-            ) or inherited_business_id
+            )
+            identity = _refine_identity(
+                element, _record_identity(element, own_business_id), repeated
+            )
+            seen = occurrences.get(identity, 0)
+            occurrences[identity] = seen + 1
+            identity_key = _occurrence_key(identity, seen)
+            # Identity-derived rather than positional (#110). `pos` below still
+            # carries the array index, so ordering is retained as metadata --
+            # it just no longer decides which row is which. Truncated to 16 hex
+            # (64 bits) because it only has to be unique among one parent's
+            # children, and a full digest at every level makes a deeply nested
+            # row_id unreadable without buying anything.
+            token = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:16]
+            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{token}"
+            business_id = own_business_id or inherited_business_id
             provenance = _provenance(
                 manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,
@@ -541,12 +652,17 @@ def _iter_run_items(
         gp_code, gp_name = _gp_context(path, payload_root)
         table_name = source_kind.lower()
         identity_counts: dict[str, int] = {}
+        # A second call rather than a materialized list: `to_records` is a pure
+        # function of the already-parsed payload, so it hands back a fresh
+        # generator and the identity pass stays as streaming as the row pass.
+        repeated = _repeated_identities(to_records(payload)[0])
         for record in records:
-            business_id = _business_id(record)
-            identity = _record_identity(record, business_id)
+            identity = _refine_identity(
+                record, _element_identity(record), repeated
+            )
             occurrence = identity_counts.get(identity, 0)
             identity_counts[identity] = occurrence + 1
-            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
+            identity_key = _occurrence_key(identity, occurrence)
             yield from _record_rows(
                 record, manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, identity_key=identity_key,
