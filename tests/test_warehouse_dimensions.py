@@ -220,3 +220,78 @@ def test_a_whole_number_written_as_a_float_is_accepted(tmp_path: Path):
     frame = _load("dim_lsdg_theme", tmp_path)
     assert frame["distinct_themes"].iloc[0] == 3
     assert frame["source_rows"].iloc[0] == 350
+
+
+def test_more_themes_than_the_activities_they_were_counted_over_is_refused(
+    tmp_path: Path,
+):
+    """`distinct_themes` is counted *across* `source_rows` activities, so it
+    cannot exceed them. Three themes supported by one activity is arithmetic
+    that cannot have happened -- but it is a whole number and it is positive,
+    so every other check in this loader waves it through and the warehouse
+    publishes impossible provenance.
+    """
+
+    csv = tmp_path / "dim_lsdg_theme.csv"
+    csv.write_text(
+        "focus_area_name,lsdg_theme,distinct_themes,n_rows\n"
+        "Sanitation,Theme 5,3.0,1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DimensionError, match="cannot exceed"):
+        _load("dim_lsdg_theme", tmp_path)
+
+
+def test_a_count_equal_to_its_support_is_accepted(tmp_path: Path):
+    """Four rows of the real file have distinct_themes == source_rows == 1.
+    The bound is "cannot exceed", not "must be less than"."""
+
+    csv = tmp_path / "dim_lsdg_theme.csv"
+    csv.write_text(
+        "focus_area_name,lsdg_theme,distinct_themes,n_rows\n"
+        "Water,Theme 2,1.0,1.0\n",
+        encoding="utf-8",
+    )
+    assert _load("dim_lsdg_theme", tmp_path)["distinct_themes"].iloc[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "header", "row", "column"),
+    [
+        ("dim_code", "variable,code,description,source,confidence",
+         "focus_area,3,Sanitation,  ,high", "source"),
+        ("dim_lsdg_theme", "focus_area_name,lsdg_theme,distinct_themes,n_rows",
+         "Sanitation, ,3.0,350.0", "lsdg_theme"),
+        ("dim_welfare_scheme", "scheme_code,scheme_name", "1,   ", "scheme_name"),
+    ],
+)
+def test_a_blank_in_a_column_the_row_needs_is_refused(
+    tmp_path: Path, name: str, header: str, row: str, column: str,
+):
+    """Whitespace-only survives `.str.strip()` as "", and the key check does
+    not look at these columns. A row that loads with a blank `lsdg_theme` or
+    `scheme_name` decodes to nothing; one with a blank `dim_code.source` is a
+    label carrying no provenance, which is the single thing `source` exists
+    to prevent (see the module docstring).
+    """
+
+    (tmp_path / f"{name}.csv").write_text(f"{header}\n{row}\n", encoding="utf-8")
+    with pytest.raises(DimensionError, match="blank"):
+        _load(name, tmp_path)
+
+
+def test_an_unrecorded_confidence_still_loads(tmp_path: Path):
+    """The counterpart to the test above, and the reason it is narrow: 253 of
+    717 real dim_code rows have no `confidence` and 238 have `Unresolved`
+    provenance. Rejecting those would reject the dictionary itself.
+    """
+
+    csv = tmp_path / "dim_code.csv"
+    csv.write_text(
+        "variable,code,description,source,confidence\n"
+        "focus_area,3,,Unresolved,\n",
+        encoding="utf-8",
+    )
+    frame = _load("dim_code", tmp_path)
+    assert frame["confidence"].iloc[0] == ""
+    assert frame["source"].iloc[0] == "Unresolved"

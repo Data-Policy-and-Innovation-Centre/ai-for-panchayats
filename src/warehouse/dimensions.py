@@ -67,6 +67,28 @@ DIMENSION_INTEGERS: Mapping[str, tuple[str, ...]] = {
     "dim_lsdg_theme": ("distinct_themes", "source_rows"),
 }
 
+# A count and the population it was counted over. `distinct_themes` is the
+# number of themes seen across the `source_rows` activities behind the row,
+# so it cannot exceed them: 3 themes supported by 1 activity is impossible
+# provenance that the whole-number and positivity checks both accept.
+DIMENSION_COUNT_BOUNDS: Mapping[str, tuple[str, str]] = {
+    "dim_lsdg_theme": ("distinct_themes", "source_rows"),
+}
+
+# Text columns a row is useless without. Deliberately narrow: `description`
+# and `confidence` are left out because their blanks are information -- 253
+# of 717 dim_code rows record no confidence, and the module docstring's
+# whole argument is that an unrecorded provenance must stay visible rather
+# than be flattened away. These three are different. A blank `lsdg_theme` or
+# `scheme_name` is a lookup that decodes to nothing, and a blank
+# `dim_code.source` is a label with no provenance at all -- which is the one
+# thing dim_code carries `source` in order to prevent.
+DIMENSION_REQUIRED: Mapping[str, tuple[str, ...]] = {
+    "dim_code": ("source",),
+    "dim_lsdg_theme": ("lsdg_theme",),
+    "dim_welfare_scheme": ("scheme_name",),
+}
+
 # Columns whose duplication is a contradiction rather than a repetition,
 # matching each table's PRIMARY KEY in schema.py. dim_lsdg_theme has none:
 # its DDL declares no key, because one focus area legitimately maps to one
@@ -146,13 +168,26 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
             )
         frame[column] = numeric.astype("Int64")
 
+    bounded = DIMENSION_COUNT_BOUNDS.get(name)
+    if bounded is not None:
+        counted, population = bounded
+        over = frame[counted] > frame[population]
+        if over.any():
+            raise DimensionError(
+                f"{path}: {counted} cannot exceed {population}; got "
+                f"{frame.loc[over, [*keys_for(name), counted, population]].head(3).to_dict('records')}"
+            )
+
     keys = keys_for(name)
-    if keys:
-        blank = frame[list(keys)].isna().any(axis=1) | (frame[list(keys)] == "").any(axis=1)
+    required = [*keys, *DIMENSION_REQUIRED.get(name, ())]
+    if required:
+        subset = frame[required]
+        blank = subset.isna().any(axis=1) | (subset == "").any(axis=1)
         if blank.any():
             raise DimensionError(
-                f"{path}: {int(blank.sum())} row(s) have a blank {'/'.join(keys)}"
+                f"{path}: {int(blank.sum())} row(s) have a blank {'/'.join(required)}"
             )
+    if keys:
         duplicated = frame.duplicated(subset=list(keys), keep=False)
         if duplicated.any():
             # Keeping the last would silently pick one of two meanings for
