@@ -11,12 +11,20 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
-from src.deploy.errors import SnapshotError
-from src.deploy.fetch import fetch_snapshot, load_expectations
-from src.deploy.manifest import load_manifest
+# Run directly (not via pytest, which sets pythonpath=["src", "."] itself, and
+# not only via `python -m`), so the repository root needs to be on sys.path
+# explicitly -- same convention as scripts/build_warehouse.py. `src.deploy`
+# imports `src.warehouse`, so the repo root (not `src/`) must be the path
+# added; otherwise the nested import fails with ModuleNotFoundError.
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from src.deploy.errors import SnapshotError  # noqa: E402
+from src.deploy.fetch import fetch_snapshot, load_expectations  # noqa: E402
+from src.deploy.manifest import load_manifest  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
