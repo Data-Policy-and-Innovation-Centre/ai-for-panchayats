@@ -132,7 +132,11 @@ LEFT JOIN dim_code fc ON fc.variable = 'fund_component_code'
 -- with geography, decoded labels, LSDG theme, expenditure and
 -- (new) the administrative-approval record.
 -- ------------------------------------------------------------
-CREATE OR REPLACE VIEW v_activity AS
+-- DIVERGENCE (this repo): the consumer defines one `v_activity`. Here the
+-- join graph is `v_activity_base`, which is stored, and `v_activity` is a
+-- thin view over it that adds `days_since_sanction`. See the note on that
+-- view below for why that column cannot be stored.
+CREATE OR REPLACE VIEW v_activity_base AS
 SELECT
     a.activity_code,
     a.plan_code,
@@ -207,10 +211,9 @@ SELECT
     ap.fund_sanctioned_st,
     ap.fund_sanctioned_total,
     ap.scheme_rows,
-    -- Days from sanction to the end of the plan year, useful for the
-    -- "no expenditure N days after sanction" style questions.
-    CASE WHEN ap.sanction_day IS NOT NULL
-         THEN DATE_DIFF('day', ap.sanction_day, CURRENT_DATE) END AS days_since_sanction,
+    -- `days_since_sanction` was computed here in the consumer's copy. It is
+    -- added by the `v_activity` view below instead; `sanction_day` above is
+    -- everything that computation needs, and it is stable.
     COALESCE(pp.evidence_uploads, 0) AS evidence_uploads,
     CASE WHEN pp.activity_code IS NOT NULL THEN 1 ELSE 0 END AS has_progress_evidence
 FROM planned_activity a
@@ -231,6 +234,31 @@ LEFT JOIN dim_code aty ON aty.variable = 'activity_type'
                       AND aty.code = CAST(a.activity_type AS VARCHAR)
 LEFT JOIN dim_code af  ON af.variable = 'activity_for'
                      AND af.code = CAST(a.activity_for AS VARCHAR);
+
+-- ------------------------------------------------------------
+-- v_activity : the name the consumer queries. Everything expensive is
+-- already computed in v_activity_base; this adds one scalar per row.
+--
+-- DIVERGENCE (this repo): `days_since_sanction` is the one column in the
+-- consumer's DDL that is not a function of the data alone -- it counts days
+-- up to CURRENT_DATE. Storing it, as every other column here is stored,
+-- would freeze it at *build* time, and the snapshot then sits deployed for
+-- weeks: "sanctioned more than 90 days ago" would silently answer as of the
+-- build date and drift further every day it stays up. So the join graph is
+-- stored and this column alone is recomputed per query.
+--
+-- Two consequences worth knowing. `days_since_sanction` moves to the end of
+-- the column list, which matters only to a `SELECT *` that reads by
+-- position. And the consumer's ensure_views() must skip a name that already
+-- exists as *any relation*, not only as a table -- skipping only tables
+-- would let its own full-join v_activity replace this view and give up the
+-- materialisation.
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW v_activity AS
+SELECT *,
+       CASE WHEN sanction_day IS NOT NULL
+            THEN DATE_DIFF('day', sanction_day, CURRENT_DATE) END AS days_since_sanction
+FROM v_activity_base;
 
 -- ------------------------------------------------------------
 -- v_plan : GPDP plans with geography.

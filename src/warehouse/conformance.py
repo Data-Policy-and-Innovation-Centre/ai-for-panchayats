@@ -80,8 +80,18 @@ ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"quarantine"})
 # alongside them rather than counted among them. Checked for presence
 # separately: a warehouse missing them builds but is not consumable.
 DERIVED_RELATIONS: frozenset[str] = frozenset({
-    "v_exp", "v_approval", "v_activity", "v_plan", "v_asset", "v_progress", "v_voucher",
+    "v_exp", "v_approval", "v_activity", "v_activity_base", "v_plan",
+    "v_asset", "v_progress", "v_voucher",
 })
+
+# The one derived relation that must NOT be stored. `v_activity` adds
+# `days_since_sanction`, which counts days up to CURRENT_DATE, so a stored
+# copy would answer as of the build date and drift for as long as the
+# snapshot stayed deployed. Its join graph is stored as `v_activity_base`
+# instead, so the cost #51 exists to remove is still paid once. Named here
+# rather than merely omitted from a list, so that storing it later trips the
+# check instead of silently reintroducing the staleness.
+DYNAMIC_RELATIONS: frozenset[str] = frozenset({"v_activity"})
 
 # Section 2: primary keys. ``None`` means "no primary key is expected" --
 # a table appearing here with None is a documented fact from the spec
@@ -661,18 +671,29 @@ def check_dim_code_uniqueness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
 
 
 def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """The consumer relations exist and are tables, not views.
+    """The consumer relations exist, and each is stored or dynamic as intended.
 
     Behind its own ``skip_derived`` flag for the reason
     ``check_geography_completeness`` is behind ``skip_geography``: a fixture
     that creates the 19 spec tables to exercise a schema rule is not wrong
     for having no ``v_activity``. A real build is.
 
-    Both halves matter. Absence means the chatbot has nothing to query --
-    it reads these and nothing else, so a warehouse without them is not
-    consumable however complete its facts are. And a *view* where a table
-    was expected means the join graph is still being re-run per question,
-    which is the 36x cost #51 exists to remove (#99, #98).
+    Three things can be wrong, and this checks all three.
+
+    **Absent** means the chatbot has nothing to query -- it reads these and
+    nothing else, so a warehouse without them is not consumable however
+    complete its facts are.
+
+    **A view where a table was expected** means the join graph is still being
+    re-run per question, which is the 36x cost #51 exists to remove (#99,
+    #98).
+
+    **A table where a view was expected** is the opposite mistake and is
+    quieter, which is why ``DYNAMIC_RELATIONS`` is named rather than merely
+    left out of a list. ``v_activity`` adds ``days_since_sanction``, a count
+    of days up to ``CURRENT_DATE``; stored, it answers as of the build date
+    and drifts for every day the snapshot stays deployed. Nothing fails --
+    the number is simply wrong, and grows more wrong.
     """
 
     relations = {
@@ -690,9 +711,21 @@ def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
             actual=f"missing {sorted(missing)}",
         ))
     not_stored = sorted(
-        name for name in DERIVED_RELATIONS & set(relations)
+        name for name in (DERIVED_RELATIONS - DYNAMIC_RELATIONS) & set(relations)
         if relations[name] != "BASE TABLE"
     )
+    wrongly_stored = sorted(
+        name for name in DYNAMIC_RELATIONS & set(relations)
+        if relations[name] == "BASE TABLE"
+    )
+    if wrongly_stored:
+        findings.append(Finding(
+            check="relations.dynamic", severity="violation",
+            expected=f"{sorted(DYNAMIC_RELATIONS)} recomputed per query",
+            actual=f"stored as tables: {wrongly_stored}",
+            detail="days_since_sanction counts up to CURRENT_DATE; a stored "
+                   "copy freezes it at build time and drifts thereafter",
+        ))
     if not_stored:
         findings.append(Finding(
             check="relations.materialized", severity="violation",

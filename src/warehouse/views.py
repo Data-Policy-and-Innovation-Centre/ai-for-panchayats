@@ -25,8 +25,12 @@ rather than reconstructed. The file's own order is dependency order
 ``v_progress`` read it), so it is executed as written.
 
 **The consumer needs one change to benefit.** Its ``ensure_views()`` must
-skip creating a view when a table of that name already exists, or the
-in-memory view shadows the stored table and nothing gets faster.
+skip creating a relation whose name already exists -- as a table *or* a
+view -- or its in-memory definition shadows what was built here and nothing
+gets faster. Note "or a view": ``v_activity`` is deliberately left as a view
+over the stored ``v_activity_base`` (see below), so a check that looked only
+for tables would replace it with the consumer's own full-join version and
+give up the materialisation entirely.
 """
 
 from __future__ import annotations
@@ -64,15 +68,22 @@ def relation_names() -> tuple[str, ...]:
     return names
 
 
-# Which relations are stored, and which are left for the consumer to create
-# as views at runtime. `ensure_views()` skips any name that already exists as
-# a table, so a subset is coherent: the stored ones shadow the view, the rest
-# behave exactly as they do today.
+# Which relations are stored, and which are left as views. `ensure_views()`
+# skips any name that already exists, so a subset is coherent: the stored ones
+# shadow the consumer's definition, the rest behave exactly as they do today.
 #
 # Set by measurement, not taste -- see the size/latency table in #51. Override
 # with the `relations` argument to compare variants.
+#
+# `v_activity_base` rather than `v_activity` is the one name here that differs
+# from the consumer's, and it is deliberate. `v_activity` adds
+# `days_since_sanction`, which counts days up to CURRENT_DATE; storing it would
+# freeze that count at build time and the answer would drift every day the
+# snapshot stayed deployed. The base carries the whole join graph, so the view
+# over it costs one scalar per row. See views.sql.
 STORED_BY_DEFAULT: tuple[str, ...] = (
-    "v_exp", "v_approval", "v_activity", "v_asset", "v_plan", "v_progress", "v_voucher",
+    "v_exp", "v_approval", "v_activity_base", "v_asset", "v_plan",
+    "v_progress", "v_voucher",
 )
 
 

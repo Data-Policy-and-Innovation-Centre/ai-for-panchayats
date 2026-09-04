@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import duckdb
 
-from src.warehouse.conformance import DERIVED_RELATIONS, check_derived_relations
+from src.warehouse.conformance import DERIVED_RELATIONS, DYNAMIC_RELATIONS, check_derived_relations
 from src.warehouse.dimensions import dimension_frames
 from src.warehouse.schema import DDL
 from src.warehouse.views import materialize, relation_names
@@ -37,24 +37,34 @@ def _seed_activity(con: duckdb.DuckDBPyConnection, activity_code: str, **columns
     )
 
 
-def test_every_relation_builds_and_is_stored_not_a_view():
+def test_every_relation_builds_and_is_stored_except_the_one_that_must_not_be():
     """The whole point of #51: stored, so the joins are paid once.
 
     A view here would still be correct and still be slow -- the consumer
     measured 28,564 ms through views against 791 ms materialised -- so
     "it built" is not the property worth asserting on its own.
+
+    `v_activity` is the deliberate exception and is asserted as a view, not
+    merely left out: it adds `days_since_sanction`, which counts up to
+    CURRENT_DATE, so storing it would freeze that count at build time. Its
+    join graph is stored as `v_activity_base`, so the cost is still paid
+    once. Asserting the kind of every relation, rather than just that they
+    exist, is what makes storing `v_activity` later fail here.
     """
 
     con = _empty_warehouse()
     try:
         counts = materialize(con)
-        assert set(counts) == DERIVED_RELATIONS
+        assert set(counts) == DERIVED_RELATIONS - DYNAMIC_RELATIONS
         kinds = dict(con.execute(
             "SELECT table_name, table_type FROM information_schema.tables "
             "WHERE table_schema = 'main' AND table_name LIKE 'v\\_%' ESCAPE '\\'"
         ).fetchall())
         assert set(kinds) == DERIVED_RELATIONS
-        assert set(kinds.values()) == {"BASE TABLE"}, kinds
+        assert {n for n, k in kinds.items() if k == "BASE TABLE"} == (
+            DERIVED_RELATIONS - DYNAMIC_RELATIONS
+        ), kinds
+        assert {n for n, k in kinds.items() if k != "BASE TABLE"} == DYNAMIC_RELATIONS, kinds
     finally:
         con.close()
 
@@ -67,8 +77,9 @@ def test_dependency_order_is_the_file_order():
     """
 
     names = relation_names()
-    assert names.index("v_exp") < names.index("v_activity")
-    assert names.index("v_approval") < names.index("v_activity")
+    assert names.index("v_exp") < names.index("v_activity_base")
+    assert names.index("v_approval") < names.index("v_activity_base")
+    assert names.index("v_activity_base") < names.index("v_activity")
     assert names.index("v_activity") < names.index("v_asset")
     assert names.index("v_activity") < names.index("v_progress")
 
@@ -94,6 +105,32 @@ def test_conformance_rejects_them_as_views():
         findings = check_derived_relations(con)
         assert [f.check for f in findings] == ["relations.materialized"]
         assert "still views" in findings[0].actual
+    finally:
+        con.close()
+
+
+def test_conformance_rejects_a_stored_v_activity():
+    """The opposite mistake to the one above, and the quieter one.
+
+    A view where a table belongs is slow. A *table* where the view belongs
+    is fast and wrong: `days_since_sanction` is frozen at the build date and
+    drifts one day further for every day the snapshot stays deployed, with
+    nothing failing anywhere. Pinned here as well as in the build test,
+    because conformance is what runs against a database someone is about to
+    deploy.
+    """
+
+    con = _empty_warehouse()
+    try:
+        materialize(con)
+        assert check_derived_relations(con) == [], "a normal build is clean"
+
+        con.execute("DROP VIEW v_activity")
+        con.execute("CREATE TABLE v_activity AS SELECT * FROM v_activity_base")
+        findings = check_derived_relations(con)
+        assert [f.check for f in findings] == ["relations.dynamic"]
+        assert findings[0].severity == "violation"
+        assert "v_activity" in findings[0].actual
     finally:
         con.close()
 
@@ -140,5 +177,63 @@ def test_labels_actually_decode_through_dim_code():
             "SELECT status_label FROM v_activity WHERE activity_code = 'act-1'"
         ).fetchone()[0]
         assert label not in (None, ""), "status_label did not decode"
+    finally:
+        con.close()
+
+
+def test_days_since_sanction_is_computed_per_query_not_frozen_at_build():
+    """The column that cannot be stored, and the reason `v_activity` is a view.
+
+    `days_since_sanction` counts days up to CURRENT_DATE. Every other column
+    in these relations is a function of the data alone, so storing it is free;
+    this one is a function of *when you ask*. A stored copy answers as of the
+    build date and drifts one day further every day the snapshot stays
+    deployed -- and nothing fails, the number is just increasingly wrong. That
+    is the failure this pins.
+
+    Asserted three ways, because any one alone is weak: the column is absent
+    from the stored base (so there is no frozen copy to drift), `v_activity`
+    is a view (so it is recomputed), and its value matches the arithmetic done
+    fresh against CURRENT_DATE right now.
+    """
+
+    con = _empty_warehouse()
+    try:
+        # An activity with a real sanction date, 100 days ago. Without a row
+        # the last assertion below is vacuously true -- the hazard this file's
+        # own `_seed_activity` docstring warns about.
+        _seed_activity(con, "A1", fiscal_year="2021-2022")
+        con.execute(
+            "INSERT INTO admin_approval (source_system, source_run_id, row_id, "
+            "gp_lgd_code, activity_code, adm_approval_sanction_date) "
+            "VALUES ('s', 'r', 'r1', '111', 'A1', CURRENT_DATE - INTERVAL 100 DAY)"
+        )
+        materialize(con)
+        assert con.execute(
+            "SELECT days_since_sanction FROM v_activity WHERE activity_code = 'A1'"
+        ).fetchone()[0] == 100
+
+        base_columns = {
+            row[0] for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'v_activity_base'"
+            ).fetchall()
+        }
+        assert "days_since_sanction" not in base_columns
+        assert "sanction_day" in base_columns, "the view needs this to recompute"
+
+        kind = con.execute(
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_name = 'v_activity'"
+        ).fetchone()[0]
+        assert kind != "BASE TABLE", kind
+
+        checked, drifted = con.execute(
+            "SELECT count(*), count(*) FILTER (WHERE days_since_sanction "
+            "IS DISTINCT FROM DATE_DIFF('day', sanction_day, CURRENT_DATE)) "
+            "FROM v_activity WHERE sanction_day IS NOT NULL"
+        ).fetchone()
+        assert checked > 0, "no sanctioned row: the next assertion would be vacuous"
+        assert drifted == 0
     finally:
         con.close()
