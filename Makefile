@@ -79,6 +79,19 @@ push: _require_data _check_git_clean
 # or database. A sample still cannot be deployed whatever MODE says:
 # scripts/build_snapshot_manifest.py refuses to pin anything short of the full
 # 6,794-GP roster.
+# Provenance stamped onto every raw run. Without these the CLI records its
+# "unknown" defaults, normalization copies them into raw_manifest_identity,
+# and two artifacts built from different code become indistinguishable --
+# which defeats the point of an immutable, hash-verified run.
+#
+# CODE_SHA carries a -dirty suffix when the tree has uncommitted changes: a
+# bare commit hash for a build that did not come from that commit is worse
+# than "unknown", because it looks authoritative.
+CODE_SHA    := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$(shell \
+                 git diff --quiet HEAD 2>/dev/null || echo -dirty)
+# The mode file is what decides every path this run reads and writes, so it
+# is the configuration a rebuild would need to reproduce.
+CONFIG_HASH  = $(shell shasum -a 256 $(MODE_ENV) 2>/dev/null | cut -c1-12 || echo unknown)
 PIPELINE_SOURCE ?= egramSwaraj
 PIPELINE_RAW_ROOT ?= data/raw
 PIPELINE_TREE   ?= data/raw/eGramSwaraj_Data/Gram_Panchayat
@@ -113,6 +126,7 @@ run: _require_mode_env
 	@echo "[$(MODE)] publishing raw run $(RUN_ID) from $(PIPELINE_TREE)..."
 	uv run python main.py ingest \
 	  --raw-root $(PIPELINE_RAW_ROOT) --source $(PIPELINE_SOURCE) --run-id $(RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
 	  --payload-tree $(PIPELINE_TREE)
 	@echo "[$(MODE)] verifying every published file against its hash..."
 	uv run python main.py validate-run $(PIPELINE_RAW_ROOT)/$(PIPELINE_SOURCE)/$(RUN_ID)

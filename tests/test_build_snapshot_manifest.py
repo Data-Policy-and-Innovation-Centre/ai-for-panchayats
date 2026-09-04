@@ -247,3 +247,38 @@ def test_the_sample_recipe_survives_pipefail_on_a_full_size_tree(tmp_path: Path)
     # the contents into the sample root instead of the directory itself.
     assert len(list(out.iterdir())) == 20
     assert len(list(out.glob("*/2021_PL.json"))) == 20
+
+
+def test_make_run_stamps_real_provenance_on_the_raw_run():
+    """`ingest` defaults code_sha and config_hash to "unknown", and
+    normalization copies those into raw_manifest_identity -- so two artifacts
+    built from different code would be indistinguishable. The recipe must
+    supply both, and the two modes must not share a config hash.
+
+    Read out of `make -n` rather than by running the pipeline: this asserts
+    what the recipe passes, which is the thing that regressed.
+    """
+
+    import re
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+
+    def flags(mode: str) -> dict[str, str]:
+        out = subprocess.run(
+            ["make", "-n", "run", f"MODE={mode}"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout
+        found = dict(re.findall(r"--(code-sha|config-hash) (\S+)", out))
+        assert set(found) == {"code-sha", "config-hash"}, out
+        return found
+
+    prod, staging = flags("prod"), flags("staging")
+    for mode, found in (("prod", prod), ("staging", staging)):
+        for key, value in found.items():
+            assert value != "unknown", f"{mode} passes a literal 'unknown' for --{key}"
+            assert value, f"{mode} passes an empty --{key}"
+    # The mode file decides every path the run touches, so its hash is what a
+    # rebuild would need; sharing one between modes would make them look alike.
+    assert prod["config-hash"] != staging["config-hash"]
+    assert prod["code-sha"] == staging["code-sha"]  # same tree, same code
