@@ -16,7 +16,8 @@ rows themselves, their values, and their ``row_id``s must not move. So each
 table is read back as one dataset, sorted by ``row_id``, and hashed.
 
 Reads the scraped tree read-only and writes everything else under --work, so
-it is safe to run while another normalization is in progress.
+it is safe to run while another normalization is in progress, and safe to point
+at the same --work twice when comparing two revisions.
 """
 
 from __future__ import annotations
@@ -49,6 +50,18 @@ def build_subset(tree: Path, count: int, destination: Path) -> int:
 
 
 def publish(work: Path, tree: Path, run_id: str) -> Path:
+    """Publish `tree` as a raw run, replacing any run this harness left behind.
+
+    Raw runs are immutable by design and `RunPublisher.publish()` refuses to
+    overwrite one. That is right for the pipeline and wrong here: comparing two
+    revisions means running this twice, and the second run would die on the
+    first one's `bench-<n>`. Only runs under --work, which this script owns and
+    creates, are removed -- never a real run.
+    """
+
+    destination = work / "raw" / "egramSwaraj" / run_id
+    if destination.exists():
+        shutil.rmtree(destination)
     subprocess.run(
         [
             "uv", "run", "python", "main.py", "ingest",
@@ -58,13 +71,23 @@ def publish(work: Path, tree: Path, run_id: str) -> Path:
         ],
         check=True, capture_output=True, cwd=Path(__file__).resolve().parents[1],
     )
-    return work / "raw" / "egramSwaraj" / run_id
+    return destination
 
 
-def fingerprint(snapshot: Path) -> dict[str, dict[str, object]]:
-    """Per-table row count and a content hash, independent of part layout."""
+def fingerprint(snapshot: Path) -> tuple[dict[str, dict[str, object]], dict[str, int]]:
+    """Per-table content hash, and separately the part-file count.
 
-    out: dict[str, dict[str, object]] = {}
+    Two return values, not one dict, because they answer opposite questions.
+    The fingerprint must be *identical* between two revisions or the change
+    altered the data. The part count is *expected* to differ -- how rows are
+    distributed across files is what a buffering change moves. Folding the
+    count into the fingerprint makes a diff of "the fingerprint values" report
+    a content regression every time the layout changes, which is exactly the
+    false alarm this harness exists to avoid.
+    """
+
+    content: dict[str, dict[str, object]] = {}
+    parts: dict[str, int] = {}
     for table_dir in sorted(p for p in snapshot.iterdir() if p.is_dir()):
         files = sorted(str(p) for p in table_dir.rglob("*.parquet"))
         if not files:
@@ -76,8 +99,9 @@ def fingerprint(snapshot: Path) -> dict[str, dict[str, object]]:
         digest = hashlib.sha256(
             pd.util.hash_pandas_object(frame, index=False).values.tobytes()
         ).hexdigest()
-        out[table_dir.name] = {"rows": len(frame), "sha256": digest[:16], "parts": len(files)}
-    return out
+        content[table_dir.name] = {"rows": len(frame), "sha256": digest[:16]}
+        parts[table_dir.name] = len(files)
+    return content, parts
 
 
 # Runs one normalization and reports what it cost, as JSON on stdout.
@@ -177,7 +201,9 @@ def main(argv: list[str] | None = None) -> int:
         measured = measure(run_path, args.work / f"canonical-{count}", args.chunk_size)
         measured["gps"] = actual
         measured["files"] = sum(1 for _ in subset.rglob("*.json"))
-        measured["fingerprint"] = fingerprint(Path(measured.pop("snapshot")))
+        measured["fingerprint"], measured["parts"] = fingerprint(
+            Path(measured.pop("snapshot"))
+        )
         report["sizes"][str(count)] = measured
         rows = sum(t["rows"] for t in measured["fingerprint"].values())
         # One line per size, as it completes. A run at 1,000 GPs takes
