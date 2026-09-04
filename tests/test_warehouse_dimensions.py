@@ -183,6 +183,8 @@ def test_the_decode_join_needs_its_cast_and_not_for_the_reason_the_issue_gives()
         ("n/a", "not a number: coercing to NULL hides that the mapping is collapsed"),
         ("", "blank: same as above"),
         ("inf", "non-finite: astype('Int64') would raise far from the cause"),
+        ("0", "zero: a row exists because it was observed, so it counts >= 1"),
+        ("-1", "negative: impossible provenance that every build check would pass"),
     ],
 )
 def test_a_theme_count_that_is_not_a_whole_number_is_refused(
@@ -201,7 +203,7 @@ def test_a_theme_count_that_is_not_a_whole_number_is_refused(
         f"Sanitation,Theme 5,{value},350.0\n",
         encoding="utf-8",
     )
-    with pytest.raises(DimensionError, match="must be a whole number"):
+    with pytest.raises(DimensionError, match="whole number of at least 1"):
         _load("dim_lsdg_theme", tmp_path)
 
 

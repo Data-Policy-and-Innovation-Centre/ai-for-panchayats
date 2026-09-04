@@ -131,10 +131,17 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
         finite = np.isfinite(numeric.to_numpy(dtype="float64", na_value=np.nan))
         invalid = raw.isna() | (raw == "") | numeric.isna() | ~finite
         fractional = ~invalid & (numeric != numeric.round())
-        if invalid.any() or fractional.any():
-            offending = frame.loc[invalid | fractional, [*keys_for(name), column]]
+        # Both columns count something that exists: `distinct_themes` counts
+        # the themes this row collapsed, `source_rows` the activities behind
+        # it. A row is in the file because it was observed, so neither can be
+        # zero or negative -- and either value would publish impossible
+        # provenance while every build check still passed.
+        non_positive = ~invalid & ~fractional & (numeric < 1)
+        bad = invalid | fractional | non_positive
+        if bad.any():
+            offending = frame.loc[bad, [*keys_for(name), column]]
             raise DimensionError(
-                f"{path}: {column} must be a whole number; got "
+                f"{path}: {column} must be a whole number of at least 1; got "
                 f"{offending.head(3).to_dict('records')}"
             )
         frame[column] = numeric.astype("Int64")
