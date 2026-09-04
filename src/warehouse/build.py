@@ -158,7 +158,9 @@ def populate(
         for kind in ("pl", "aa", "ta", "pp", "re"):
             frame = _read(root, tables, kind)
             top_level[kind] = frame
-            if kind in tables:
+            # `re` is accounted for below: whether it is consumed depends on
+            # what is in it, not on whether the snapshot declares it.
+            if kind in tables and kind != "re":
                 used.append(kind)
         pl, aa, ta, pp, re = (top_level[k] for k in ("pl", "aa", "ta", "pp", "re"))
 
@@ -266,8 +268,27 @@ def populate(
             pp, activity_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
 
+        # The scraped `re` kind is getLbAllocatedAmountData -- budgetary
+        # allocation, not expenditure -- so it cannot fill this table, and
+        # feeding it in only produces a RequiredFieldUnresolved for a field
+        # the source never had. activity_expenditure's source is the separate
+        # expenditure extract (#49), which has no loader yet; until it does,
+        # this table stays empty the same way voucher and dim_code do.
+        #
+        # A frame that *does* carry expenditure spellings is still shaped and
+        # still checked, so a renamed column in a real expenditure source
+        # keeps failing loudly instead of silently loading nothing. Leaving
+        # `re` out of `used` reports it as unconsumed rather than claiming a
+        # kind was loaded that was not.
+        expenditure_source = re if transform.is_expenditure_frame(re) else pd.DataFrame()
+        if "re" in tables and (re.empty or not expenditure_source.empty):
+            # An empty `re` dataset -- what normalization writes for a kind
+            # that was requested but yielded nothing -- has no rows left
+            # unloaded, so reporting it as unconsumed would be noise.
+            used.append("re")
         expenditures = transform.activity_expenditure(
-            re, gp_codes, quarantine, source_system=source_system, source_run_id=source_run_id,
+            expenditure_source, gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
             resolutions=resolutions, start_id=next_expenditure_id,
         )
         add_count("activity_expenditure", insert(con, "activity_expenditure", expenditures, batch_size=batch_size))

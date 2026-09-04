@@ -165,10 +165,26 @@ run-staging: sample
 	@$(MAKE) run MODE=staging PIPELINE_TREE=$(SAMPLE_TREE)
 
 # Stage 3-4: build the warehouse from an approved snapshot, then check it.
+#
+# The build goes to a candidate path and is renamed over the real one only
+# after conformance passes (#135). build_warehouse.py is itself atomic -- it
+# loads into a temp file and os.replace()s the target -- but that replace
+# happens before this recipe reaches the checker, so a build that loads
+# cleanly and then fails conformance would otherwise have already overwritten
+# the last good database. At full state that costs a ~90-minute rebuild, and
+# it leaves a known-bad file sitting at the path every later command reads.
+#
+# A failed check leaves the candidate in place on purpose: it is the artifact
+# you need to look at to find out why, and the previous database is still
+# where it was. `mv` is a rename within one directory, so the promotion is
+# atomic too.
+CANDIDATE_DB := $(PANCHAYAT_DB_PATH).candidate
+
 warehouse: _require_mode_env
 	@test -n "$(SNAPSHOT_ID)" || { \
 	  echo "SNAPSHOT_ID is required: make warehouse SNAPSHOT_ID=<id>"; exit 1; }
-	uv run python scripts/build_warehouse.py build --snapshot-id $(SNAPSHOT_ID)
+	uv run python scripts/build_warehouse.py --database $(CANDIDATE_DB) \
+	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
 	@echo "  --skip-reconciliation: voucher/dim_code have no loader yet (#46, #48,"
@@ -176,7 +192,9 @@ warehouse: _require_mode_env
 	@echo "  until they do -- see #50. Geography coverage is NOT skipped here: it"
 	@echo "  is what catches a sample built as if it were the state."
 	uv run python scripts/check_warehouse_conformance.py \
-	  $(PANCHAYAT_DB_PATH) --skip-reconciliation $(CONFORMANCE_EXTRA)
+	  $(CANDIDATE_DB) --skip-reconciliation $(CONFORMANCE_EXTRA)
+	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)
+	@echo "[$(MODE)] promoted to $(PANCHAYAT_DB_PATH)"
 
 # Staging skips geography as well: a 20-GP sample is not the state, and is
 # not pretending to be.
