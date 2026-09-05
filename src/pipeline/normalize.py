@@ -17,7 +17,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -57,6 +57,46 @@ FLAT_CSV_SOURCES: dict[str, tuple[str, str]] = {
 # shared, so a name-derived path could not identify a GP at all.
 NESTED_JSON_SOURCES: dict[str, str] = {
     "egramswaraj_accounting": "VOUCHER",
+}
+# One very large flat CSV, streamed rather than held (#49). Keyed by the raw
+# run's `source` like the two lanes above.
+#
+# A fourth lane rather than a mode on `normalize_flat_csv`, because that lane
+# reads the whole file into a list to decide which identities repeat, and says
+# so: its ceiling is one row per GP. This source is 4,075,935 rows and 770 MB.
+#
+# `key_columns` is a *composite* key, where the flat lane takes a single
+# column: this source has no one-column identity, and the four together were
+# measured unique across all 4,075,935 rows -- which is what lets the lane
+# stream at all, since a row's identity does not depend on rows not yet read.
+#
+# `business_id_column` is separate from the key on purpose. `row_id` needs the
+# composite to be unique, but `transform._base_identity` reads `business_id`
+# as the row's activity_code, so putting the composite there would fill
+# activity_expenditure.activity_code with JSON.
+#
+# Headers are carried through verbatim, NOT snake_cased. `transform`'s
+# RE_CANDIDATES already lists this source's own spellings -- "planCode",
+# "S.No.", "Scheme Name", "Approved Cost in Action Plan" -- so renaming here
+# would silently break every one of them and leave the columns unresolved.
+class LargeCsvSpec(NamedTuple):
+    source_kind: str
+    key_columns: tuple[str, ...]
+    business_id_column: str
+    gp_column: str
+    gp_name_column: str
+    year_column: str
+
+
+LARGE_CSV_SOURCES: dict[str, LargeCsvSpec] = {
+    "egramswaraj_expenditure": LargeCsvSpec(
+        source_kind="EXPENDITURE",
+        key_columns=("gpCode", "planCode", "Activity Code", "S.No."),
+        business_id_column="Activity Code",
+        gp_column="gpCode",
+        gp_name_column="gpName",
+        year_column="planYear",
+    ),
 }
 # The two arrays a single accounting file carries, and the `direction` each
 # one means. The warehouse's `voucher.direction` CHECK admits exactly these
@@ -1406,6 +1446,162 @@ def _blank_to_none(value: Any) -> str | None:
     return text or None
 
 
+def normalize_large_csv(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    spec: LargeCsvSpec,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize one very large flat CSV to canonical Parquet, streaming (#49).
+
+    `normalize_flat_csv` cannot be used and cannot simply be widened: it holds
+    every row in memory because deciding which identities repeat needs the
+    whole file before any row can be written, and its docstring bounds that at
+    one row per GP. This source is 4,075,935 rows.
+
+    Streaming is possible here only because the identity is knowable per row.
+    `key_columns` is a composite natural key measured unique across every row
+    of the real extract, so a row's `row_id` does not depend on rows not yet
+    read. That measurement is not assumed: the lane keeps a digest of every
+    key it has seen and **raises** on a repeat rather than emitting two rows
+    with one `row_id`. If the source gains duplicates, the run fails and names
+    the key, instead of quietly publishing a canonical tree whose identities
+    collide.
+
+    Digests rather than the keys themselves, because 4M composite key strings
+    would cost more than the rows being streamed. A 64-bit collision would
+    only produce a spurious failure naming a real key, never a silent
+    duplicate -- the safe direction for a check to be wrong in.
+
+    The schema is declared from the header rather than inferred, for the same
+    reason as the accounting lane: the first batch is written long before the
+    last row is read, so no column's type may depend on rows not yet seen.
+    Every column is a string, which is what the warehouse's own parsers
+    (`clean.to_code`, `to_decimal_money`, `to_datetime`) expect anyway.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    csv_paths = sorted(payload_root.rglob("*.csv"))
+    if len(csv_paths) != 1:
+        raise NormalizationError(
+            f"a large-CSV run must publish exactly one .csv payload; "
+            f"{payload_root} has {len(csv_paths)}"
+        )
+    csv_path = csv_paths[0]
+    source_file = csv_path.relative_to(payload_root).as_posix()
+    source_kind = spec.source_kind
+    table_name = source_kind.lower()
+
+    total_rows = 0
+    paths: list[Path] = []
+    pending: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+
+    # utf-8-sig, not utf-8: this file carries a BOM, and without it the first
+    # header reads as "\ufeffplanYear" so every lookup of it returns None (#49).
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or ())
+        required = (*spec.key_columns, spec.business_id_column, spec.gp_column,
+                    spec.gp_name_column, spec.year_column)
+        missing = tuple(dict.fromkeys(c for c in required if c not in fieldnames))
+        if missing:
+            raise NormalizationError(
+                f"{source_file} is missing required column(s) {list(missing)}; "
+                f"found {fieldnames}"
+            )
+        types = dict(PROVENANCE_SCHEMA)
+        for column in fieldnames:
+            types.setdefault(column, pa.string())
+        schema = _arrow_schema(types)
+
+        with AtomicParquetPublication(destination) as publication:
+            def flush() -> None:
+                nonlocal pending
+                if pending:
+                    paths.extend(publication.write_rows(
+                        table_name, pending, chunk_size=chunk_size, schema=schema,
+                    ))
+                    pending = []
+
+            for line_number, record in enumerate(reader, start=2):
+                parts = [_blank_to_none(record.get(column)) for column in spec.key_columns]
+                if any(part is None for part in parts):
+                    raise NormalizationError(
+                        f"{source_file} line {line_number} has a blank key column "
+                        f"among {list(spec.key_columns)}; identity cannot be established"
+                    )
+                business_id = _canonical_json(parts)
+                digest = int.from_bytes(
+                    hashlib.blake2b(business_id.encode("utf-8"), digest_size=8).digest(), "big",
+                )
+                if digest in seen:
+                    raise NormalizationError(
+                        f"{source_file} line {line_number} repeats the key {business_id}; "
+                        f"{list(spec.key_columns)} was measured unique across this source, so a "
+                        f"repeat means the source changed shape -- refusing to publish two "
+                        f"rows with one row_id"
+                    )
+                seen.add(digest)
+                row_id = hashlib.sha256("|".join(
+                    (manifest.source, source_kind, source_file, business_id)
+                ).encode("utf-8")).hexdigest()
+                row = {k: _blank_to_none(v) for k, v in record.items() if k}
+                row.update(_provenance(
+                    manifest=manifest, source_file=source_file, source_kind=source_kind,
+                    year=_blank_to_none(record.get(spec.year_column)),
+                    gp_code=_blank_to_none(record.get(spec.gp_column)),
+                    gp_name=_blank_to_none(record.get(spec.gp_name_column)),
+                    row_id=row_id, source_record_id=row_id, parent_row_id=None, pos=None,
+                    business_id=_blank_to_none(record.get(spec.business_id_column)),
+                ))
+                pending.append(row)
+                total_rows += 1
+                if len(pending) >= chunk_size:
+                    flush()
+            flush()
+
+            if not paths:
+                paths.extend(publication.write_empty(table_name, schema))
+            canonical = {
+                "source": manifest.source,
+                "run_id": manifest.run_id,
+                "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+                "raw_manifest_identity": {
+                    "source": manifest.source, "run_id": manifest.run_id,
+                    "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+                },
+                "schema_version": manifest.schema_version,
+                "tables": {
+                    table_name: {
+                        "row_count": total_rows,
+                        "files": [
+                            _canonical_file_record(publication.staging_root, path)
+                            for path in paths
+                        ],
+                    },
+                },
+                "quarantine_count": 0,
+                "terminal_state": "complete",
+            }
+            publication.write_canonical_manifest(canonical)
+            validate_canonical_manifest(publication.staging_root)
+            publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), total_rows, 0,
+    )
+
+
 def normalize_run(
     run_path: str | Path, output_root: str | Path, **kwargs: Any,
 ) -> NormalizationResult:
@@ -1423,6 +1619,10 @@ def normalize_run(
     if nested is not None:
         kwargs.pop("kinds", None)
         return normalize_accounting(run_path, output_root, source_kind=nested, **kwargs)
+    large = LARGE_CSV_SOURCES.get(source)
+    if large is not None:
+        kwargs.pop("kinds", None)
+        return normalize_large_csv(run_path, output_root, spec=large, **kwargs)
     flat = FLAT_CSV_SOURCES.get(source)
     if flat is None:
         return normalize_egramswaraj(run_path, output_root, **kwargs)

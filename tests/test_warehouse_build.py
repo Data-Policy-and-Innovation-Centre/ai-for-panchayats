@@ -18,9 +18,10 @@ import duckdb
 import pytest
 
 from src.pipeline.manifest import RunPublisher
-from src.pipeline.normalize import normalize_run
+from src.pipeline.normalize import NormalizationError, normalize_run
 from warehouse.build import BuildResult, build, create_schema
 from warehouse.conformance import check_conformance, check_satellite_row_parity, has_violations
+from warehouse import transform as transform_module
 from warehouse.transform import EmptyRequiredColumn, RequiredFieldUnresolved
 from warehouse.validate import ValidationFailed
 
@@ -1177,5 +1178,183 @@ def test_voucher_quarantines_a_duplicate_natural_key_rather_than_failing_the_ins
             "SELECT sum(row_count) FROM quarantine "
             "WHERE table_name = 'voucher' AND reason_code = 'conflicting_duplicate_key'"
         ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- expenditure (#49)
+
+EXPENDITURE_COLUMNS = (
+    "planYear,stateName,zpName,blockName,gpName,gpCode,planType,approvalDate,planCode,"
+    "planCodeStatus,S.No.,Activity Code,Activity Name,Activity For,Focus Area,"
+    "Approved Cost in Action Plan,Technical Approved Cost,Admin Approved Cost,Scheme Name,"
+    "General,SC,ST,Total Expenditure,Voucher Date,Voucher No,Voucher Cost"
+)
+
+
+def _expenditure_row(*, s_no: str, activity: str, total: str,
+                     v_no: str, v_cost: str, v_date: str, gp: str = "123") -> str:
+    return (
+        f"2022-2023,Odisha,Koraput,Dasamantapur,Test GP,{gp},131,,4810158,123,{s_no},"
+        f"{activity},Some work,GEN,Education,200000.00,200000,200000.00,XV Finance Commission,"
+        f"200000,,,{total},{v_date},{v_no},{v_cost}"
+    )
+
+
+def _expenditure_snapshot(tmp_path: Path, settings, run_id: str, body: str) -> None:
+    with RunPublisher(tmp_path / "raw", "egramswaraj_expenditure", run_id) as publisher:
+        publisher.write_payload(
+            "expenditure_all.csv", f"﻿{EXPENDITURE_COLUMNS}\n{body}".encode("utf-8"),
+        )
+        run = publisher.publish()
+    normalize_run(run, settings.canonical_root)
+
+
+def test_expenditure_explodes_parallel_voucher_cells_and_links_both_ways(tmp_path: Path):
+    """#49's core shape: three pipe cells recombined positionally.
+
+    Also pins the two joins that make the bridge worth having -- every row
+    reaches an activity_expenditure row, and reaches a voucher row where the
+    accounting extract actually covers it.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _accounting_snapshot(tmp_path, settings, "acct-1", {
+        "a/b/One/2022-2023.json": _accounting_payload(
+            "123", "2022-2023", receipts=[],
+            payments=[_voucher("XVFC/2022-23/P/7", 1028.0)],
+        ),
+    })
+    _expenditure_snapshot(tmp_path, settings, "exp-1", "\n".join([
+        # Three references in one row; the same voucher_no repeats, which is
+        # legitimate -- three payments settled against one voucher.
+        _expenditure_row(
+            s_no="1", activity="44134242", total="119143.0",
+            v_no="XVFC/2022-23/P/7 | XVFC/2022-23/P/7 | XVFC/2099-00/P/9",
+            v_cost="1028.0 | 1143.0 | 116972.0",
+            v_date="05/07/2023 | 05/07/2023 | 05/07/2023",
+        ),
+    ]))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("acct-1", "egramswaraj_accounting", "acct-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "acct-1", "exp-1"), settings=settings, registry=spec_registry,
+    )
+    assert result.counts["activity_expenditure"] == 1
+    assert result.counts["activity_voucher"] == 3, "one row per voucher reference"
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        rows = con.execute(
+            "SELECT voucher_no, voucher_cost, fiscal_year, voucher_date, voucher_pk IS NOT NULL "
+            "FROM activity_voucher ORDER BY voucher_cost"
+        ).fetchall()
+        assert rows == [
+            ("XVFC/2022-23/P/7", Decimal("1028.00"), "2022-2023", datetime(2023, 7, 5), True),
+            ("XVFC/2022-23/P/7", Decimal("1143.00"), "2022-2023", datetime(2023, 7, 5), True),
+            # Cites a voucher the accounting extract does not reach: kept, and
+            # left unmatched by design (#49, and much commoner under #171).
+            ("XVFC/2099-00/P/9", Decimal("116972.00"), "2099-2100", datetime(2023, 7, 5), False),
+        ]
+        # The bridge resolves to a real expenditure row in every case.
+        assert con.execute(
+            "SELECT count(*) FROM activity_voucher av "
+            "WHERE NOT EXISTS (SELECT 1 FROM activity_expenditure e "
+            "                  WHERE e.expenditure_id = av.expenditure_id)"
+        ).fetchone()[0] == 0
+        # The costs recombine to the row's own stated total.
+        assert con.execute("SELECT sum(voucher_cost) FROM activity_voucher").fetchone()[0] == Decimal("119143.00")
+        assert con.execute("SELECT total_expenditure FROM activity_expenditure").fetchone()[0] == Decimal("119143.00")
+    finally:
+        con.close()
+
+
+def test_expenditure_refuses_misaligned_voucher_cells_rather_than_truncating(tmp_path: Path):
+    """#49 names this: `zip` would silently drop the tail and lose real money."""
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _expenditure_snapshot(tmp_path, settings, "exp-1", "\n".join([
+        _expenditure_row(
+            s_no="1", activity="44134242", total="119143.0",
+            v_no="XVFC/2022-23/P/7 | XVFC/2022-23/P/8 | XVFC/2022-23/P/9",
+            v_cost="1028.0 | 1143.0",          # one short
+            v_date="05/07/2023 | 05/07/2023 | 05/07/2023",
+        ),
+    ]))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    with pytest.raises(transform_module.MisalignedVoucherCells, match="differing lengths"):
+        build(snapshot_ids=("snap-1", "exp-1"), settings=settings, registry=spec_registry)
+
+
+def test_expenditure_lane_refuses_a_repeated_natural_key(tmp_path: Path):
+    """Streaming is only sound while the key stays unique; a repeat must stop it.
+
+    Measured unique across all 4,075,935 rows of the real extract. If that
+    stops being true the lane cannot assign row_ids one row at a time, so it
+    fails loudly instead of publishing two rows with one identity.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    duplicate = _expenditure_row(
+        s_no="1", activity="44134242", total="1.0",
+        v_no="XVFC/2022-23/P/1", v_cost="1.0", v_date="05/07/2023",
+    )
+    with pytest.raises(NormalizationError, match="repeats the key"):
+        _expenditure_snapshot(tmp_path, settings, "exp-1", "\n".join([duplicate, duplicate]))
+
+
+def test_expenditure_names_the_right_vouchers_when_their_expenditure_row_is_dropped(tmp_path: Path):
+    """The orphan-bridge path, which nothing exercised until it was wrong.
+
+    An expenditure line for a GP outside `gram_panchayat` is quarantined by
+    `activity_expenditure`, so its voucher references have no `expenditure_id`
+    to point at and cannot be loaded either. Quarantine has to name *those*
+    vouchers -- selecting them by index membership after a merge picked
+    unrelated rows, because `merge` returns a fresh RangeIndex while `explode`
+    leaves repeated labels.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    # Order and arity are both load-bearing. The dropped row comes FIRST and
+    # carries SEVERAL vouchers, so `explode` emits repeated index labels
+    # (0,0) before the kept row's (1) while `merge` renumbers to 0,1,2. Put
+    # the kept row first, or give each row one voucher, and the broken
+    # index-membership selection happens to pick the right rows anyway --
+    # a test that passes either way pins nothing.
+    _expenditure_snapshot(tmp_path, settings, "exp-1", "\n".join([
+        _expenditure_row(
+            s_no="2", activity="44134243", total="20.0",
+            v_no="ORPHAN/2022-23/P/2 | ORPHAN/2022-23/P/3",
+            v_cost="20.0 | 30.0", v_date="05/07/2023 | 05/07/2023", gp="999",
+        ),
+        _expenditure_row(
+            s_no="1", activity="44134242", total="10.0",
+            v_no="KEPT/2022-23/P/1", v_cost="10.0", v_date="05/07/2023", gp="123",
+        ),
+    ]))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    result = build(snapshot_ids=("snap-1", "exp-1"), settings=settings, registry=spec_registry)
+    assert result.counts["activity_expenditure"] == 1
+    assert result.counts["activity_voucher"] == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT voucher_no FROM activity_voucher").fetchall() == [
+            ("KEPT/2022-23/P/1",),
+        ]
+        # The quarantined key must be the orphan's voucher, not the kept one.
+        assert sorted(con.execute(
+            "SELECT key_value FROM quarantine "
+            "WHERE table_name = 'activity_voucher' AND reason_code = 'orphan_expenditure'"
+        ).fetchall()) == [("ORPHAN/2022-23/P/2",), ("ORPHAN/2022-23/P/3",)]
     finally:
         con.close()

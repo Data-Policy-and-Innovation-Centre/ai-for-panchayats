@@ -158,6 +158,11 @@ def populate(
     # of the scrape snapshots naming the same GPs would quarantine every
     # voucher as an orphan and still finish green (#161).
     voucher_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for a further reason than voucher's: activity_voucher bridges
+    # activity_expenditure to voucher, so it needs expenditure_id AND
+    # voucher_pk to exist. Both are assigned after the loop, so the
+    # expenditure source has to be held until they are.
+    expenditure_frames: list[tuple[str, str, pd.DataFrame]] = []
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -196,6 +201,12 @@ def populate(
                 (source_system, source_run_id, _read(root, tables, "voucher"))
             )
             used.append("voucher")
+
+        if "expenditure" in tables:
+            expenditure_frames.append(
+                (source_system, source_run_id, _read(root, tables, "expenditure"))
+            )
+            used.append("expenditure")
 
         # Every kind independently records its own GP via the same
         # folder-name parser, so the dimension is built from all of them,
@@ -371,6 +382,31 @@ def populate(
         )
         add_count("voucher", insert(con, "voucher", vouchers, batch_size=batch_size))
         next_voucher_pk += len(vouchers)
+
+    # activity_expenditure and its bridge, after voucher so voucher_pk exists
+    # to resolve against. The expenditure_id counter continues from the loop's
+    # `re`-driven call above rather than restarting, so the two paths cannot
+    # both claim id 1 -- the same rule voucher_pk follows across snapshots.
+    for source_system, source_run_id, frame in expenditure_frames:
+        expenditures = transform.activity_expenditure(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            resolutions=resolutions, start_id=next_expenditure_id,
+        )
+        add_count("activity_expenditure", insert(
+            con, "activity_expenditure", expenditures, batch_size=batch_size,
+        ))
+        next_expenditure_id += len(expenditures)
+        # Read back rather than held: voucher may span several snapshots, and
+        # the bridge has to resolve against every voucher in the build, not
+        # only the ones this snapshot happened to carry.
+        voucher_keys = con.execute(
+            "SELECT gp_lgd_code, fiscal_year, voucher_no, voucher_pk FROM voucher"
+        ).fetchdf()
+        add_count("activity_voucher", insert(con, "activity_voucher", transform.activity_voucher(
+            frame, expenditures, voucher_keys, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+        ), batch_size=batch_size))
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
     return counts, quarantine, consumed, unconsumed, resolutions
