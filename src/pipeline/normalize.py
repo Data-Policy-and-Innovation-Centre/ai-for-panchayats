@@ -1102,6 +1102,38 @@ def normalize_egramswaraj(
     )
 
 
+def _checked_record(
+    record: dict[Any, Any], fieldnames: list[str], source_file: str, line_number: int,
+) -> dict[str, Any]:
+    """A CSV record whose width disagrees with the header, rejected.
+
+    `csv.DictReader` neither raises nor marks a ragged line. A short one is
+    padded with None, so a truncated record publishes null money under
+    provenance that says it is fine. A long one -- one unescaped comma in a
+    name -- shifts every later value one column across and parks the overflow
+    under the None key, which `_flatten_scalars` drops (it is a list) and the
+    large-CSV lane's `if k` discards. Either way the row loads, and the
+    reconciliation totals move with nothing to point at (#49).
+
+    Both extracts are rectangular today (4,075,935 x 26 and 6,794 x 99,
+    counted), so this rejects nothing that exists -- it is here for the day
+    the source changes shape.
+    """
+
+    surplus = record.pop(None, None)
+    if surplus is not None or any(value is None for value in record.values()):
+        width = (
+            len(fieldnames) + len(surplus) if surplus is not None
+            else sum(value is not None for value in record.values())
+        )
+        raise NormalizationError(
+            f"{source_file} line {line_number} has {width} field(s) against a "
+            f"{len(fieldnames)}-column header; refusing to publish a record whose "
+            f"columns may be shifted"
+        )
+    return record
+
+
 def normalize_flat_csv(
     run_path: str | Path,
     output_root: str | Path,
@@ -1156,7 +1188,11 @@ def normalize_flat_csv(
                 f"{source_file} has no {key_column!r} column; "
                 f"found {list(reader.fieldnames or ())}"
             )
-        records = list(reader)
+        fieldnames = list(reader.fieldnames)
+        records = [
+            _checked_record(record, fieldnames, source_file, line_number)
+            for line_number, record in enumerate(reader, start=2)
+        ]
 
     # A blank key is not an error here -- 84 of the profile rows carry one, and
     # they must reach the warehouse's quarantine rather than be dropped where
@@ -1302,11 +1338,20 @@ def normalize_accounting(
     total_rows = 0
     paths: list[Path] = []
     pending: list[dict[str, Any]] = []
+    observed_max_buffered_rows = 0
 
     with AtomicParquetPublication(destination) as publication:
         def flush() -> None:
-            nonlocal pending
+            # `pending` only grows between flushes, so its length here is
+            # the peak. This lane batches by file, so the peak overshoots
+            # chunk_size by whatever the file that crossed it carried --
+            # which is the number worth reporting, and why it is observed
+            # rather than inferred. Returning `total_rows`, as both streaming
+            # lanes did, made the diagnostic #109 is measured against unable
+            # to fail (#49).
+            nonlocal pending, observed_max_buffered_rows
             if pending:
+                observed_max_buffered_rows = max(observed_max_buffered_rows, len(pending))
                 paths.extend(publication.write_rows(
                     table_name, pending, chunk_size=chunk_size, schema=schema,
                 ))
@@ -1353,7 +1398,7 @@ def normalize_accounting(
     return NormalizationResult(
         destination, manifest.run_id,
         {table_name: tuple(destination / path for path in paths)},
-        (), total_rows, 0,
+        (), observed_max_buffered_rows, 0,
     )
 
 
@@ -1388,11 +1433,27 @@ def _accounting_rows(
     for array_key, direction in VOUCHER_DIRECTIONS:
         entries = payload.get(array_key)
         if entries is None:
-            continue
+            entries = []
         if not isinstance(entries, list):
             raise NormalizationError(
                 f"accounting payload {source_file} has {array_key!r} as "
                 f"{type(entries).__name__}, expected a list"
+            )
+        # The payload counts its own vouchers, and the canonical manifest
+        # verifies only the rows that were emitted -- so an array that arrived
+        # short, or not at all, publishes as `complete` with the difference
+        # gone and nothing anywhere to point at. Checking the source against
+        # its own declaration is the only thing that can see it (#129).
+        #
+        # This fires on nothing in the current extract: 38,616 payloads, no
+        # absent array, and 3,515,445 declared vouchers against 3,515,445
+        # present. That is the measurement, not an assumption -- and it means
+        # the count is not where #171's missing money went.
+        declared = payload.get(f"{direction}_count")
+        if isinstance(declared, int) and declared != len(entries):
+            raise NormalizationError(
+                f"accounting payload {source_file} declares {declared} "
+                f"{direction}(s) but carries {len(entries)}"
             )
         for entry in entries:
             if not isinstance(entry, dict):
@@ -1502,6 +1563,7 @@ def normalize_large_csv(
     total_rows = 0
     paths: list[Path] = []
     pending: list[dict[str, Any]] = []
+    observed_max_buffered_rows = 0
     seen: set[int] = set()
     destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
 
@@ -1525,14 +1587,16 @@ def normalize_large_csv(
 
         with AtomicParquetPublication(destination) as publication:
             def flush() -> None:
-                nonlocal pending
+                nonlocal pending, observed_max_buffered_rows
                 if pending:
+                    observed_max_buffered_rows = max(observed_max_buffered_rows, len(pending))
                     paths.extend(publication.write_rows(
                         table_name, pending, chunk_size=chunk_size, schema=schema,
                     ))
                     pending = []
 
             for line_number, record in enumerate(reader, start=2):
+                record = _checked_record(record, fieldnames, source_file, line_number)
                 parts = [_blank_to_none(record.get(column)) for column in spec.key_columns]
                 if any(part is None for part in parts):
                     raise NormalizationError(
@@ -1598,7 +1662,7 @@ def normalize_large_csv(
     return NormalizationResult(
         destination, manifest.run_id,
         {table_name: tuple(destination / path for path in paths)},
-        (), total_rows, 0,
+        (), observed_max_buffered_rows, 0,
     )
 
 

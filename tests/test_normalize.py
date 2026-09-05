@@ -994,3 +994,175 @@ def test_a_blank_business_id_is_absent_the_same_way_a_blank_key_part_is(tmp_path
     by_note = {r["note"]: r for r in rows(files(result, "pl")[0])}
     assert by_note["whitespace-only"]["business_id"] is None
     assert by_note["padded"]["business_id"] == "A1"
+
+
+EXPENDITURE_HEADER = (
+    "planYear,stateName,zpName,blockName,gpName,gpCode,planType,approvalDate,planCode,"
+    "planCodeStatus,S.No.,Activity Code,Activity Name,Activity For,Focus Area,"
+    "Approved Cost in Action Plan,Technical Approved Cost,Admin Approved Cost,Scheme Name,"
+    "General,SC,ST,Total Expenditure,Voucher Date,Voucher No,Voucher Cost"
+)
+
+
+def expenditure_row(*, s_no: str = "1", activity: str = "44134242",
+                    total: str = "1028.00") -> str:
+    return (
+        f"2022-2023,Odisha,Koraput,Dasamantapur,Test GP,123,131,,4810158,123,{s_no},"
+        f"{activity},Some work,GEN,Education,200000.00,200000,200000.00,XV Finance Commission,"
+        f"200000,,,{total},05/07/2023,XVFC/2022-23/P/7,1028.00"
+    )
+
+
+def expenditure_run(tmp_path: Path, run_id: str, body: str) -> Path:
+    with RunPublisher(tmp_path / "raw", "egramswaraj_expenditure", run_id) as publisher:
+        publisher.write_payload(
+            "expenditure_all.csv", f"﻿{EXPENDITURE_HEADER}\n{body}".encode(),
+        )
+        return publisher.publish()
+
+
+def test_large_csv_rejects_a_record_wider_than_its_header(tmp_path: Path):
+    """One unescaped comma shifts the money columns, and nothing raises (#49).
+
+    `csv.DictReader` parks the overflow under the None key, which the lane's
+    `if k` then discards -- so the record loads with `Total Expenditure`
+    holding what belonged to `ST`, every later value one column across, and
+    provenance that says the row is fine. The key columns sit ahead of the
+    inserted comma, so the existing key check passes and the only visible
+    effect is a reconciliation total that has quietly moved.
+    """
+
+    shifted = expenditure_row().replace("Some work", "Some, work")
+    run = expenditure_run(tmp_path, "exp-wide", shifted)
+    with pytest.raises(NormalizationError, match="27 field.s. against a 26-column header"):
+        normalize_run(run, tmp_path / "canonical")
+
+
+def test_large_csv_rejects_a_truncated_record(tmp_path: Path):
+    """The other half: DictReader pads a short line with None rather than raising.
+
+    The four key columns are all in the first eleven, so a line truncated
+    after them establishes identity perfectly well and then publishes null
+    money under it.
+    """
+
+    truncated = ",".join(expenditure_row().split(",")[:20])
+    run = expenditure_run(tmp_path, "exp-short", truncated)
+    with pytest.raises(NormalizationError, match="20 field.s. against a 26-column header"):
+        normalize_run(run, tmp_path / "canonical")
+
+
+def test_flat_csv_rejects_a_ragged_record(tmp_path: Path):
+    """The same guard on the sibling lane, which had it too (#123).
+
+    `_flatten_scalars` drops the overflow because it is a list, so a shifted
+    profile row would publish one population figure under another's column.
+    """
+
+    run = profile_run(tmp_path, "profile-ragged", "115550,Anga,rbandha,120")
+    with pytest.raises(NormalizationError, match="4 field.s. against a 3-column header"):
+        normalize_run(run, tmp_path / "canonical")
+
+    short = profile_run(tmp_path, "profile-short", "115550,Angarbandha")
+    with pytest.raises(NormalizationError, match="2 field.s. against a 3-column header"):
+        normalize_run(short, tmp_path / "canonical")
+
+
+def test_large_csv_reports_the_peak_it_buffered_not_the_row_count(tmp_path: Path):
+    """The streaming claim has to be checkable, and this is the only thing checking it.
+
+    `max_buffered_rows` is what `scripts/benchmark_normalize.py` records and
+    what #109 is measured against. Returning `total_rows` made the
+    4,075,935-row production run report 4,075,935 rows buffered against a
+    chunk_size of 100,000 -- a diagnostic that cannot fail, and so cannot
+    detect the lane silently ceasing to stream.
+    """
+
+    run = expenditure_run(tmp_path, "exp-peak", "\n".join(
+        expenditure_row(s_no=str(n), activity=f"441342{n:02d}") for n in range(1, 11)
+    ))
+    result = normalize_run(run, tmp_path / "canonical", chunk_size=3)
+
+    assert result.tables["expenditure"], "the run published rows"
+    assert result.max_buffered_rows == 3, (
+        f"buffered {result.max_buffered_rows} rows against a chunk_size of 3"
+    )
+
+
+def accounting_run(tmp_path: Path, run_id: str, files_by_name: dict[str, int]) -> Path:
+    """One accounting payload per name, carrying `n` payment vouchers each."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_accounting", run_id) as publisher:
+        for name, count in files_by_name.items():
+            publisher.write_payload(name, json.dumps({
+                "gp_name": "Test GP", "gp_lgd_code": "123", "state": "21",
+                "district_name": "Deogarh", "district_code": "310",
+                "block_name": "Barkote", "block_code": "3709",
+                "year": "2022-2023", "status": "ok",
+                "receipt_count": 0, "payment_count": count,
+                "total_receipts": 0.0, "total_payments": 0.0, "opening_balance": 0.0,
+                "receipts": [],
+                "payments": [
+                    {"month": "April", "date": "03/04/2022", "voucher_no": f"{name}-{n}",
+                     "type": "Expenditures", "amount": 10.0, "voucher_id": str(n)}
+                    for n in range(count)
+                ],
+            }).encode())
+        return publisher.publish()
+
+
+def test_accounting_reports_the_peak_it_buffered_not_the_row_count(tmp_path: Path):
+    """The sibling streaming lane had the same defect, uncited (#129).
+
+    This lane batches by file, so its peak is neither `total_rows` nor
+    `chunk_size` -- it overshoots the bound by whatever the file that crossed
+    it carried. That is the number worth reporting, and the reason the peak
+    has to be observed rather than inferred from the configured chunk_size.
+    """
+
+    run = accounting_run(tmp_path, "acct-peak", {f"a/{n}.json": 3 for n in range(4)})
+    result = normalize_run(run, tmp_path / "canonical", chunk_size=5)
+
+    assert result.tables["voucher"], "the run published rows"
+    assert result.max_buffered_rows == 6, (
+        "two 3-voucher files cross a chunk_size of 5, so the peak is 6 -- "
+        f"got {result.max_buffered_rows}"
+    )
+
+
+def test_accounting_rejects_a_payload_that_contradicts_its_own_count(tmp_path: Path):
+    """A short or absent array publishes as complete, and nothing downstream can tell (#129).
+
+    The canonical manifest verifies the rows that were emitted, so a payload
+    declaring 3 payments and carrying 1 -- or carrying no `payments` key at
+    all -- produces a valid, `complete` snapshot with the difference simply
+    gone. The payload's own declared count is the only witness, which is why
+    it has to be read rather than trusted.
+    """
+
+    def run(run_id: str, body: dict) -> Path:
+        with RunPublisher(tmp_path / "raw", "egramswaraj_accounting", run_id) as publisher:
+            publisher.write_payload("a/1.json", json.dumps({
+                "gp_lgd_code": "123", "gp_name": "Test GP", "year": "2022-2023",
+                "receipt_count": 0, "receipts": [], **body,
+            }).encode())
+            return publisher.publish()
+
+    voucher = {"month": "April", "date": "03/04/2022", "voucher_no": "V1",
+               "type": "Expenditures", "amount": 10.0, "voucher_id": "1"}
+
+    short = run("acct-short", {"payment_count": 3, "payments": [voucher]})
+    with pytest.raises(NormalizationError, match="declares 3 payment.s. but carries 1"):
+        normalize_run(short, tmp_path / "canonical")
+
+    # The absent-array case is the one the lane used to skip outright.
+    absent = run("acct-absent", {"payment_count": 3})
+    with pytest.raises(NormalizationError, match="declares 3 payment.s. but carries 0"):
+        normalize_run(absent, tmp_path / "canonical")
+
+    # A payload that agrees with itself still loads, including one that
+    # genuinely carries nothing and says so.
+    agrees = run("acct-ok", {"payment_count": 1, "payments": [voucher]})
+    assert len(rows(files(normalize_run(agrees, tmp_path / "canonical"), "voucher")[0])) == 1
+    empty = run("acct-empty", {"payment_count": 0})
+    assert normalize_run(empty, tmp_path / "canonical").tables["voucher"]
