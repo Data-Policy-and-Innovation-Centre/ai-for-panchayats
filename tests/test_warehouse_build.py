@@ -1358,3 +1358,126 @@ def test_expenditure_names_the_right_vouchers_when_their_expenditure_row_is_drop
         ).fetchall()) == [("ORPHAN/2022-23/P/2",), ("ORPHAN/2022-23/P/3",)]
     finally:
         con.close()
+
+
+def test_a_second_accounting_snapshot_does_not_collide_on_the_unique_key(tmp_path: Path):
+    """Two snapshots may legitimately overlap; the build must survive it (Codex, #173).
+
+    `_dedupe` only sees one frame. Two accounting snapshots can each carry the
+    same (gp, year, voucher_no) -- exactly what #171's remedy produces, since
+    re-scraping the 358 missing GPs yields a second run alongside the first --
+    and each survives its own dedupe, so the second insert hits voucher's
+    UNIQUE constraint and aborts the whole build.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    shared = _voucher("XVFC/2022-23/P/1", 100.0)
+    for run in ("acct-1", "acct-2"):
+        _accounting_snapshot(tmp_path, settings, run, {
+            "a/b/One/2022-2023.json": _accounting_payload(
+                "123", "2022-2023", receipts=[],
+                # The overlap, plus one row unique to each run so neither
+                # snapshot is wholly redundant.
+                payments=[shared, _voucher(f"XVFC/2022-23/P/{run[-1]}0", 5.0)],
+            ),
+        })
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("acct-1", "egramswaraj_accounting", "acct-1"),
+        approved("acct-2", "egramswaraj_accounting", "acct-2"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "acct-1", "acct-2"), settings=settings, registry=spec_registry,
+    )
+    # Three distinct vouchers across two snapshots: the shared one once, plus
+    # one unique to each run.
+    assert result.counts["voucher"] == 3
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        total, distinct = con.execute(
+            "SELECT count(*), count(DISTINCT (gp_lgd_code, fiscal_year, voucher_no)) FROM voucher"
+        ).fetchone()
+        assert total == distinct == 3
+        # voucher_pk stays dense: the collision is dropped before ids are
+        # assigned, so activity_voucher's foreign key has no gaps.
+        assert con.execute(
+            "SELECT min(voucher_pk), max(voucher_pk), count(DISTINCT voucher_pk) FROM voucher"
+        ).fetchone() == (1, 3, 3)
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'voucher' "
+            "AND reason_code = 'cross_snapshot_duplicate_key'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_a_voucher_position_with_a_cost_but_no_number_is_quarantined_not_dropped(tmp_path: Path):
+    """Equal cell counts can still hide a missing voucher number (Codex, #174).
+
+    `V1||V3` against three costs passes the length check, and filtering on a
+    non-empty voucher number alone then discards the middle payment silently
+    -- making sum(voucher_cost) fall below the row's own total_expenditure,
+    which is the arithmetic anyone would use to check this table.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _expenditure_snapshot(tmp_path, settings, "exp-1", "\n".join([
+        _expenditure_row(
+            s_no="1", activity="44134242", total="600.0",
+            v_no="XVFC/2022-23/P/1 |  | XVFC/2022-23/P/3",
+            v_cost="100.0 | 200.0 | 300.0",
+            v_date="05/07/2023 | 05/07/2023 | 05/07/2023",
+        ),
+    ]))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    result = build(snapshot_ids=("snap-1", "exp-1"), settings=settings, registry=spec_registry)
+    assert result.counts["activity_voucher"] == 2
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        # The 200.00 payment is absent from the bridge -- and *counted*, so the
+        # shortfall against total_expenditure is explained rather than silent.
+        assert con.execute("SELECT sum(voucher_cost) FROM activity_voucher").fetchone()[0] == Decimal("400.00")
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'activity_voucher' "
+            "AND reason_code = 'partial_voucher_slot'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_a_second_profile_snapshot_does_not_collide_on_the_primary_key(tmp_path: Path):
+    """gp_profile had voucher's cross-snapshot defect too, since #123.
+
+    Found by reviewing the sibling rather than by report: `_dedupe` sees one
+    frame, so two profile snapshots both carrying a GP each survive their own
+    dedupe and the second insert hits gp_lgd_code's PRIMARY KEY.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    for run in ("profile-1", "profile-2"):
+        _profile_snapshot(tmp_path, settings, run, PROFILE_BODY)
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("profile-1", "egramswaraj_profile", "profile-1"),
+        approved("profile-2", "egramswaraj_profile", "profile-2"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "profile-1", "profile-2"),
+        settings=settings, registry=spec_registry,
+    )
+    assert result.counts["gp_profile"] == 1
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM gp_profile").fetchone()[0] == 1
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'gp_profile' "
+            "AND reason_code = 'cross_snapshot_duplicate_key'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()

@@ -363,25 +363,34 @@ def populate(
 
     # After the loop, deliberately: see profile_frames above.
     all_gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+    loaded_profile_keys: set[str] = set()
     for source_system, source_run_id, frame in profile_frames:
-        add_count("gp_profile", insert(con, "gp_profile", transform.gp_profile(
+        profiles = transform.gp_profile(
             frame, all_gp_codes, quarantine,
             source_system=source_system, source_run_id=source_run_id,
-        ), batch_size=batch_size))
+            loaded_keys=loaded_profile_keys,
+        )
+        add_count("gp_profile", insert(con, "gp_profile", profiles, batch_size=batch_size))
+        loaded_profile_keys.update(profiles["gp_lgd_code"])
 
     # voucher_pk advances across snapshots the same way expenditure_id and
     # nsap_id do inside the loop: the counter is the caller's, so two
     # accounting snapshots in one build cannot both claim id 1 and collide on
     # the INTEGER PRIMARY KEY.
     next_voucher_pk = 1
+    loaded_voucher_keys: set[tuple[str, str, str]] = set()
     for source_system, source_run_id, frame in voucher_frames:
         vouchers = transform.voucher(
             frame, all_gp_codes, quarantine,
             source_system=source_system, source_run_id=source_run_id,
-            start_id=next_voucher_pk,
+            start_id=next_voucher_pk, loaded_keys=loaded_voucher_keys,
         )
         add_count("voucher", insert(con, "voucher", vouchers, batch_size=batch_size))
         next_voucher_pk += len(vouchers)
+        loaded_voucher_keys.update(zip(
+            vouchers["gp_lgd_code"], vouchers["fiscal_year"], vouchers["voucher_no"],
+            strict=True,
+        ))
 
     # activity_expenditure and its bridge, after voucher so voucher_pk exists
     # to resolve against. The expenditure_id counter continues from the loop's

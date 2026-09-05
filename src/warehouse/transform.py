@@ -511,9 +511,30 @@ def activity_voucher(
         )
 
     exploded = frame.assign(**split).explode(list(AV_PIPE_COLUMNS.values()))
-    # Rows whose voucher cells were entirely blank explode to one empty
-    # string; they cite no voucher and are not references at all.
-    exploded = exploded[exploded["voucher_no"].astype("string").str.len() > 0]
+    def _blank(column: str) -> pd.Series:
+        return exploded[column].astype("string").fillna("").str.strip() == ""
+
+    # A position with nothing in any of the three cells is not a voucher
+    # reference at all -- a row citing no vouchers explodes to one empty
+    # position -- and is dropped silently.
+    #
+    # A position with a blank voucher_no but a populated cost or date is a
+    # different thing entirely: a payment whose voucher number is missing.
+    # Dropping it silently (as `str.len() > 0` alone did) would make
+    # sum(voucher_cost) quietly fall below the expenditure row's own
+    # total_expenditure, which is the one arithmetic anybody would use to
+    # check this table. Quarantined instead, keyed by activity_code since the
+    # voucher number is exactly what it lacks.
+    all_blank = _blank("voucher_no") & _blank("voucher_cost") & _blank("voucher_date")
+    partial = _blank("voucher_no") & ~all_blank
+    if partial.any():
+        quarantine.add(
+            "activity_voucher", "partial_voucher_slot",
+            "voucher position has a cost or date but no voucher number",
+            "activity_code", exploded.loc[partial, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    exploded = exploded[~all_blank & ~partial]
     if exploded.empty:
         return pd.DataFrame(columns=ACTIVITY_VOUCHER_COLUMNS)
 
@@ -551,6 +572,7 @@ def activity_voucher(
 def voucher(
     frame: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
     *, source_system: str, source_run_id: str, start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shape one voucher frame and assign its voucher_pk (#46, #129).
 
@@ -619,6 +641,30 @@ def voucher(
         out, "voucher", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    # `_dedupe` above only sees this frame. Two accounting snapshots in one
+    # build can each hold the same (gp, year, voucher_no) -- legitimately, if
+    # a later run re-scrapes GPs the first one covered -- and each would
+    # survive its own dedupe, so the second insert would hit the table's
+    # UNIQUE constraint and abort the build. Checked against what earlier
+    # snapshots already inserted, the way `_merge_gram_panchayat` does for the
+    # conformed dimension, and passed in as a set the way `_restrict` takes
+    # `gp_codes`. Filtered before ids are handed out, so voucher_pk stays
+    # dense and activity_voucher's foreign key has no gaps to explain.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                out["gp_lgd_code"], out["fiscal_year"], out["voucher_no"], strict=True,
+            )],
+            index=out.index,
+        )
+        if already.any():
+            quarantine.add(
+                "voucher", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this voucher",
+                "voucher_no", out.loc[already, "voucher_no"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
     out = out.sort_values(
         ["gp_lgd_code", "fiscal_year", "voucher_no"], kind="mergesort",
     ).reset_index(drop=True)
@@ -629,7 +675,8 @@ def voucher(
 
 
 def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
-               *, source_system: str, source_run_id: str) -> pd.DataFrame:
+               *, source_system: str, source_run_id: str,
+               loaded_keys: set[str] | None = None) -> pd.DataFrame:
     """One row per GP, from the panchayat profile extract (#123).
 
     Two rejections, kept apart because they mean different things:
@@ -720,6 +767,20 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
         out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id,
     )
+    # The same cross-snapshot collision `voucher` guards against, and for the
+    # same reason: `_dedupe` sees one frame, but two profile snapshots in one
+    # build can both carry a GP and the second insert would hit gp_lgd_code's
+    # PRIMARY KEY. Present since #123; found by reviewing the sibling.
+    if loaded_keys:
+        already = out["gp_lgd_code"].isin(loaded_keys)
+        if already.any():
+            quarantine.add(
+                "gp_profile", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this GP's profile",
+                "gp_lgd_code", out.loc[already, "gp_lgd_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
 
     bad = unreadable.reindex(out.index, fill_value=False)
     if bad.any():
