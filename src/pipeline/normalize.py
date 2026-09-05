@@ -44,6 +44,36 @@ GP_RE = re.compile(r"^LGD[_-]?(?P<code>\d+)[_-](?P<name>.+)$", re.IGNORECASE)
 FLAT_CSV_SOURCES: dict[str, tuple[str, str]] = {
     "egramswaraj_profile": ("PROFILE", "basic_info_lgd"),
 }
+# Nested per-GP-per-year accounting JSON, published as its own raw run (#129).
+# Keyed by the raw run's `source`, exactly as FLAT_CSV_SOURCES is, so
+# `normalize_run` picks the lane from the manifest rather than a CLI flag.
+#
+# Not a `SUPPORTED_KINDS` entry, despite #129's wording. That set drives the
+# eGramSwaraj lane, which finds a GP by parsing `LGD_<code>_<name>` out of a
+# parent directory and a kind out of the filename. The accounting tree is
+# `District/Block/GP/YYYY-YYYY.json` -- neither pattern matches, and every
+# file would be skipped as unrecognized. The GP is carried *inside* the
+# payload as `gp_lgd_code`, which is also the safer source: 505 GP names are
+# shared, so a name-derived path could not identify a GP at all.
+NESTED_JSON_SOURCES: dict[str, str] = {
+    "egramswaraj_accounting": "VOUCHER",
+}
+# The two arrays a single accounting file carries, and the `direction` each
+# one means. The warehouse's `voucher.direction` CHECK admits exactly these
+# two spellings.
+VOUCHER_DIRECTIONS: tuple[tuple[str, str], ...] = (
+    ("receipts", "receipt"),
+    ("payments", "payment"),
+)
+# Per-voucher fields kept from each array element. The file's sibling
+# `receipt_count`/`payment_count`/`total_receipts`/`total_payments` keys are
+# deliberately NOT here: they are per-GP-per-year aggregates repeated
+# alongside every voucher, and #46 records that summing them once per voucher
+# row is the specific mistake to avoid. They are recomputable from the rows
+# themselves, so carrying them would add a second, disagreeing answer.
+VOUCHER_FIELDS: tuple[str, ...] = (
+    "month", "date", "voucher_no", "type", "amount", "voucher_id",
+)
 ID_KEYS = ("activityCd", "activity_cd", "activityId", "activity_id", "id")
 # Identity keys for child collections, by the array's own JSON key (#163).
 #
@@ -1169,6 +1199,213 @@ def normalize_flat_csv(
     )
 
 
+def normalize_accounting(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    source_kind: str,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize a nested per-GP-per-year accounting run to canonical Parquet (#129).
+
+    A third lane, for the same reason the flat-CSV lane is a second one: the
+    input shares nothing with the eGramSwaraj walk but its output contract.
+    Each payload is one GP and one fiscal year, holding independent
+    ``receipts`` and ``payments`` arrays; one canonical row is emitted per
+    voucher, tagged with the ``direction`` its array means.
+
+    **Money is carried as source text, not as a float.** ``json.load`` is
+    given ``parse_float=str``, so ``"amount": 44280.0`` reaches Parquet as
+    ``"44280.0"`` and the warehouse parses it with ``clean.to_decimal_money``
+    into an exact ``Decimal``. This is not defensive habit: #46's acceptance
+    is a rupee total matching to the paisa, and this source has ~3.7M rows.
+    Binary floating point accumulated over that many addends does not
+    reliably reproduce a decimal total, and the error would appear as a
+    reconciliation failure with no bad row to point at.
+
+    **The schema is declared, not inferred.** The other two lanes see every
+    row before writing and can merge observed types. Streaming a 657 MB tree
+    means writing the first batch before the last file is read, so the type
+    of a column cannot depend on rows not yet seen -- a late file whose
+    ``voucher_id`` happened to be numeric would otherwise change a column's
+    type midway and produce parts that will not read back as one table.
+
+    Rows are written in batches as files are read, so the whole tree is never
+    resident. The identity pass is per file, which is sound here and is not
+    in the flat-CSV lane: a canonical ``row_id`` already mixes in the source
+    file, and one file is exactly one GP and fiscal year, so two vouchers can
+    only collide if they collide *within* that pair -- which is precisely the
+    natural key ``(gp_lgd_code, fiscal_year, voucher_no)`` that #46 verified
+    unique. A repeat inside one file is still refined by content rather than
+    silently deduplicated, because a genuine duplicate is a source defect for
+    the warehouse's quarantine to count, not for this lane to hide.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    json_paths = sorted(payload_root.rglob("*.json"))
+    if not json_paths:
+        raise NormalizationError(f"accounting run publishes no .json payloads: {payload_root}")
+
+    table_name = source_kind.lower()
+    types = dict(PROVENANCE_SCHEMA)
+    for column in ("direction", *VOUCHER_FIELDS):
+        types[column] = pa.string()
+    schema = _arrow_schema(types)
+
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+    total_rows = 0
+    paths: list[Path] = []
+    pending: list[dict[str, Any]] = []
+
+    with AtomicParquetPublication(destination) as publication:
+        def flush() -> None:
+            nonlocal pending
+            if pending:
+                paths.extend(publication.write_rows(
+                    table_name, pending, chunk_size=chunk_size, schema=schema,
+                ))
+                pending = []
+
+        for json_path in json_paths:
+            source_file = json_path.relative_to(payload_root).as_posix()
+            rows = _accounting_rows(json_path, source_file, manifest, source_kind)
+            total_rows += len(rows)
+            pending.extend(rows)
+            # Batched by row count rather than by file: a per-file flush would
+            # write ~38,600 tiny Parquet parts, and one flush at the end would
+            # defeat the streaming this lane exists for.
+            if len(pending) >= chunk_size:
+                flush()
+        flush()
+
+        if not paths:
+            paths.extend(publication.write_empty(table_name, schema))
+        canonical = {
+            "source": manifest.source,
+            "run_id": manifest.run_id,
+            "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+            "raw_manifest_identity": {
+                "source": manifest.source, "run_id": manifest.run_id,
+                "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+            },
+            "schema_version": manifest.schema_version,
+            "tables": {
+                table_name: {
+                    "row_count": total_rows,
+                    "files": [
+                        _canonical_file_record(publication.staging_root, path)
+                        for path in paths
+                    ],
+                },
+            },
+            "quarantine_count": 0,
+            "terminal_state": "complete",
+        }
+        publication.write_canonical_manifest(canonical)
+        validate_canonical_manifest(publication.staging_root)
+        publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), total_rows, 0,
+    )
+
+
+def _accounting_rows(
+    json_path: Path, source_file: str, manifest: RunManifest, source_kind: str,
+) -> list[dict[str, Any]]:
+    """One canonical row per voucher in a single GP/fiscal-year payload."""
+
+    try:
+        # parse_float=str keeps the source's exact decimal text; see the
+        # money note in `normalize_accounting`.
+        payload = json.loads(json_path.read_text(encoding="utf-8"), parse_float=str)
+    except (OSError, json.JSONDecodeError) as error:
+        raise NormalizationError(f"unreadable accounting payload {source_file}: {error}") from error
+    if not isinstance(payload, dict):
+        raise NormalizationError(
+            f"accounting payload {source_file} is {type(payload).__name__}, expected an object"
+        )
+
+    gp_code = _blank_to_none(payload.get("gp_lgd_code"))
+    gp_name = _blank_to_none(payload.get("gp_name"))
+    year = _blank_to_none(payload.get("year"))
+    # A payload naming no GP cannot be attributed, and the file path cannot
+    # stand in for it: the tree is keyed by GP *name*, and 505 of those are
+    # shared. Loading such a row would attach real money to a guess.
+    if gp_code is None:
+        raise NormalizationError(f"accounting payload {source_file} carries no gp_lgd_code")
+    if year is None:
+        raise NormalizationError(f"accounting payload {source_file} carries no year")
+
+    records: list[tuple[str, Mapping[str, Any]]] = []
+    for array_key, direction in VOUCHER_DIRECTIONS:
+        entries = payload.get(array_key)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise NormalizationError(
+                f"accounting payload {source_file} has {array_key!r} as "
+                f"{type(entries).__name__}, expected a list"
+            )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise NormalizationError(
+                    f"accounting payload {source_file} has a non-object entry in {array_key!r}"
+                )
+            records.append((direction, entry))
+
+    business_ids = [_blank_to_none(entry.get("voucher_no")) for _, entry in records]
+    identities = [
+        _record_identity(entry, business_id)
+        for (_, entry), business_id in zip(records, business_ids)
+    ]
+    repeated = _repeated_identities(identities)
+
+    rows: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}
+    for (direction, entry), business_id, identity in zip(records, business_ids, identities):
+        identity = _refine_identity(entry, identity, repeated)
+        seen = occurrences.get(identity, 0)
+        occurrences[identity] = seen + 1
+        row_id = hashlib.sha256("|".join(
+            (manifest.source, source_kind, source_file, gp_code, year,
+             _occurrence_key(identity, seen))
+        ).encode("utf-8")).hexdigest()
+        row: dict[str, Any] = {"direction": direction}
+        for column in VOUCHER_FIELDS:
+            row[column] = _blank_to_none(entry.get(column))
+        row.update(_provenance(
+            manifest=manifest, source_file=source_file, source_kind=source_kind,
+            year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,
+            source_record_id=row_id, parent_row_id=None, pos=None,
+            business_id=business_id,
+        ))
+        rows.append(row)
+    return rows
+
+
+def _blank_to_none(value: Any) -> str | None:
+    """Source text, stripped; blank-after-stripping is absent.
+
+    The same test `_business_id` and `_collection_key` apply, so a padded
+    voucher number cannot become an identity that differs from its own
+    stripped spelling in the warehouse (every code column goes through
+    `clean.to_code`, which strips).
+    """
+
+    if value is None or isinstance(value, (list, dict)):
+        return None
+    text = value.strip() if isinstance(value, str) else str(value)
+    return text or None
+
+
 def normalize_run(
     run_path: str | Path, output_root: str | Path, **kwargs: Any,
 ) -> NormalizationResult:
@@ -1182,6 +1419,10 @@ def normalize_run(
     """
 
     source = load_manifest(run_path).source.casefold()
+    nested = NESTED_JSON_SOURCES.get(source)
+    if nested is not None:
+        kwargs.pop("kinds", None)
+        return normalize_accounting(run_path, output_root, source_kind=nested, **kwargs)
     flat = FLAT_CSV_SOURCES.get(source)
     if flat is None:
         return normalize_egramswaraj(run_path, output_root, **kwargs)

@@ -9,6 +9,8 @@ as required coverage.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -1026,5 +1028,154 @@ def test_admin_approval_scheme_activity_code_is_cleaned_like_every_other_one(tmp
             "SELECT s.activity_code FROM admin_approval_scheme s"
             " JOIN planned_activity a ON a.activity_code = s.activity_code"
         ).fetchall() == [("7",)], "scheme activity_code must join planned_activity"
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------- voucher (#46, #129)
+
+def _accounting_payload(gp_code: str, year: str, receipts: list[dict], payments: list[dict]) -> bytes:
+    return json.dumps({
+        "gp_name": "Test GP", "gp_lgd_code": gp_code, "state": "21",
+        "district_name": "Deogarh", "district_code": "310",
+        "block_name": "Barkote", "block_code": "3709",
+        "year": year, "status": "ok",
+        "receipt_count": len(receipts), "payment_count": len(payments),
+        "total_receipts": 0.0, "total_payments": 0.0,
+        "receipts": receipts, "payments": payments, "opening_balance": 0.0,
+    }).encode()
+
+
+def _voucher(no: str, amount, *, vid: str = "1", vtype: str = "Expenditures",
+             date: str = "03/04/2022", month: str = "April") -> dict:
+    return {"month": month, "date": date, "voucher_no": no,
+            "type": vtype, "amount": amount, "voucher_id": vid}
+
+
+def _accounting_snapshot(tmp_path: Path, settings, run_id: str,
+                         payloads: dict[str, bytes]) -> None:
+    """Publish and normalize a nested accounting run into the build's canonical root."""
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_accounting", run_id) as publisher:
+        for name, body in payloads.items():
+            publisher.write_payload(name, body)
+        run = publisher.publish()
+    normalize_run(run, settings.canonical_root)
+
+
+def test_voucher_loads_receipts_and_payments_with_their_direction(tmp_path: Path):
+    """Both arrays reach one table, each tagged with what it means (#129).
+
+    The shape that makes this worth asserting: a receipt and a payment can
+    carry the *same* voucher number within a GP and year only if they differ
+    elsewhere, and the ledger is meaningless if the two sides are not told
+    apart. Also pins that money survives as an exact Decimal rather than a
+    float -- #46's acceptance is a total matching to the paisa.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _accounting_snapshot(tmp_path, settings, "acct-1", {
+        "Deogarh/Barkote/Test/2022-2023.json": _accounting_payload(
+            "123", "2022-2023",
+            receipts=[_voucher("XVFC/2022-23/R/1", 304690.55, vtype="Direct Receipts")],
+            payments=[_voucher("XVFC/2022-23/P/1", 44280.45)],
+        ),
+    })
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("acct-1", "egramswaraj_accounting", "acct-1"),
+    )
+    result = build(snapshot_ids=("snap-1", "acct-1"), settings=settings, registry=spec_registry)
+    assert result.counts["voucher"] == 2
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT direction, voucher_no, amount FROM voucher ORDER BY voucher_no"
+        ).fetchall() == [
+            ("payment", "XVFC/2022-23/P/1", Decimal("44280.45")),
+            ("receipt", "XVFC/2022-23/R/1", Decimal("304690.55")),
+        ]
+        # Exact to the paisa: the pair sums without binary-float drift.
+        assert con.execute("SELECT sum(amount) FROM voucher").fetchone()[0] == Decimal("348971.00")
+        # dayfirst: 03/04/2022 is 3 April, not 4 March.
+        assert con.execute("SELECT DISTINCT date FROM voucher").fetchall() == [
+            (datetime(2022, 4, 3),),
+        ]
+    finally:
+        con.close()
+
+
+def test_voucher_id_repeats_across_gps_but_voucher_pk_does_not(tmp_path: Path):
+    """#46's named acceptance: voucher_id is not the key and never becomes one.
+
+    It repeats across GP, year and direction in the real extract -- a
+    portal-internal sequence unique only within a GP. Keying on it would
+    merge unrelated vouchers from different panchayats into one row.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _accounting_snapshot(tmp_path, settings, "acct-1", {
+        # Same voucher_id "7", and the same voucher_no, in two different GPs
+        # and two different years. Four rows, four distinct voucher_pk.
+        "a/b/One/2022-2023.json": _accounting_payload(
+            "123", "2022-2023", receipts=[],
+            payments=[_voucher("V/1", 100.0, vid="7"), _voucher("V/2", 200.0, vid="7")],
+        ),
+        "a/b/Two/2023-2024.json": _accounting_payload(
+            "456", "2023-2024", receipts=[],
+            payments=[_voucher("V/1", 300.0, vid="7"), _voucher("V/2", 400.0, vid="7")],
+        ),
+    })
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("acct-1", "egramswaraj_accounting", "acct-1"),
+    )
+    result = build(snapshot_ids=("snap-1", "acct-1"), settings=settings, registry=spec_registry)
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        # GP 456 is not in gram_panchayat, so its two rows are orphans; the
+        # point stands on the pair that loads plus the pair that is counted.
+        assert con.execute("SELECT count(DISTINCT voucher_id) FROM voucher").fetchone()[0] == 1
+        total, distinct = con.execute(
+            "SELECT count(*), count(DISTINCT voucher_pk) FROM voucher"
+        ).fetchone()
+        assert total == distinct, "voucher_pk must be unique even when voucher_id is not"
+        assert con.execute(
+            "SELECT count(*) FROM quarantine WHERE table_name = 'voucher' AND reason_code = 'orphan_gp'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_voucher_quarantines_a_duplicate_natural_key_rather_than_failing_the_insert(tmp_path: Path):
+    """The UNIQUE constraint is real, so a collision must not reach it.
+
+    Two rows sharing (gp_lgd_code, fiscal_year, voucher_no) would abort the
+    whole insert and take every good voucher with them. Quarantined instead,
+    where the count stays visible.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    _accounting_snapshot(tmp_path, settings, "acct-1", {
+        "a/b/One/2022-2023.json": _accounting_payload(
+            "123", "2022-2023", receipts=[],
+            payments=[_voucher("V/1", 100.0, vid="1"), _voucher("V/1", 999.0, vid="2")],
+        ),
+    })
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("acct-1", "egramswaraj_accounting", "acct-1"),
+    )
+    result = build(snapshot_ids=("snap-1", "acct-1"), settings=settings, registry=spec_registry)
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM voucher").fetchone()[0] == 1
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine "
+            "WHERE table_name = 'voucher' AND reason_code = 'conflicting_duplicate_key'"
+        ).fetchone()[0] == 1
     finally:
         con.close()

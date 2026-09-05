@@ -153,6 +153,11 @@ def populate(
     # #161 is open about elsewhere in this function. Deferring is the whole
     # fix here: one row per GP, no per-snapshot state, nothing to interleave.
     profile_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for exactly the reason profile_frames is: voucher has a
+    # FOREIGN KEY to gram_panchayat, so loading an accounting snapshot ahead
+    # of the scrape snapshots naming the same GPs would quarantine every
+    # voucher as an orphan and still finish green (#161).
+    voucher_frames: list[tuple[str, str, pd.DataFrame]] = []
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -185,6 +190,12 @@ def populate(
                 (source_system, source_run_id, _read(root, tables, "profile"))
             )
             used.append("profile")
+
+        if "voucher" in tables:
+            voucher_frames.append(
+                (source_system, source_run_id, _read(root, tables, "voucher"))
+            )
+            used.append("voucher")
 
         # Every kind independently records its own GP via the same
         # folder-name parser, so the dimension is built from all of them,
@@ -346,6 +357,20 @@ def populate(
             frame, all_gp_codes, quarantine,
             source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
+
+    # voucher_pk advances across snapshots the same way expenditure_id and
+    # nsap_id do inside the loop: the counter is the caller's, so two
+    # accounting snapshots in one build cannot both claim id 1 and collide on
+    # the INTEGER PRIMARY KEY.
+    next_voucher_pk = 1
+    for source_system, source_run_id, frame in voucher_frames:
+        vouchers = transform.voucher(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            start_id=next_voucher_pk,
+        )
+        add_count("voucher", insert(con, "voucher", vouchers, batch_size=batch_size))
+        next_voucher_pk += len(vouchers)
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
     return counts, quarantine, consumed, unconsumed, resolutions

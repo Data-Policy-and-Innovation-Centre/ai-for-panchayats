@@ -402,6 +402,91 @@ GP_PROFILE_COLUMNS = [
 ]
 
 
+VOUCHER_COLUMNS: list[str] = [
+    "gp_lgd_code", "fiscal_year", "voucher_no", "voucher_id",
+    "direction", "type", "date", "month", "amount",
+]
+
+def voucher(
+    frame: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+    *, source_system: str, source_run_id: str, start_id: int = 1,
+) -> pd.DataFrame:
+    """Shape one voucher frame and assign its voucher_pk (#46, #129).
+
+    ``voucher_pk`` is an INTEGER surrogate assigned exactly the way
+    ``activity_expenditure.expenditure_id`` is: contiguously from
+    ``start_id``, *after* every quarantine step, so ids are dense and 1:1
+    with the rows returned, and the caller advances ``start_id`` between
+    snapshots. Mirrored rather than reinvented -- #129 asks for the
+    deterministic assignment #69 built with a SQLite ``ROW_NUMBER``, and the
+    property that actually matters (ids independent of chunk size and
+    iteration order) already holds here, because the frame is fully
+    materialised and sorted before ids are handed out.
+
+    ``voucher_id`` is **not** the key and is never treated as one. #46
+    verified it repeats across 116 distinct GP/year/direction combinations:
+    it is a portal-internal sequence, unique only within a GP. The real
+    identity is ``(gp_lgd_code, fiscal_year, voucher_no)``, which the DDL
+    carries as a UNIQUE constraint, so a collision has to reach quarantine
+    rather than fail the insert.
+
+    Rows are sorted by that natural key before ids are assigned. Without it
+    ``voucher_pk`` would follow the order files happened to be walked in, and
+    two builds of the same snapshot could disagree about which voucher is 7 --
+    which matters because ``activity_voucher.voucher_pk`` (#49) is a foreign
+    key into this table.
+    """
+
+    columns = ["voucher_pk"] + VOUCHER_COLUMNS
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame({
+        "source_system": frame["source_system"],
+        "source_run_id": frame["source_run_id"],
+        "gp_lgd_code": to_code(frame["gp_code"]),
+        "fiscal_year": frame["fiscal_year"],
+    })
+    for column in ("voucher_no", "voucher_id", "direction", "type", "month"):
+        out[column] = _ensure_columns(frame, [column])[column]
+    out["amount"] = to_decimal_money(_ensure_columns(frame, ["amount"])["amount"])
+    # dayfirst because the source writes DD/MM/YYYY (#46). Parsed without it,
+    # 03/04/2022 silently becomes 4 March instead of 3 April -- a wrong answer
+    # for every voucher before the 13th of a month, and no error anywhere.
+    out["date"] = to_datetime(_ensure_columns(frame, ["date"])["date"], dayfirst=True)
+
+    # No guard on `direction`'s spelling: the normalizer sets it from the
+    # array a voucher came out of (`normalize.VOUCHER_DIRECTIONS`), so it is
+    # 'receipt' or 'payment' by construction and a validity check here could
+    # not be reached, let alone tested. An absent column is a different
+    # matter and is caught below.
+    missing = out["voucher_no"].isna() | out["gp_lgd_code"].isna() | out["direction"].isna()
+    if missing.any():
+        quarantine.add(
+            "voucher", "missing_key",
+            "voucher row lacks gp_lgd_code, voucher_no or direction",
+            "voucher_no", out.loc[missing, "voucher_no"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    out = out[~missing]
+
+    out = _dedupe(
+        out, ["gp_lgd_code", "fiscal_year", "voucher_no"], "voucher", quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    out = _restrict(
+        out, "voucher", "gp_lgd_code", gp_codes, quarantine,
+        source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
+    )
+    out = out.sort_values(
+        ["gp_lgd_code", "fiscal_year", "voucher_no"], kind="mergesort",
+    ).reset_index(drop=True)
+    out = _ensure_columns(out, VOUCHER_COLUMNS)
+    result = out[VOUCHER_COLUMNS].copy()
+    result.insert(0, "voucher_pk", range(start_id, start_id + len(result)))
+    return result
+
+
 def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
                *, source_system: str, source_run_id: str) -> pd.DataFrame:
     """One row per GP, from the panchayat profile extract (#123).

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL  := help
 .PHONY: help setup pull ingest publish-raw push run run-staging run-profile \
-        run-profile-staging warehouse warehouse-staging sample exhibits deliver \
+        run-profile-staging run-accounting run-accounting-staging warehouse warehouse-staging sample exhibits deliver \
         box-paths status _require_mode_env
 BOX_REMOTE      ?= box
 BOX_PROJECT_ROOT ?= /2. Projects/11. PR&DW/AI for Panchayats
@@ -20,6 +20,7 @@ help:
 	@echo "  make pull            Get latest code, deps, and approved DVC data"
 	@echo "  make ingest DATA=f.csv Copy an original source file from Box"
 	@echo "  make run-profile      Publish+normalize the GP profile extract (#123)"
+	@echo "  make run-accounting   Publish+normalize the accounting extract (#129)"
 	@echo "  make publish-raw DATA=f.csv Copy a local raw file to Box"
 	@echo "  make push DATA=f.csv Version and share a locally-ingested file via DVC"
 	@echo "  make run             Publish + normalize the scraped tree (full state)"
@@ -225,6 +226,38 @@ run-profile: _require_mode_env
 # worth exercising rather than avoiding.
 run-profile-staging:
 	@$(MAKE) run-profile MODE=staging
+
+# The same two stages for the nested accounting extract (#129), which fills
+# `voucher`. A tree rather than one file, so it publishes with --payload-tree
+# exactly as `run` does; going through make is what keeps prod and staging
+# registries apart, for the reason spelled out above run-profile.
+ACCOUNTING_SOURCE ?= egramswaraj_accounting
+ACCOUNTING_RUN_ID ?= $(RUN_ID)
+ACCOUNTING_TREE   ?= data/raw/eGramSwaraj_Data/Expenditure/Accounting_All_GPs
+ACCOUNTING_RUN    := $(PIPELINE_RAW_ROOT)/$(ACCOUNTING_SOURCE)/$(ACCOUNTING_RUN_ID)
+
+run-accounting: _require_mode_env
+	@test -d "$(ACCOUNTING_TREE)" || { \
+	  echo "No accounting tree at $(ACCOUNTING_TREE); pull it from Box with"; \
+	  echo "  rclone copy \"$(INCOMING_REMOTE)eGramSwaraj_Data/Expenditure/Accounting_All_GPs\" \\"; \
+	  echo "    $(ACCOUNTING_TREE) --transfers 16 --progress"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing accounting run $(ACCOUNTING_RUN_ID) from $(ACCOUNTING_TREE)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(ACCOUNTING_SOURCE) --run-id $(ACCOUNTING_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload-tree $(ACCOUNTING_TREE)
+	@echo "[$(MODE)] verifying every published file against its hash..."
+	uv run python main.py validate-run $(ACCOUNTING_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(ACCOUNTING_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with ALL snapshots --"
+	@echo "  make warehouse MODE=$(MODE) SNAPSHOT_ID='<scrape-id> --snapshot-id <profile-id> --snapshot-id <accounting-id>'"
+
+run-accounting-staging:
+	@$(MAKE) run-accounting MODE=staging
 
 # Stage 3-4: build the warehouse from an approved snapshot, then check it.
 #
