@@ -8,3 +8,8 @@ snapshots:
     run_id: '2026-09-04'
     schema_version: '1'
     status: approved
+  - id: egramswaraj_profile-2026-09-04
+    source: egramswaraj_profile
+    run_id: '2026-09-04'
+    schema_version: '1'
+    status: approved
