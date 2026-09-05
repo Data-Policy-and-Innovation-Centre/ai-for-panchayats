@@ -1,0 +1,261 @@
+name: Deploy
+
+# Apply on merge to main, and roll back on demand (#92), then prove the thing
+# that is running is the thing this run deployed (#93).
+#
+# Rollback is the same operation as deployment with a different tag, so it is
+# the same job with a different input rather than a second implementation that
+# drifts from the first.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy. Omit to deploy the tag computed from main.'
+        required: false
+        type: string
+
+# Serialise applies. cancel-in-progress MUST stay false: cancelling an apply
+# mid-flight is what leaves an orphaned S3 lockfile requiring force-unlock,
+# because the backend uses use_lockfile and a killed process releases nothing.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+jobs:
+  # Everything that can refuse the deploy happens here, with no credentials
+  # that can change anything and before the environment gate.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # An approval gate reorders runs: two queued deploys approved out of
+      # order would happily apply an older image over a newer one. Refusing
+      # when this run's commit is no longer the tip of main is what makes the
+      # queue order irrelevant.
+      - name: Refuse if this commit is no longer the tip of main
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip="$(gh api repos/${{ github.repository }}/commits/main --jq .sha)"
+          if [ "$tip" != "${{ github.sha }}" ]; then
+            echo "::error title=Stale run::${{ github.sha }} is no longer the tip of main ($tip). Refusing to deploy an older image over a newer one."
+            exit 1
+          fi
+          echo "confirmed tip of main: $tip"
+
+      - name: Resolve the tag to deploy
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            tag="${{ inputs.image_tag }}"
+            echo "::notice title=Manual deploy::$tag"
+          else
+            tag="$(uv run python scripts/compute_image_tag.py --platform linux/arm64)"
+            echo "::notice title=Tag from main::$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # service.tf refuses a tag whose architecture suffix contradicts the
+      # task architecture, but it does so during apply. Checking here fails
+      # the run before the environment gate rather than after it.
+      - name: Refuse a tag that is not arm64
+        run: |
+          case "${{ steps.resolve.outputs.tag }}" in
+            *-arm64) ;;
+            *) echo "::error title=Wrong architecture::tag does not end in -arm64"; exit 1 ;;
+          esac
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      # A tag that is not in ECR must fail BEFORE any AWS mutation. Terraform
+      # would otherwise register a task definition that no task can ever pull,
+      # and the circuit breaker would roll it back several minutes later.
+      # This uses the read-only plan role, so it cannot mutate anything itself.
+      - name: Refuse a tag that is not in the registry
+        run: |
+          if ! aws ecr describe-images --repository-name prdw-chatbot \
+                 --image-ids imageTag='${{ steps.resolve.outputs.tag }}' >/dev/null 2>&1; then
+            echo "::error title=No such image::${{ steps.resolve.outputs.tag }} is not in ECR. Nothing has been changed."
+            exit 1
+          fi
+          echo "image present: ${{ steps.resolve.outputs.tag }}"
+
+  apply:
+    needs: preflight
+    runs-on: ubuntu-latest
+    # The gate. Its branch policy restricts deployments to main, so a
+    # workflow_dispatch from another ref cannot reach it. Add a required
+    # reviewer here and this becomes a human-approved deploy with no workflow
+    # change -- the environment carries that setting, not this file.
+    environment:
+      name: production
+      url: ${{ steps.record.outputs.url }}
+    outputs:
+      task_definition: ${{ steps.apply.outputs.task_definition }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_APPLY_ROLE_ARN }}
+          aws-region: ap-south-1
+          # An apply waits for steady state and service.tf allows 20m for it;
+          # the session has to outlive that or credentials expire mid-apply
+          # and the S3 lock is left held.
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform -chdir=infra/terraform/app init -input=false -lockfile=readonly
+
+      - name: Apply
+        id: apply
+        run: |
+          terraform -chdir=infra/terraform/app apply -input=false -auto-approve -no-color \
+            -var "image_tag=${{ needs.preflight.outputs.tag }}"
+          # The revision THIS run registered. #93 asserts the service is
+          # actually running it, which is the only way to notice that the
+          # circuit breaker rolled back behind Terraform's back.
+          td="$(aws ecs describe-services --cluster prdw-chatbot --services prdw-chatbot \
+                  --query 'services[0].taskDefinition' --output text)"
+          echo "task_definition=$td" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Applied::${{ needs.preflight.outputs.tag }} as $td"
+
+      - name: Record the deployment
+        id: record
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ needs.preflight.outputs.tag }}
+          TASK_DEFINITION: ${{ steps.apply.outputs.task_definition }}
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: context.sha, environment: 'production',
+              auto_merge: false, required_contexts: [],
+              description: `image ${process.env.IMAGE_TAG} as ${process.env.TASK_DEFINITION}`,
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              deployment_id: deployment.id, state: 'success',
+              description: `${process.env.IMAGE_TAG} / ${process.env.TASK_DEFINITION}`,
+            });
+            core.setOutput('url', `https://github.com/${context.repo.owner}/${context.repo.repo}/deployments`);
+
+  # #93. Everything here asserts about the deployment, not merely about the
+  # transport. Reporting `/ -> 200` as success was wrong once already.
+  verify:
+    needs: [preflight, apply]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Resolve the public URL
+        id: url
+        run: |
+          domain="$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='prdw-chatbot'].DomainName | [0]" \
+            --output text)"
+          if [ -z "$domain" ] || [ "$domain" = "None" ]; then
+            echo "::error title=No distribution::could not resolve the CloudFront domain"; exit 1
+          fi
+          echo "url=https://$domain" >> "$GITHUB_OUTPUT"
+
+      - name: Read the pinned consumer commit
+        id: pin
+        run: |
+          echo "commit=$(python3 -c 'import json;print(json.load(open("infra/consumer/pin.json"))["commit"])')" >> "$GITHUB_OUTPUT"
+
+      # Rollout state, task-definition revision, runningCount, build info and
+      # the /query round-trip. Each fails independently; see
+      # tests/test_verify_deployment.py.
+      - name: Assert the deployment is the one this run made
+        run: |
+          uv run python scripts/verify_deployment.py \
+            --cluster prdw-chatbot --service prdw-chatbot \
+            --task-definition '${{ needs.apply.outputs.task_definition }}' \
+            --image-tag '${{ needs.preflight.outputs.tag }}' \
+            --consumer-commit '${{ steps.pin.outputs.commit }}' \
+            --url '${{ steps.url.outputs.url }}'
+
+      # The failure that started #93: the page rendered blank because
+      # crypto.randomUUID() is undefined outside a secure context, and every
+      # status code was 200 throughout.
+      - name: Install a browser
+        run: |
+          uv run --with playwright playwright install --with-deps chromium
+
+      - name: Assert the page actually mounts
+        env:
+          APP_URL: ${{ steps.url.outputs.url }}
+        run: |
+          uv run --with playwright python - <<'PYEOF'
+          import os, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          errors: list[str] = []
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.on("pageerror", lambda e: errors.append(str(e)))
+              page.goto(url, wait_until="networkidle", timeout=60000)
+
+              secure = page.evaluate("window.isSecureContext")
+              has_uuid = page.evaluate("typeof crypto.randomUUID === 'function'")
+              children = page.evaluate(
+                  "document.querySelector('#root') ? "
+                  "document.querySelector('#root').childElementCount : -1"
+              )
+              browser.close()
+
+          problems = []
+          if secure is not True:
+              problems.append(f"window.isSecureContext is {secure!r}, not True")
+          if has_uuid is not True:
+              problems.append("crypto.randomUUID is not a function -- the exact cause of the blank page in #93")
+          if children == -1:
+              problems.append("no #root element in the document")
+          elif children < 1:
+              problems.append("#root has no element children; the app did not mount")
+          if errors:
+              problems.append(f"uncaught exceptions during mount: {errors}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error title=Browser check failed::{problem}", file=sys.stderr)
+              sys.exit(1)
+          print(f"secure context, crypto.randomUUID present, #root has {children} children, no uncaught exceptions")
+          PYEOF
