@@ -1481,3 +1481,50 @@ def test_a_second_profile_snapshot_does_not_collide_on_the_primary_key(tmp_path:
         ).fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_a_second_expenditure_snapshot_does_not_double_the_money(tmp_path: Path):
+    """The silent one of the three cross-snapshot defects (Codex, #174).
+
+    voucher and gp_profile collide on a UNIQUE/PRIMARY KEY, so an overlapping
+    second snapshot aborts the build. activity_expenditure's only key is the
+    `expenditure_id` surrogate, so nothing stops the duplicates:
+    total_expenditure doubles and the bridge duplicates with it, on a green
+    build and a green conformance run.
+
+    `_dedupe` cannot catch it even in principle -- its key includes
+    source_run_id, so one business row seen by two runs is two rows to it.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    row = _expenditure_row(
+        s_no="1", activity="44134242", total="500.0",
+        v_no="XVFC/2022-23/P/1", v_cost="500.0", v_date="05/07/2023",
+    )
+    for run in ("exp-1", "exp-2"):
+        _expenditure_snapshot(tmp_path, settings, run, row)
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+        approved("exp-2", "egramswaraj_expenditure", "exp-2"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "exp-1", "exp-2"), settings=settings, registry=spec_registry,
+    )
+    assert result.counts["activity_expenditure"] == 1, "the overlap must not load twice"
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        # The number the whole reconciliation rests on: it must not double.
+        assert con.execute(
+            "SELECT sum(total_expenditure) FROM activity_expenditure"
+        ).fetchone()[0] == Decimal("500.00")
+        # And the bridge must not duplicate along with it.
+        assert con.execute("SELECT count(*) FROM activity_voucher").fetchone()[0] == 1
+        assert con.execute("SELECT sum(voucher_cost) FROM activity_voucher").fetchone()[0] == Decimal("500.00")
+        assert con.execute(
+            "SELECT sum(row_count) FROM quarantine WHERE table_name = 'activity_expenditure' "
+            "AND reason_code = 'cross_snapshot_duplicate_key'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()

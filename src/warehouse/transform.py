@@ -1462,6 +1462,7 @@ def activity_expenditure(
     *, source_system: str, source_run_id: str,
     resolutions: FieldResolutions | None = None,
     start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shape one activity_expenditure frame and assign its expenditure_id.
 
@@ -1512,6 +1513,38 @@ def activity_expenditure(
         frame, "activity_expenditure", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    # The same cross-snapshot guard voucher and gp_profile carry, and the most
+    # important of the three: those two collide on a UNIQUE/PRIMARY KEY and
+    # abort the build, so a second overlapping snapshot fails loudly. This
+    # table's only key is the `expenditure_id` surrogate assigned below, so
+    # nothing would stop the duplicates -- `total_expenditure` would silently
+    # double and the activity_voucher bridge would duplicate with it, on a
+    # green build and a green conformance run.
+    #
+    # Note the `_dedupe` above cannot catch this even in principle: its key
+    # includes source_run_id, so the same business row observed by two runs is
+    # two rows to it. That is right within a frame and wrong across them.
+    #
+    # Bridge rows for the rows dropped here find no expenditure_id and are
+    # counted by activity_voucher's own orphan_expenditure path, which is the
+    # correct outcome -- they are duplicate references to an already-loaded
+    # expenditure line.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                frame["gp_lgd_code"], frame["plan_code"],
+                frame["activity_code"], frame["s_no"], strict=True,
+            )],
+            index=frame.index,
+        )
+        if already.any():
+            quarantine.add(
+                "activity_expenditure", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this expenditure line",
+                "activity_code", frame.loc[already, "activity_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        frame = frame[~already]
     frame = frame.reset_index(drop=True)
     frame.insert(0, "expenditure_id", range(start_id, start_id + len(frame)))
     return frame

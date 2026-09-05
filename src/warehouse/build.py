@@ -396,16 +396,22 @@ def populate(
     # to resolve against. The expenditure_id counter continues from the loop's
     # `re`-driven call above rather than restarting, so the two paths cannot
     # both claim id 1 -- the same rule voucher_pk follows across snapshots.
+    loaded_expenditure_keys: set[tuple[str, str, str, str]] = set()
     for source_system, source_run_id, frame in expenditure_frames:
         expenditures = transform.activity_expenditure(
             frame, all_gp_codes, quarantine,
             source_system=source_system, source_run_id=source_run_id,
             resolutions=resolutions, start_id=next_expenditure_id,
+            loaded_keys=loaded_expenditure_keys,
         )
         add_count("activity_expenditure", insert(
             con, "activity_expenditure", expenditures, batch_size=batch_size,
         ))
         next_expenditure_id += len(expenditures)
+        loaded_expenditure_keys.update(zip(
+            expenditures["gp_lgd_code"], expenditures["plan_code"],
+            expenditures["activity_code"], expenditures["s_no"], strict=True,
+        ))
         # Read back rather than held: voucher may span several snapshots, and
         # the bridge has to resolve against every voucher in the build, not
         # only the ones this snapshot happened to carry.
