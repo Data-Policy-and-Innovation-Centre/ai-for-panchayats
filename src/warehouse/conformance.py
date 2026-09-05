@@ -606,6 +606,20 @@ def check_satellite_payload_population(
             continue  # an empty satellite is section 5's business, not this one
         payload = [c for c in _columns(con, table) if c not in SATELLITE_IDENTITY_COLUMNS]
         if not payload:
+            # A satellite reduced to its identity columns cannot hold data at
+            # all, and nothing else notices: check_table_existence compares
+            # table NAMES, and row parity, primary keys and foreign keys all
+            # still pass on a table with no payload. That is this check's own
+            # blind spot, one level up from the one it was written for.
+            if full_state:
+                findings.append(Finding(
+                    check=f"data.satellite_payload.{table}", severity="violation",
+                    expected="payload column(s) beyond "
+                             f"{sorted(SATELLITE_IDENTITY_COLUMNS)}",
+                    actual="the table has only identity columns",
+                    detail="schema drift: this table cannot carry data, and every "
+                           "other check still passes on it",
+                ))
             continue
         selects = ", ".join(f'COUNT("{column}")' for column in payload)
         counts = con.execute(f"SELECT {selects} FROM {table}").fetchone() or ()

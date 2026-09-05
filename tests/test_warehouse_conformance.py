@@ -563,17 +563,66 @@ def test_beneficiary_count_type_flags_missing_required_column(tmp_path):
 # Section 5: data-level invariants
 # ---------------------------------------------------------------------------
 
-def _real_activity_asset(con: duckdb.DuckDBPyConnection) -> None:
-    """Replace the stub activity_asset with the DDL the build actually ships.
+# One populated column per satellite, so a fixture can be conformant rather
+# than merely well-shaped. Read off the shipped DDL rather than invented.
+_SATELLITE_FIRST_PAYLOAD_COLUMN: dict[str, str] = {
+    "activity_delegation": "is_delegated",
+    "activity_asset": "asset_type",
+    "activity_fund": "fund_scheme_code",
+    "activity_training": "training_category_code",
+    "activity_community_service": "community_service_code",
+}
+
+
+def _real_satellites(con: duckdb.DuckDBPyConnection, *tables: str) -> None:
+    """Replace stub satellites with the DDL the build actually ships.
 
     FULL_DDL's satellites carry only `activity_code`, which is right for the
     checks that only count rows -- but a payload check needs payload columns,
-    and inventing a shape here would test a table nobody builds. Nothing has
-    a foreign key onto activity_asset, so this needs no _drop_with_dependents.
+    and inventing a shape here would test a table nobody builds. Nothing holds
+    a foreign key onto a satellite, so this needs no _drop_with_dependents.
     """
 
-    con.execute("DROP TABLE activity_asset")
-    con.execute(REAL_DDL["activity_asset"])
+    for table in tables or tuple(_SATELLITE_FIRST_PAYLOAD_COLUMN):
+        con.execute(f"DROP TABLE {table}")
+        con.execute(REAL_DDL[table])
+
+
+def _real_activity_asset(con: duckdb.DuckDBPyConnection) -> None:
+    _real_satellites(con, "activity_asset")
+
+
+def _populate_satellite(con: duckdb.DuckDBPyConnection, table: str, activity_code: str) -> None:
+    """One row with EVERY payload column non-NULL, typed from the live schema.
+
+    Typed by asking the catalog rather than by a hand-kept list, so a column
+    added to a satellite is populated here automatically instead of quietly
+    becoming the fixture's own dead column.
+    """
+
+    columns = con.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = ? ORDER BY ordinal_position", [table],
+    ).fetchall()
+    names, values = [], []
+    for name, data_type in columns:
+        names.append(name)
+        upper = data_type.upper()
+        if name == "activity_code":
+            values.append(activity_code)
+        elif name == "source_system":
+            values.append("egramSwaraj")
+        elif name == "source_run_id":
+            values.append("run-1")
+        elif "BOOL" in upper:
+            values.append(True)
+        elif any(kind in upper for kind in ("INT", "DOUBLE", "DECIMAL", "FLOAT", "NUMERIC")):
+            values.append(1)
+        else:
+            values.append("x")
+    placeholders = ", ".join("?" for _ in names)
+    quoted = ", ".join(f'"{name}"' for name in names)
+    con.execute(f"INSERT INTO {table} ({quoted}) VALUES ({placeholders})", values)
 
 
 def test_satellite_payload_flags_a_table_that_is_all_padding(tmp_path):
@@ -672,6 +721,36 @@ def test_all_null_satellite_is_a_violation_only_at_full_state(tmp_path):
     assert severity_of(full_state=True) == "violation"
     assert severity_of(full_state=False) == "informational", (
         "a fixture must not be failed for a satellite its records never populate"
+    )
+    con.close()
+
+
+def test_a_satellite_with_no_payload_columns_at_all_is_drift(tmp_path):
+    """This check's own blind spot, one level up from the one it was written for.
+
+    A satellite reduced to its identity columns cannot hold data, and nothing
+    else notices: check_table_existence compares table NAMES, and row parity,
+    primary keys and foreign keys all still pass on a table with no payload.
+    Skipping it quietly -- which is what the first version of this check did --
+    reproduces the #159 failure in a form the check itself could not see.
+
+    FULL_DDL's stub satellites are exactly this shape, which is why it needs
+    the same full_state gate: a fixture is allowed to be a stub.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)  # stub satellites: activity_code and nothing else
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute("INSERT INTO activity_asset VALUES ('A1')")
+
+    findings = check_satellite_payload_population(con, full_state=True)
+    asset = [f for f in findings if f.check == "data.satellite_payload.activity_asset"]
+    assert len(asset) == 1
+    assert asset[0].severity == "violation"
+    assert "only identity columns" in asset[0].actual
+
+    assert check_satellite_payload_population(con, full_state=False) == [], (
+        "a stub fixture must not be failed for being a stub"
     )
     con.close()
 
@@ -1014,6 +1093,7 @@ def _seed_full_state_geography(con):
 def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
+    _real_satellites(con)
     gp_code = _seed_full_state_geography(con)
     con.execute(
         "INSERT INTO voucher VALUES (1, ?, '2025-2026', 'V1', ?, 'payment')",
@@ -1027,11 +1107,12 @@ def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path
         "INSERT INTO planned_activity VALUES ('A1', NULL, ?, NULL)",
         [float(EXPECTED_PLANNED_COST_TOTAL)],
     )
-    con.execute("INSERT INTO activity_delegation VALUES ('A1')")
-    con.execute("INSERT INTO activity_asset VALUES ('A1')")
-    con.execute("INSERT INTO activity_fund VALUES ('A1')")
-    con.execute("INSERT INTO activity_training VALUES ('A1')")
-    con.execute("INSERT INTO activity_community_service VALUES ('A1')")
+    # Real satellite DDL, every payload column populated. A satellite reduced
+    # to identity columns is schema drift now, and one whose columns are all
+    # NULL is reported -- so a fixture calling itself "fully conformant" has
+    # to actually carry data, not just the right shape.
+    for table in _SATELLITE_FIRST_PAYLOAD_COLUMN:
+        _populate_satellite(con, table, "A1")
     findings = check_conformance(con, skip_derived=True, skip_reconciliation=False)
     assert findings == []
     assert not has_violations(findings)
