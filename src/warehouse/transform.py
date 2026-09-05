@@ -447,6 +447,7 @@ def _voucher_fiscal_year(voucher_no: object) -> str | None:
 def activity_voucher(
     source: pd.DataFrame, expenditures: pd.DataFrame, voucher_keys: pd.DataFrame,
     quarantine: Quarantine, *, source_system: str, source_run_id: str,
+    linked_expenditure_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """Explode the parallel voucher cells into one row per voucher reference (#49).
 
@@ -562,6 +563,30 @@ def activity_voucher(
             source_system=source_system, source_run_id=source_run_id,
         )
     linked = linked.loc[~unmatched].drop(columns="_merge")
+
+    # An expenditure line that already has its bridge rows must not get them
+    # again from a second snapshot restating the same line. This table is
+    # legitimately 1:many -- three payments can settle against one voucher
+    # number, so row-level dedupe would be wrong -- and the unit that must
+    # not repeat is therefore the expenditure_id's whole set of references,
+    # not an individual row.
+    #
+    # The case this exists for: two overlapping EXPENDITURE snapshots. The
+    # second one's activity_expenditure rows are suppressed by the
+    # cross-snapshot key guard, but its voucher references still RESOLVE --
+    # against the surviving row -- so without this they would double the
+    # bridge while the fact table stayed correct.
+    if linked_expenditure_ids:
+        repeated = linked["expenditure_id"].isin(linked_expenditure_ids).to_numpy()
+        if repeated.any():
+            quarantine.add(
+                "activity_voucher", "cross_snapshot_duplicate_key",
+                "this expenditure line already has its voucher references loaded",
+                "voucher_no", linked.loc[repeated, "voucher_no"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        linked = linked.loc[~repeated]
+
     linked = linked.merge(
         voucher_keys, how="left", on=["gp_lgd_code", "fiscal_year", "voucher_no"],
     )

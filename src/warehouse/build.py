@@ -468,9 +468,28 @@ def populate(
         voucher_keys = con.execute(
             "SELECT gp_lgd_code, fiscal_year, voucher_no, voucher_pk FROM voucher"
         ).fetchdf()
+        # And the expenditures, for exactly the same reason. `expenditures`
+        # is this frame's surviving rows only: the cross-snapshot guard above
+        # drops a line already loaded through the `re` path, and resolving the
+        # bridge against that filtered frame would quarantine its vouchers as
+        # orphan_expenditure -- suppressing the duplicate fact row and losing
+        # the bridge rows with it, which is a worse trade than the duplicate.
+        expenditure_keys = con.execute(
+            "SELECT gp_lgd_code, plan_code, activity_code, s_no, expenditure_id "
+            "FROM activity_expenditure"
+        ).fetchdf()
+        # Which expenditure lines already carry their references, so a second
+        # snapshot restating the same line cannot contribute them twice now
+        # that the resolution above spans the whole table.
+        linked_expenditure_ids = {
+            row[0] for row in con.execute(
+                "SELECT DISTINCT expenditure_id FROM activity_voucher"
+            ).fetchall()
+        }
         add_count("activity_voucher", insert(con, "activity_voucher", transform.activity_voucher(
-            frame, expenditures, voucher_keys, quarantine,
+            frame, expenditure_keys, voucher_keys, quarantine,
             source_system=source_system, source_run_id=source_run_id,
+            linked_expenditure_ids=linked_expenditure_ids,
         ), batch_size=batch_size))
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
