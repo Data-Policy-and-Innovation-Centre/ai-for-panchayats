@@ -1,0 +1,154 @@
+name: Image
+
+# Builds the deployment image on every PR that touches a build input, and
+# additionally pushes it on main (#90).
+#
+# The tag comes from a hash of the build inputs, not from a commit, so two
+# commits that change nothing about the image produce the SAME tag. Against a
+# repository with IMMUTABLE tags that is what makes a re-run a harmless no-op
+# instead of a hard failure.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Never cancel a push that may already be uploading layers.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # required to mint the OIDC token; nothing else
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # Emitted on EVERY run, including runs that push nothing, so a deploy job
+    # can name the image even when the build was a no-op.
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # The tag is computable with no clone, no docker daemon and no AWS call,
+      # which is the property that lets it be a job output regardless of what
+      # the rest of this job does.
+      - name: Compute the image tag from the build inputs
+        id: tag
+        run: |
+          tag="$(uv run python scripts/compute_image_tag.py --platform linux/arm64)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Image tag::$tag"
+
+      # Exact, not the major that build.sh enforces. The dashboard bundle is a
+      # build output: a different Node can change it, and the image is supposed
+      # to be reproducible from its inputs.
+      # Pinned HERE rather than in docker/.node-version, deliberately. That
+      # file records the Node MAJOR that produced the image now in production
+      # and build.sh enforces only the major, so writing an exact patch there
+      # would assert something about the deployed image that nobody verified.
+      # CI, which has to be reproducible, pins exactly; a developer keeps the
+      # looser local check.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+
+      - name: Pin npm exactly and prove the majors agree
+        run: |
+          # npm 11.19.0 is what Node 24.20.0 bundles; installed explicitly so
+          # the version is stated rather than inherited from the runner image.
+          npm install -g npm@11.19.0
+          node --version && npm --version
+          # build.sh independently enforces the major from docker/.node-version.
+          # If CI's pin ever drifts to a different major, the build fails there
+          # with a clear message rather than silently producing a different
+          # dashboard bundle -- so this asserts the two agree up front.
+          want="$(tr -d '[:space:]' < docker/.node-version)"
+          have="$(node --version)"; have="${have#v}"
+          if [ "${have%%.*}" != "${want%%.*}" ]; then
+            echo "::error title=Node major drift::CI pins ${have} but docker/.node-version says ${want}"
+            exit 1
+          fi
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Only on main, and only the push role. A pull request never gets AWS
+      # credentials of any kind -- it builds and throws the image away.
+      - name: Assume the ECR push role
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Resolve the registry at runtime
+        if: github.event_name == 'push'
+        id: registry
+        run: |
+          # Never hardcoded: the account id must not appear in a tracked file.
+          account="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${account}.dkr.ecr.ap-south-1.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      # The no-op path. An immutable tag that already exists cannot be pushed
+      # again, so the push is SKIPPED rather than attempted and failed -- and
+      # the job still succeeds and still emits the tag.
+      - name: Is this tag already in the registry?
+        if: github.event_name == 'push'
+        id: exists
+        run: |
+          if aws ecr describe-images --repository-name prdw-chatbot \
+               --image-ids imageTag='${{ steps.tag.outputs.tag }}' >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No-op::${{ steps.tag.outputs.tag }} is already in ECR; nothing to build or push."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A PR builds to prove the inputs still produce an image -- in particular
+      # that a consumer pin bump still passes `npm run build`, which is the
+      # only thing that turns such a PR red before it reaches main.
+      - name: Build (pull request; never pushed)
+        if: github.event_name == 'pull_request'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PLATFORM: linux/arm64
+        run: ./docker/build.sh
+
+      - name: Build and push (main)
+        id: push
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PLATFORM: linux/arm64
+          IMAGE: ${{ steps.registry.outputs.registry }}/prdw-chatbot
+        run: |
+          if [ "${{ steps.exists.outputs.exists }}" = "true" ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ./docker/build.sh
+          docker push "${IMAGE}:${TAG}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`${{ steps.tag.outputs.tag }}\` |"
+            echo "| event | ${{ github.event_name }} |"
+            echo "| already in ECR | ${{ steps.exists.outputs.exists || 'n/a (not a push)' }} |"
+            echo "| pushed | ${{ steps.push.outputs.pushed || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
