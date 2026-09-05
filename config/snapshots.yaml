@@ -13,3 +13,8 @@ snapshots:
     run_id: '2026-09-04'
     schema_version: '1'
     status: approved
+  - id: egramswaraj_accounting-2026-09-05
+    source: egramswaraj_accounting
+    run_id: '2026-09-05'
+    schema_version: '1'
+    status: approved
