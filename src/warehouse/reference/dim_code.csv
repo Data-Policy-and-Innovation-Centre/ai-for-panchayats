@@ -1,0 +1,718 @@
+variable,code,description,source,confidence
+activity_type,61,Public Works,Conflict,high
+activity_type,62,Beneficiary Oriented Programmes,Derived,medium
+focus_area,1,Agriculture,Confirmed,medium
+focus_area,2,Land improvement,Confirmed,high
+focus_area,3,Water Conservation,Confirmed,high
+focus_area,4,Animal husbandry,User-supplied,
+focus_area,5,Fisheries,User-supplied,
+focus_area,6,Social forestry and farm forestry,User-supplied,
+focus_area,8,Small-scale industries,User-supplied,
+focus_area,9,Khadi,User-supplied,
+focus_area,10,Rural housing,User-supplied,
+focus_area,11,Drinking water,Confirmed,high
+focus_area,12,Fuel and fodder,User-supplied,
+focus_area,13,Roads,Confirmed,high
+focus_area,14,Rural electrification,Confirmed,high
+focus_area,15,Non-conventional energy sources,Confirmed,high
+focus_area,16,Poverty allevation programme,Confirmed,high
+focus_area,17,Education,Confirmed,high
+focus_area,18,Technical training and vocational education,Confirmed,medium
+focus_area,20,Libraries,Confirmed,medium
+focus_area,21,Cultural activities,Confirmed,high
+focus_area,22,Markets and fairs,Confirmed,high
+focus_area,24,Family welfare,Confirmed,medium
+focus_area,25,Women and child development,Confirmed,high
+focus_area,26,Social welfare,Confirmed,high
+focus_area,27,Welfare of the weaker sections,User-supplied,
+focus_area,28,Public distribution system,User-supplied,
+focus_area,29,Maintenance of community system,Confirmed,high
+focus_area,53,Administrative & Technical Support,User-supplied,
+focus_area,54,GP Office Infrastructure,Confirmed,high
+focus_area,55,Health,Confirmed,high
+focus_area,56,Sanitation,Confirmed,high
+activity_for,111,General,User-supplied,
+activity_for,112,sc,User-supplied,
+activity_for,113,st,User-supplied,
+activity_for,114,ALL/ General public,User-supplied,
+work_type,141,New/Fresh,Conflict,high
+work_type,142,,Unresolved,
+work_type,143,Maintenance,Confirmed,high
+work_type,144,Upgradation,Derived,high
+is_costless_activity,0,No - activity has a cost,Derived,high
+is_costless_activity,1,Yes - costless activity,Derived,high
+operation_type,1,,Unresolved,
+operation_type,2,,Unresolved,
+operation_type,3,,Unresolved,
+operation_type,4,,Unresolved,
+operation_type,5,,Unresolved,
+operation_type,6,,Unresolved,
+operation_type,7,,Unresolved,
+main_asset_category,4,Irrigation Sources,Derived,high
+main_asset_category,6,Pond & Reservoir,Derived,medium
+main_asset_category,10,Water Sources & Structures,Derived,high
+main_asset_category,15,"Roads, Bridges & Culverts",Derived,high
+main_asset_category,29,Community Sanitation,Derived,medium
+main_asset_category,60,Electrification,Derived,high
+main_asset_category,63,Sanitation & Sewerage Facilities,Derived,high
+main_asset_category,77,Buildings,Derived,high
+main_asset_category,97,Recreational Facilities,Derived,high
+main_asset_category,103,Medical & Health Facilities,Derived,high
+main_asset_category,104,Education Facilities,Derived,high
+main_asset_category,105,Banking Facilities,Derived,medium
+main_asset_category,106,Other Public/Social,Derived,high
+main_asset_category,407,Land,Derived,high
+main_asset_category,451,Solid Waste Management,Derived,medium
+main_asset_category,453,Household Sanitation,Derived,high
+main_asset_category,454,Community Sanitation,Derived,high
+main_asset_category,456,Plastic Waste Management,Derived,high
+main_asset_category,457,Liquid Waste Management,Derived,high
+main_asset_category,462,Drinking water supply structure,Derived,high
+main_asset_category,465,Grey water management,Derived,high
+main_asset_subcategory,1,Well,Derived,high
+main_asset_subcategory,2,Borewell,Derived,high
+main_asset_subcategory,3,Pond,Derived,high
+main_asset_subcategory,4,Spring Box,Derived,high
+main_asset_subcategory,8,Pump,Derived,high
+main_asset_subcategory,10,Public Taps,Derived,high
+main_asset_subcategory,11,Pump House,Derived,high
+main_asset_subcategory,13,Water Purification System,Derived,high
+main_asset_subcategory,25,Foot Bridge,Derived,high
+main_asset_subcategory,26,Rain Water Harvest Tank,Derived,high
+main_asset_subcategory,28,Septic Tank,Derived,high
+main_asset_subcategory,29,Toilet,Derived,high
+main_asset_subcategory,33,,Unresolved,
+main_asset_subcategory,37,Panchayat Bhawan,Derived,high
+main_asset_subcategory,38,Aanganwadi,Derived,high
+main_asset_subcategory,44,Shelter Home,Derived,high
+main_asset_subcategory,46,Computer Centre,Derived,high
+main_asset_subcategory,47,Library Building,Derived,high
+main_asset_subcategory,53,Schools,Derived,high
+main_asset_subcategory,55,Play Ground / Park,Derived,high
+main_asset_subcategory,56,Health Centres,Derived,high
+main_asset_subcategory,59,Government Sponsored Houses,Derived,high
+main_asset_subcategory,62,Drainage,Derived,high
+main_asset_subcategory,63,Other Sanitation Asset,Derived,high
+main_asset_subcategory,64,Minor Irrigation Structures,Derived,high
+main_asset_subcategory,66,Commercial Complexes,Derived,high
+main_asset_subcategory,452,Water Tank,Derived,high
+main_asset_subcategory,457,Cultural Stage,Derived,high
+main_asset_subcategory,458,Road CC,Derived,high
+main_asset_subcategory,459,Road BT,Derived,high
+main_asset_subcategory,460,,Unresolved,
+main_asset_subcategory,1026,,Unresolved,
+main_asset_subcategory,1045,Mahila Mandals,Derived,high
+main_asset_subcategory,1057,Youth Club Buildings,Derived,high
+main_asset_subcategory,1062,Marriage / Community Hall,Derived,high
+main_asset_subcategory,1068,Culvert,Derived,high
+main_asset_subcategory,1069,Sewage Treatment Plant,Derived,high
+main_asset_subcategory,1072,Agricultural Land,Derived,high
+main_asset_subcategory,1076,Office Building,Derived,high
+main_asset_subcategory,1083,Garbage Container,Derived,high
+main_asset_subcategory,1087,Market Yards/ Vending Zone,Derived,high
+main_asset_subcategory,1153,Wasteland,Derived,high
+main_asset_subcategory,1154,Grassland,Derived,high
+main_asset_subcategory,1156,Water supply pipe line,Derived,high
+main_asset_subcategory,1160,,Unresolved,
+main_asset_subcategory,1161,,Unresolved,
+main_asset_subcategory,1199,Sheds,Derived,high
+main_asset_subcategory,1201,Old Aged Home,Derived,high
+main_asset_subcategory,1202,Boundary wall / Side Wall / Retaining Wall,Derived,high
+main_asset_subcategory,1203,Guest House,Derived,high
+main_asset_subcategory,1205,Approach Road,Derived,high
+main_asset_subcategory,1207,Bharat Nirman Rajiv Gandhi Seva Kendra,Derived,high
+main_asset_subcategory,1208,Street Light,Derived,high
+main_asset_subcategory,1211,Power Station,Derived,high
+main_asset_subcategory,1216,,Unresolved,
+main_asset_subcategory,1217,CSC (Common Service Centre),Derived,high
+main_asset_subcategory,1223,,Unresolved,
+main_asset_subcategory,1225,,Unresolved,
+main_asset_subcategory,1227,Godown and Stores,Derived,high
+main_asset_subcategory,1229,,Unresolved,
+main_asset_subcategory,1235,Overhead Tank,Derived,high
+main_asset_subcategory,1236,,Unresolved,
+main_asset_subcategory,1237,Hand pump,Derived,high
+main_asset_subcategory,1238,Tourist places,Derived,high
+main_asset_subcategory,1240,Garbage Disposal Sites,Derived,high
+main_asset_subcategory,1242,Women and Child Centres,Derived,high
+main_asset_subcategory,1247,Other Financial Institutions,Derived,high
+main_asset_subcategory,1251,Bathing Ghat,Derived,high
+main_asset_subcategory,1252,Other Public / Social Service Centre,Derived,high
+main_asset_subcategory,1253,Bathroom,Derived,high
+main_asset_subcategory,1254,Pavement,Derived,high
+main_asset_subcategory,1256,Gram Sachivalaya,Derived,high
+main_asset_subcategory,1260,Furniture & Play material for Anganwadi centers,Derived,high
+main_asset_subcategory,1261,,Unresolved,
+main_asset_subcategory,1263,Safety and Sanitary Kits,Derived,high
+main_asset_subcategory,1264,Vehicles for Garbage transport,Derived,high
+main_asset_subcategory,1265,Sanitation Tools,Derived,high
+main_asset_subcategory,1266,Tri-cycle,Derived,high
+main_asset_subcategory,1269,,Unresolved,
+main_asset_subcategory,1272,Cattle Troughs,Derived,high
+main_asset_subcategory,1273,,Unresolved,
+main_asset_subcategory,1275,Building Electrification,Derived,high
+main_asset_subcategory,1279,,Unresolved,
+main_asset_subcategory,1281,Community Compost Pits,Derived,high
+main_asset_subcategory,1282,Individual Compost Pits,Derived,high
+main_asset_subcategory,1283,Community Bio Gas plant,Derived,high
+main_asset_subcategory,1284,Push carts-Vehicles for Collection and Transportation,Derived,high
+main_asset_subcategory,1286,Battery operated-Vehicles for Collection and Transportation,Derived,high
+main_asset_subcategory,1287,Vehicles for Collection and Transportation (Others),Derived,high
+main_asset_subcategory,1288,Plastic Waste Management Centre,Derived,high
+main_asset_subcategory,1299,Individual Household Latrine (IHHL),Derived,high
+main_asset_subcategory,1300,Community Sanitation Complex (CSC),Derived,high
+main_asset_subcategory,1301,Institutional Toilet,Derived,high
+main_asset_subcategory,1307,Plastic Waste Storage Unit,Derived,high
+main_asset_subcategory,1308,Waste stabilization pond–3-pond system,Derived,high
+main_asset_subcategory,1313,Drainage channel,Derived,high
+main_asset_subcategory,1314,Small-bore pipe conveyance system,Derived,high
+main_asset_subcategory,1316,Individual soak pit,Derived,high
+main_asset_subcategory,1317,Community soak pit,Derived,high
+main_asset_subcategory,1328,Multi village Plastic Waste Management Unit (PWMU),Derived,high
+main_asset_subcategory,1329,Material Recovery Facility (MRF),Derived,high
+main_asset_subcategory,1330,Drainage channel for multiple villages,Derived,high
+main_asset_subcategory,1341,Drainage channel for multiple villages,Derived,high
+main_asset_subcategory,1344,Amrit Sarovar,Derived,high
+main_asset_subcategory,1345,Pumphouse,Derived,high
+main_asset_subcategory,1346,Overhead tank,Derived,high
+main_asset_subcategory,1348,Water treatment plant,Derived,high
+main_asset_subcategory,1352,Additional borewell,Derived,high
+main_asset_subcategory,1353,Additional surface water source,Derived,high
+main_asset_subcategory,1355,Groundwater source Tubewell,Derived,high
+main_asset_subcategory,1356,Pond,Derived,high
+main_asset_subcategory,1358,Spring source,Derived,high
+main_asset_subcategory,1360,Tap connection to Anganwadi centres,Derived,high
+main_asset_subcategory,1361,Tap connection to Panchayat office,Derived,high
+main_asset_subcategory,1362,Tap connection to other public institutional building,Derived,high
+main_asset_subcategory,1364,Construction of Pond,Derived,high
+main_asset_subcategory,1368,Construction of conveyance structure,Derived,high
+main_asset_subcategory,1373,,Unresolved,
+main_asset_subcategory,1374,,Unresolved,
+main_asset_subcategory,1375,Tap connections,Derived,high
+main_asset_subcategory,1376,Waste collection and segregation sheds in the village,Derived,high
+main_asset_subcategory,1377,Segregation Bins at Community places in the village,Derived,high
+main_asset_subcategory,1380,Aanganwadi,Derived,high
+main_asset_unit_type,2,P,Derived,high
+main_asset_unit_type,4,L,Derived,high
+main_asset_unit_type,5,Y,Derived,high
+main_asset_unit_count,1,,Unresolved,
+main_asset_unit_count,2,,Unresolved,
+main_asset_unit_count,3,,Unresolved,
+main_asset_unit_count,4,,Unresolved,
+main_asset_unit_count,5,,Unresolved,
+main_asset_unit_count,7,,Unresolved,
+main_asset_unit_count,10,,Unresolved,
+main_asset_unit_count,12,,Unresolved,
+main_asset_unit_count,15,,Unresolved,
+main_asset_unit_count,20,,Unresolved,
+main_asset_unit_count,25,,Unresolved,
+main_asset_unit_count,30,,Unresolved,
+main_asset_unit_count,35,,Unresolved,
+main_asset_unit_count,40,,Unresolved,
+main_asset_unit_count,50,,Unresolved,
+main_asset_unit_count,85,,Unresolved,
+main_asset_unit_count,100,,Unresolved,
+main_asset_unit_count,120,,Unresolved,
+main_asset_unit_count,150,,Unresolved,
+main_asset_unit_count,200,,Unresolved,
+main_asset_unit_count,250,,Unresolved,
+main_asset_unit_count,300,,Unresolved,
+main_asset_unit_count,500,,Unresolved,
+main_asset_unit_count,600,,Unresolved,
+main_asset_unit_count,650,,Unresolved,
+plan_type,131,Main Plan,Derived,high
+plan_type,132,Supplementary Plan,Derived,high
+plan_code_status,123,Plan Approved,Conflict,high
+output_type,101,,Unresolved,
+output_type,102,,Unresolved,
+output_type,103,,Unresolved,
+output_type,104,,Unresolved,
+output_type,105,,Unresolved,
+output_type,106,,Unresolved,
+output_type,109,,Unresolved,
+output_type,110,,Unresolved,
+activity_status,74,Activity Approved,Unresolved,
+activity_status,173,Buildings,Unresolved,
+activity_status,174,UNDER APPROVAL,Unresolved,
+activity_status,176,WORK ONGOING,Unresolved,
+activity_status,178,	WORK COMPLETED,Unresolved,
+activity_status,180,WORK ABANDONED,Unresolved,
+asset_type,1,movable,Confirmed,high
+asset_type,2,Immovable,Conflict,high
+asset_category,4,Irrigation Sources,Confirmed,high
+asset_category,6,Pond & Reservoir,Confirmed,medium
+asset_category,10,Water Sources & Structures,Confirmed,high
+asset_category,15,"Roads, Bridges & Culverts",Confirmed,high
+asset_category,29,Community Sanitation,Derived,medium
+asset_category,41,Office Equipment,Confirmed,high
+asset_category,48,Computers and peripherals,Confirmed,medium
+asset_category,60,Electrification,Confirmed,high
+asset_category,63,Sanitation & Sewerage Facilities,Confirmed,high
+asset_category,77,Buildings,Confirmed,high
+asset_category,97,Recreational Facilities,Confirmed,high
+asset_category,103,Medical & Health Facilities,Confirmed,high
+asset_category,104,Education Facilities,Confirmed,high
+asset_category,105,Banking Facilities,Confirmed,medium
+asset_category,106,Other Public/Social,Confirmed,high
+asset_category,301,Electrical Installation and Equipment,Confirmed,medium
+asset_category,302,,Unresolved,
+asset_category,351,,Unresolved,
+asset_category,407,Land,Confirmed,high
+asset_category,410,,Unresolved,
+asset_category,411,,Unresolved,
+asset_category,412,,Unresolved,
+asset_category,451,Solid Waste Management,Confirmed,medium
+asset_category,452,,Unresolved,
+asset_category,453,Household Sanitation,Confirmed,high
+asset_category,454,Community Sanitation,Confirmed,high
+asset_category,455,Movable Sanitation Asset,Confirmed,high
+asset_category,456,Plastic Waste Management,Confirmed,high
+asset_category,457,Liquid Waste Management,Confirmed,high
+asset_category,458,,Unresolved,
+asset_category,459,,Unresolved,
+asset_category,460,Faecal Sludge Management,Confirmed,high
+asset_category,461,Medical Supplies,Confirmed,medium
+asset_category,462,Drinking water supply structure,Confirmed,high
+asset_category,463,Drinking water supply equipment,Confirmed,high
+asset_category,465,Grey water management,Confirmed,high
+asset_subcategory,1,Well,Derived,high
+asset_subcategory,2,Borewell,Derived,high
+asset_subcategory,3,Pond,Derived,high
+asset_subcategory,4,Spring Box,Derived,high
+asset_subcategory,5,Checkdam,Derived,high
+asset_subcategory,6,Reservoir,Derived,high
+asset_subcategory,8,Pump,Derived,high
+asset_subcategory,9,,Unresolved,
+asset_subcategory,10,Public Taps,Derived,high
+asset_subcategory,11,Pump House,Derived,high
+asset_subcategory,13,Water Purification System,Derived,high
+asset_subcategory,23,Bridge,Derived,high
+asset_subcategory,26,Rain Water Harvest Tank,Derived,high
+asset_subcategory,28,Septic Tank,Derived,high
+asset_subcategory,29,Toilet,Derived,high
+asset_subcategory,33,,Unresolved,
+asset_subcategory,37,Panchayat Bhawan,Derived,high
+asset_subcategory,38,Aanganwadi,Derived,high
+asset_subcategory,39,,Unresolved,
+asset_subcategory,40,,Unresolved,
+asset_subcategory,44,Shelter Home,Derived,high
+asset_subcategory,45,,Unresolved,
+asset_subcategory,46,Computer Centre,Derived,high
+asset_subcategory,47,Library Building,Derived,high
+asset_subcategory,53,Schools,Derived,high
+asset_subcategory,55,Play Ground / Park,Derived,high
+asset_subcategory,56,Health Centres,Derived,high
+asset_subcategory,58,PDS / Ration Shops,Derived,high
+asset_subcategory,59,Government Sponsored Houses,Derived,high
+asset_subcategory,62,Drainage,Derived,high
+asset_subcategory,63,Other Sanitation Asset,Derived,high
+asset_subcategory,64,Minor Irrigation Structures,Derived,high
+asset_subcategory,65,,Unresolved,
+asset_subcategory,66,Commercial Complexes,Derived,high
+asset_subcategory,367,Desktop Computers,Derived,high
+asset_subcategory,368,Laptop,Derived,high
+asset_subcategory,370,,Unresolved,
+asset_subcategory,371,,Unresolved,
+asset_subcategory,401,,Unresolved,
+asset_subcategory,411,,Unresolved,
+asset_subcategory,452,Water Tank,Derived,high
+asset_subcategory,457,Cultural Stage,Derived,high
+asset_subcategory,458,Road CC,Derived,high
+asset_subcategory,459,Road BT,Derived,high
+asset_subcategory,1026,,Unresolved,
+asset_subcategory,1038,Hostel Buildings,Derived,high
+asset_subcategory,1045,Mahila Mandals,Derived,high
+asset_subcategory,1051,,Unresolved,
+asset_subcategory,1057,Youth Club Buildings,Derived,high
+asset_subcategory,1060,IKP Buildings,Derived,high
+asset_subcategory,1062,Marriage / Community Hall,Derived,high
+asset_subcategory,1064,,Unresolved,
+asset_subcategory,1068,Culvert,Derived,high
+asset_subcategory,1069,Sewage Treatment Plant,Derived,high
+asset_subcategory,1072,Agricultural Land,Derived,high
+asset_subcategory,1076,Office Building,Derived,high
+asset_subcategory,1080,Store Room,Derived,high
+asset_subcategory,1083,Garbage Container,Derived,high
+asset_subcategory,1087,Market Yards/ Vending Zone,Derived,high
+asset_subcategory,1098,Type writers (Electronic / manual),Derived,high
+asset_subcategory,1099,insurance spares for Generators,Derived,high
+asset_subcategory,1102,Office Equipment,Derived,high
+asset_subcategory,1107,,Unresolved,
+asset_subcategory,1108,,Unresolved,
+asset_subcategory,1110,,Unresolved,
+asset_subcategory,1111,,Unresolved,
+asset_subcategory,1113,,Unresolved,
+asset_subcategory,1114,,Unresolved,
+asset_subcategory,1115,,Unresolved,
+asset_subcategory,1116,,Unresolved,
+asset_subcategory,1119,,Unresolved,
+asset_subcategory,1121,,Unresolved,
+asset_subcategory,1136,,Unresolved,
+asset_subcategory,1138,,Unresolved,
+asset_subcategory,1145,,Unresolved,
+asset_subcategory,1153,Wasteland,Derived,high
+asset_subcategory,1154,Grassland,Derived,high
+asset_subcategory,1155,Barrage/Weir/Anicut,Derived,high
+asset_subcategory,1156,Water supply pipe line,Derived,high
+asset_subcategory,1157,,Unresolved,
+asset_subcategory,1160,,Unresolved,
+asset_subcategory,1161,,Unresolved,
+asset_subcategory,1162,Cash safe,Derived,high
+asset_subcategory,1163,,Unresolved,
+asset_subcategory,1164,,Unresolved,
+asset_subcategory,1165,,Unresolved,
+asset_subcategory,1199,Sheds,Derived,high
+asset_subcategory,1200,Residential Buildings,Derived,high
+asset_subcategory,1201,Old Aged Home,Derived,high
+asset_subcategory,1202,Boundary wall / Side Wall / Retaining Wall,Derived,high
+asset_subcategory,1203,Guest House,Derived,high
+asset_subcategory,1205,Approach Road,Derived,high
+asset_subcategory,1206,Chaupal,Derived,high
+asset_subcategory,1207,Bharat Nirman Rajiv Gandhi Seva Kendra,Derived,high
+asset_subcategory,1208,Street Light,Derived,high
+asset_subcategory,1210,Transformer,Derived,high
+asset_subcategory,1211,Power Station,Derived,high
+asset_subcategory,1216,,Unresolved,
+asset_subcategory,1217,CSC (Common Service Centre),Derived,high
+asset_subcategory,1218,Night Shelter,Derived,high
+asset_subcategory,1220,Religious Structures,Derived,high
+asset_subcategory,1222,,Unresolved,
+asset_subcategory,1225,,Unresolved,
+asset_subcategory,1227,Godown and Stores,Derived,high
+asset_subcategory,1228,,Unresolved,
+asset_subcategory,1229,,Unresolved,
+asset_subcategory,1235,Overhead Tank,Derived,high
+asset_subcategory,1237,Hand pump,Derived,high
+asset_subcategory,1238,Tourist places,Derived,high
+asset_subcategory,1239,Cinema / Video hall,Derived,high
+asset_subcategory,1240,Garbage Disposal Sites,Derived,high
+asset_subcategory,1242,Women and Child Centres,Derived,high
+asset_subcategory,1247,Other Financial Institutions,Derived,high
+asset_subcategory,1248,Cremation Ground/Graveyard,Derived,high
+asset_subcategory,1251,Bathing Ghat,Derived,high
+asset_subcategory,1252,Other Public / Social Service Centre,Derived,high
+asset_subcategory,1253,Bathroom,Derived,high
+asset_subcategory,1254,Pavement,Derived,high
+asset_subcategory,1256,Gram Sachivalaya,Derived,high
+asset_subcategory,1258,Metal Road,Derived,high
+asset_subcategory,1259,,Unresolved,
+asset_subcategory,1260,Furniture & Play material for Anganwadi centers,Derived,high
+asset_subcategory,1261,,Unresolved,
+asset_subcategory,1262,Garbage Transportation,Derived,high
+asset_subcategory,1263,Safety and Sanitary Kits,Derived,high
+asset_subcategory,1264,Vehicles for Garbage transport,Derived,high
+asset_subcategory,1265,Sanitation Tools,Derived,high
+asset_subcategory,1269,,Unresolved,
+asset_subcategory,1270,,Unresolved,
+asset_subcategory,1271,,Unresolved,
+asset_subcategory,1272,Cattle Troughs,Derived,high
+asset_subcategory,1274,Electrification,Derived,high
+asset_subcategory,1275,Building Electrification,Derived,high
+asset_subcategory,1276,,Unresolved,
+asset_subcategory,1280,,Unresolved,
+asset_subcategory,1281,Community Compost Pits,Derived,high
+asset_subcategory,1282,Individual Compost Pits,Derived,high
+asset_subcategory,1283,Community Bio Gas plant,Derived,high
+asset_subcategory,1284,Push carts-Vehicles for Collection and Transportation,Derived,high
+asset_subcategory,1285,Tractors-Vehicles for Collection and Transportation,Derived,high
+asset_subcategory,1286,Battery operated-Vehicles for Collection and Transportation,Derived,high
+asset_subcategory,1287,Vehicles for Collection and Transportation (Others),Derived,high
+asset_subcategory,1288,Plastic Waste Management Centre,Derived,high
+asset_subcategory,1289,Menstrual Waste Decomposer e.g. Incinerator,Derived,high
+asset_subcategory,1290,Community Soak Pit/ Leach Pit/ Magic Pit,Derived,high
+asset_subcategory,1299,Individual Household Latrine (IHHL),Derived,high
+asset_subcategory,1300,Community Sanitation Complex (CSC),Derived,high
+asset_subcategory,1301,Institutional Toilet,Derived,high
+asset_subcategory,1307,Plastic Waste Storage Unit,Derived,high
+asset_subcategory,1308,Waste stabilization pond–3-pond system,Derived,high
+asset_subcategory,1311,,Unresolved,
+asset_subcategory,1312,Constructed Wet Lands,Derived,high
+asset_subcategory,1313,Drainage channel,Derived,high
+asset_subcategory,1314,Small-bore pipe conveyance system,Derived,high
+asset_subcategory,1315,,Unresolved,
+asset_subcategory,1316,Individual soak pit,Derived,high
+asset_subcategory,1317,Community soak pit,Derived,high
+asset_subcategory,1318,,Unresolved,
+asset_subcategory,1320,,Unresolved,
+asset_subcategory,1322,,Unresolved,
+asset_subcategory,1325,Leach Pit,Derived,high
+asset_subcategory,1326,Soak Pit,Derived,high
+asset_subcategory,1328,Multi village Plastic Waste Management Unit (PWMU),Derived,high
+asset_subcategory,1329,Material Recovery Facility (MRF),Derived,high
+asset_subcategory,1330,Drainage channel for multiple villages,Derived,high
+asset_subcategory,1341,Drainage channel for multiple villages,Derived,high
+asset_subcategory,1342,Multi village/Block Plastic Waste Management Unit (PWMU),Derived,high
+asset_subcategory,1343,Medical Consumables,Derived,high
+asset_subcategory,1344,Amrit Sarovar,Derived,high
+asset_subcategory,1345,Pumphouse,Derived,high
+asset_subcategory,1346,Overhead tank,Derived,high
+asset_subcategory,1348,Water treatment plant,Derived,high
+asset_subcategory,1349,Groundwater source borewell,Derived,high
+asset_subcategory,1350,Motor pump,Derived,high
+asset_subcategory,1351,Solar panel,Derived,high
+asset_subcategory,1352,Additional borewell,Derived,high
+asset_subcategory,1353,Additional surface water source,Derived,high
+asset_subcategory,1355,Groundwater source Tubewell,Derived,high
+asset_subcategory,1356,Pond,Derived,high
+asset_subcategory,1357,,Unresolved,
+asset_subcategory,1358,Spring source,Derived,high
+asset_subcategory,1359,Tap connection to the school,Derived,high
+asset_subcategory,1360,Tap connection to Anganwadi centres,Derived,high
+asset_subcategory,1361,Tap connection to Panchayat office,Derived,high
+asset_subcategory,1362,Tap connection to other public institutional building,Derived,high
+asset_subcategory,1363,,Unresolved,
+asset_subcategory,1364,Construction of Pond,Derived,high
+asset_subcategory,1365,,Unresolved,
+asset_subcategory,1366,,Unresolved,
+asset_subcategory,1367,,Unresolved,
+asset_subcategory,1368,Construction of conveyance structure,Derived,high
+asset_subcategory,1369,Individual soak pit,Derived,high
+asset_subcategory,1370,,Unresolved,
+asset_subcategory,1373,,Unresolved,
+asset_subcategory,1375,Tap connections,Derived,high
+asset_subcategory,1376,Waste collection and segregation sheds in the village,Derived,high
+asset_subcategory,1377,Segregation Bins at Community places in the village,Derived,high
+asset_subcategory,1380,Aanganwadi,Derived,high
+asset_coverage_code,A,,Unresolved,
+asset_unit_type,2,P,Derived,high
+asset_unit_type,4,L,Derived,high
+asset_unit_type,5,Y,Derived,high
+fund_scheme_code,0,Own Funds,Derived,medium
+fund_scheme_code,21,,Unresolved,
+fund_scheme_code,26,,Unresolved,
+fund_scheme_code,27,,Unresolved,
+fund_scheme_code,29,,Unresolved,
+fund_scheme_code,31,,Unresolved,
+fund_scheme_code,34,,Unresolved,
+fund_scheme_code,38,,Candidate,
+fund_scheme_code,399,,Unresolved,
+fund_scheme_code,1008,,Unresolved,
+fund_scheme_code,1013,,Unresolved,
+fund_scheme_code,1481,,Unresolved,
+fund_scheme_code,1547,,Unresolved,
+fund_scheme_code,1696,,Unresolved,
+fund_scheme_code,1769,XV Finance Commission,Confirmed,high
+fund_scheme_code,1778,5TH STATE FINANCE COMMISSION,Confirmed,high
+fund_scheme_code,1786,,Unresolved,
+fund_scheme_code,1859,,Unresolved,
+fund_component_code,0,Own Funds,Derived,medium
+fund_component_code,1,,Unresolved,
+fund_component_code,3,,Unresolved,
+fund_component_code,4,,Unresolved,
+fund_component_code,17,,Unresolved,
+fund_component_code,23,,Unresolved,
+fund_component_code,24,,Unresolved,
+fund_component_code,26,,Unresolved,
+fund_component_code,2022,,Unresolved,
+fund_component_code,2029,,Unresolved,
+fund_component_code,3744,,Unresolved,
+fund_component_code,3795,,Unresolved,
+fund_component_code,3973,,Unresolved,
+fund_component_code,4133,,Unresolved,
+fund_component_code,4211,Basic Grant (untied),Derived,high
+fund_component_code,4212,,Unresolved,
+fund_component_code,4213,,Unresolved,
+fund_component_code,4214,,Unresolved,
+fund_component_code,4215,,Unresolved,
+fund_component_code,4249,Tied Grant,Derived,high
+fund_component_code,4250,DEVOLUTION OF FUND,Derived,high
+fund_component_code,4251,GRANT-IN-AID,Derived,high
+fund_component_code,4252,NON CFC/SFC,Derived,medium
+fund_component_code,4258,,Unresolved,
+fund_component_code,4306,,Unresolved,
+community_service_code,657,,Unresolved,
+community_service_code,658,,Unresolved,
+community_service_code,659,,Unresolved,
+asset_parameter_type,1,Well,Derived,high
+asset_parameter_type,2,Borewell,Derived,high
+asset_parameter_type,3,Pond,Derived,medium
+asset_parameter_type,4,Spring Box,Derived,medium
+asset_parameter_type,5,Checkdam,Derived,medium
+asset_parameter_type,6,,Unresolved,
+asset_parameter_type,8,Pump,Derived,medium
+asset_parameter_type,9,Public Taps,Derived,high
+asset_parameter_type,10,Pump House,Derived,high
+asset_parameter_type,21,Bridge,Derived,medium
+asset_parameter_type,23,Rain Water Harvest Tank,Derived,medium
+asset_parameter_type,25,,Unresolved,
+asset_parameter_type,26,Toilet,Derived,medium
+asset_parameter_type,29,,Unresolved,
+asset_parameter_type,33,Panchayat Bhawan,Derived,medium
+asset_parameter_type,34,Aanganwadi,Derived,medium
+asset_parameter_type,35,,Unresolved,
+asset_parameter_type,36,,Unresolved,
+asset_parameter_type,40,Shelter Home,Derived,medium
+asset_parameter_type,41,,Unresolved,
+asset_parameter_type,42,,Unresolved,
+asset_parameter_type,43,Library Building,Derived,medium
+asset_parameter_type,49,Schools,Derived,high
+asset_parameter_type,51,,Unresolved,
+asset_parameter_type,53,PDS / Ration Shops,Derived,medium
+asset_parameter_type,54,Government Sponsored Houses,Derived,medium
+asset_parameter_type,57,Other Sanitation Asset,Derived,medium
+asset_parameter_type,58,Minor Irrigation Structures,Derived,medium
+asset_parameter_type,59,,Unresolved,
+asset_parameter_type,60,Commercial Complexes,Derived,medium
+asset_parameter_type,61,,Unresolved,
+asset_parameter_type,64,Play Ground / Park,Derived,high
+asset_parameter_type,65,Drainage,Derived,high
+asset_parameter_type,80,,Unresolved,
+asset_parameter_type,84,Hostel Buildings,Derived,medium
+asset_parameter_type,89,Mahila Mandals,Derived,medium
+asset_parameter_type,95,,Unresolved,
+asset_parameter_type,101,,Unresolved,
+asset_parameter_type,104,IKP Buildings,Derived,medium
+asset_parameter_type,106,Marriage / Community Hall,Derived,high
+asset_parameter_type,267,Desktop Computers,Derived,medium
+asset_parameter_type,268,Laptop,Derived,medium
+asset_parameter_type,270,,Unresolved,
+asset_parameter_type,271,,Unresolved,
+asset_parameter_type,301,,Unresolved,
+asset_parameter_type,311,,Unresolved,
+asset_parameter_type,352,Water Tank,Derived,high
+asset_parameter_type,357,Cultural Stage,Derived,medium
+asset_parameter_type,358,Road CC,Derived,high
+asset_parameter_type,359,Road BT,Derived,high
+asset_parameter_type,367,,Unresolved,
+asset_parameter_type,371,Culvert,Derived,medium
+asset_parameter_type,372,,Unresolved,
+asset_parameter_type,376,Agricultural Land,Derived,medium
+asset_parameter_type,380,Office Building,Derived,high
+asset_parameter_type,384,Store Room,Derived,medium
+asset_parameter_type,387,,Unresolved,
+asset_parameter_type,391,Market Yards/ Vending Zone,Derived,medium
+asset_parameter_type,402,Type writers (Electronic / manual),Derived,medium
+asset_parameter_type,403,insurance spares for Generators,Derived,medium
+asset_parameter_type,406,Office Equipment,Derived,high
+asset_parameter_type,410,,Unresolved,
+asset_parameter_type,411,,Unresolved,
+asset_parameter_type,413,,Unresolved,
+asset_parameter_type,414,,Unresolved,
+asset_parameter_type,416,,Unresolved,
+asset_parameter_type,417,,Unresolved,
+asset_parameter_type,418,,Unresolved,
+asset_parameter_type,419,,Unresolved,
+asset_parameter_type,422,,Unresolved,
+asset_parameter_type,424,,Unresolved,
+asset_parameter_type,440,,Unresolved,
+asset_parameter_type,442,,Unresolved,
+asset_parameter_type,449,,Unresolved,
+asset_parameter_type,457,Wasteland,Derived,high
+asset_parameter_type,458,Grassland,Derived,medium
+asset_parameter_type,459,Barrage/Weir/Anicut,Derived,medium
+asset_parameter_type,461,,Unresolved,
+asset_parameter_type,464,,Unresolved,
+asset_parameter_type,466,Cash safe,Derived,medium
+asset_parameter_type,467,,Unresolved,
+asset_parameter_type,468,,Unresolved,
+asset_parameter_type,469,,Unresolved,
+asset_parameter_type,503,Residential Buildings,Derived,medium
+asset_parameter_type,505,Boundary wall / Side Wall / Retaining Wall,Derived,high
+asset_parameter_type,508,Approach Road,Derived,high
+asset_parameter_type,551,Water supply pipe line,Derived,high
+asset_parameter_type,600,,Unresolved,
+asset_parameter_type,650,Water Purification System,Derived,medium
+asset_parameter_type,651,Sheds,Derived,high
+asset_parameter_type,652,,Unresolved,
+asset_parameter_type,653,Bharat Nirman Rajiv Gandhi Seva Kendra,Derived,medium
+asset_parameter_type,654,Street Light,Derived,high
+asset_parameter_type,656,Transformer,Derived,medium
+asset_parameter_type,657,Power Station,Derived,medium
+asset_parameter_type,662,,Unresolved,
+asset_parameter_type,663,CSC (Common Service Centre),Derived,medium
+asset_parameter_type,664,Night Shelter,Derived,medium
+asset_parameter_type,666,,Unresolved,
+asset_parameter_type,668,,Unresolved,
+asset_parameter_type,671,,Unresolved,
+asset_parameter_type,673,Godown and Stores,Derived,medium
+asset_parameter_type,674,,Unresolved,
+asset_parameter_type,675,,Unresolved,
+asset_parameter_type,681,Overhead Tank,Derived,high
+asset_parameter_type,683,Hand pump,Derived,high
+asset_parameter_type,684,Tourist places,Derived,medium
+asset_parameter_type,685,Cinema / Video hall,Derived,medium
+asset_parameter_type,686,Garbage Disposal Sites,Derived,medium
+asset_parameter_type,688,Women and Child Centres,Derived,medium
+asset_parameter_type,694,,Unresolved,
+asset_parameter_type,697,Bathing Ghat,Derived,medium
+asset_parameter_type,698,Other Public / Social Service Centre,Derived,high
+asset_parameter_type,699,Bathroom,Derived,medium
+asset_parameter_type,702,Gram Sachivalaya,Derived,high
+asset_parameter_type,703,Pavement,Derived,high
+asset_parameter_type,705,,Unresolved,
+asset_parameter_type,706,,Unresolved,
+asset_parameter_type,707,,Unresolved,
+asset_parameter_type,708,,Unresolved,
+asset_parameter_type,709,Garbage Transportation,Derived,medium
+asset_parameter_type,710,,Unresolved,
+asset_parameter_type,711,,Unresolved,
+asset_parameter_type,712,Sanitation Tools,Derived,high
+asset_parameter_type,716,,Unresolved,
+asset_parameter_type,717,,Unresolved,
+asset_parameter_type,718,,Unresolved,
+asset_parameter_type,719,,Unresolved,
+asset_parameter_type,721,Electrification,Derived,medium
+asset_parameter_type,722,Building Electrification,Derived,high
+asset_parameter_type,723,,Unresolved,
+asset_parameter_type,725,Community Sanitation Complex (CSC),Derived,medium
+asset_parameter_type,726,,Unresolved,
+asset_parameter_type,728,Community Compost Pits,Derived,high
+asset_parameter_type,729,Individual Compost Pits,Derived,medium
+asset_parameter_type,730,Community Bio Gas plant,Derived,medium
+asset_parameter_type,731,Push carts-Vehicles for Collection and Transportation,Derived,high
+asset_parameter_type,732,Tractors-Vehicles for Collection and Transportation,Derived,medium
+asset_parameter_type,733,Battery operated-Vehicles for Collection and Transportation,Derived,high
+asset_parameter_type,734,Vehicles for Collection and Transportation (Others),Derived,high
+asset_parameter_type,735,Plastic Waste Management Centre,Derived,medium
+asset_parameter_type,736,,Unresolved,
+asset_parameter_type,745,Menstrual Waste Decomposer e.g. Incinerator,Derived,medium
+asset_parameter_type,746,Individual Household Latrine (IHHL),Derived,high
+asset_parameter_type,747,Community Sanitation Complex (CSC),Derived,high
+asset_parameter_type,748,Institutional Toilet,Derived,high
+asset_parameter_type,754,Plastic Waste Storage Unit,Derived,high
+asset_parameter_type,758,,Unresolved,
+asset_parameter_type,759,Constructed Wet Lands,Derived,medium
+asset_parameter_type,760,Drainage channel,Derived,high
+asset_parameter_type,761,,Unresolved,
+asset_parameter_type,762,,Unresolved,
+asset_parameter_type,763,Individual soak pit,Derived,medium
+asset_parameter_type,764,Community soak pit,Derived,high
+asset_parameter_type,765,,Unresolved,
+asset_parameter_type,767,,Unresolved,
+asset_parameter_type,769,,Unresolved,
+asset_parameter_type,772,,Unresolved,
+asset_parameter_type,773,Soak Pit,Derived,medium
+asset_parameter_type,777,Drainage channel for multiple villages,Derived,medium
+asset_parameter_type,787,Drainage channel for multiple villages,Derived,medium
+asset_parameter_type,788,Multi village/Block Plastic Waste Management Unit (PWMU),Derived,medium
+asset_parameter_type,789,Medical Consumables,Derived,medium
+asset_parameter_type,790,Amrit Sarovar,Derived,medium
+asset_parameter_type,791,Tap connections,Derived,high
+asset_parameter_type,792,Pumphouse,Derived,high
+asset_parameter_type,793,Overhead tank,Derived,high
+asset_parameter_type,795,Water treatment plant,Derived,high
+asset_parameter_type,796,Groundwater source borewell,Derived,medium
+asset_parameter_type,797,Motor pump,Derived,high
+asset_parameter_type,798,Solar panel,Derived,medium
+asset_parameter_type,799,Additional borewell,Derived,high
+asset_parameter_type,800,Additional surface water source,Derived,high
+asset_parameter_type,802,Groundwater source Tubewell,Derived,high
+asset_parameter_type,803,Pond,Derived,medium
+asset_parameter_type,804,,Unresolved,
+asset_parameter_type,805,Spring source,Derived,medium
+asset_parameter_type,806,Tap connection to the school,Derived,medium
+asset_parameter_type,807,Tap connection to Anganwadi centres,Derived,medium
+asset_parameter_type,808,Tap connection to Panchayat office,Derived,medium
+asset_parameter_type,809,Tap connection to other public institutional building,Derived,medium
+asset_parameter_type,810,,Unresolved,
+asset_parameter_type,811,Construction of Pond,Derived,medium
+asset_parameter_type,812,,Unresolved,
+asset_parameter_type,813,,Unresolved,
+asset_parameter_type,814,,Unresolved,
+asset_parameter_type,815,Construction of conveyance structure,Derived,medium
+asset_parameter_type,816,Individual soak pit,Derived,high
+asset_parameter_type,817,,Unresolved,
+asset_parameter_type,820,,Unresolved,
+asset_parameter_type,822,Waste collection and segregation sheds in the village,Derived,high
+asset_parameter_type,823,Segregation Bins at Community places in the village,Derived,medium
+asset_parameter_type,826,Aanganwadi,Derived,high

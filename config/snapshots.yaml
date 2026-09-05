@@ -2,4 +2,24 @@ version: 1
 
 # Only snapshots that have been explicitly reviewed for the pipeline contract
 # belong here. Source adapters or release tooling add exact immutable run IDs.
-snapshots: []
+snapshots:
+  - id: egramswaraj-2026-09-04
+    source: egramSwaraj
+    run_id: '2026-09-04'
+    schema_version: '1'
+    status: approved
+  - id: egramswaraj_profile-2026-09-04
+    source: egramswaraj_profile
+    run_id: '2026-09-04'
+    schema_version: '1'
+    status: approved
+  - id: egramswaraj_accounting-2026-09-05
+    source: egramswaraj_accounting
+    run_id: '2026-09-05'
+    schema_version: '1'
+    status: approved
+  - id: egramswaraj_expenditure-2026-09-05
+    source: egramswaraj_expenditure
+    run_id: '2026-09-05'
+    schema_version: '1'
+    status: approved

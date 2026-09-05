@@ -15,6 +15,7 @@ from .normalize import (
     NormalizationError,
     NormalizationResult,
     normalize_egramswaraj,
+    normalize_flat_csv,
     normalize_run,
 )
 
@@ -35,6 +36,7 @@ __all__ = [
     "load_settings",
     "load_snapshot_registry",
     "normalize_egramswaraj",
+    "normalize_flat_csv",
     "normalize_run",
     "validate_run",
 ]

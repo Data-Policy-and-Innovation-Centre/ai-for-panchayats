@@ -15,13 +15,19 @@ from __future__ import annotations
 from decimal import Decimal
 
 import duckdb
+import pytest
 
+from scripts import check_warehouse_conformance as conformance_cli
 from warehouse.geography import gp_geography
+from warehouse.schema import DDL as REAL_DDL
 
 from warehouse.conformance import (
+    EXEMPTABLE_RECONCILIATION_CHECKS,
     EXPECTED_ACTIVITY_EXPENDITURE_TOTAL,
+    GP_PROFILE_MEASURES,
     EXPECTED_PLANNED_COST_TOTAL,
     EXPECTED_VOUCHER_AMOUNT_TOTAL,
+    RECONCILIATION_TARGETS,
     check_activity_expenditure_fk_not_enforced,
     check_activity_nsap_empty,
     check_activity_voucher_nullable,
@@ -30,11 +36,13 @@ from warehouse.conformance import (
     check_conformance,
     check_dim_code_uniqueness,
     check_geography_completeness,
+    check_gp_profile_completeness,
     check_fiscal_year_format,
     check_money_types,
     check_primary_keys,
     check_reconciliation_totals,
     check_required_foreign_keys,
+    check_satellite_payload_population,
     check_satellite_row_parity,
     check_surrogate_key_types,
     check_table_existence,
@@ -55,6 +63,17 @@ FULL_DDL: dict[str, str] = {
             zp_name VARCHAR, block_code VARCHAR, block_name VARCHAR
         )
     """,
+    "gp_profile": """
+        CREATE TABLE gp_profile (
+            source_system VARCHAR, source_run_id VARCHAR,
+            gp_lgd_code VARCHAR PRIMARY KEY,
+            total_population INTEGER, male_population INTEGER,
+            female_population INTEGER, transgender_population INTEGER,
+            children_population INTEGER, sc_population INTEGER,
+            st_population INTEGER, obc_population INTEGER,
+            general_population INTEGER, households INTEGER,
+            FOREIGN KEY (gp_lgd_code) REFERENCES gram_panchayat (gp_lgd_code)
+        )""",
     "plan": """
         CREATE TABLE plan (
             plan_code VARCHAR PRIMARY KEY, gp_lgd_code VARCHAR, fiscal_year VARCHAR,
@@ -171,7 +190,7 @@ def build_full_schema(con: duckdb.DuckDBPyConnection) -> None:
 # planned_activity -> activity_delegation, etc).
 _FK_DEPENDENTS: dict[str, tuple[str, ...]] = {
     "gram_panchayat": (
-        "plan", "planned_activity", "activity_expenditure", "voucher",
+        "gp_profile", "plan", "planned_activity", "activity_expenditure", "voucher",
         "admin_approval", "technical_approval",
     ),
     "plan": ("planned_activity",),
@@ -548,6 +567,220 @@ def test_beneficiary_count_type_flags_missing_required_column(tmp_path):
 # Section 5: data-level invariants
 # ---------------------------------------------------------------------------
 
+# One populated column per satellite, so a fixture can be conformant rather
+# than merely well-shaped. Read off the shipped DDL rather than invented.
+_SATELLITE_FIRST_PAYLOAD_COLUMN: dict[str, str] = {
+    "activity_delegation": "is_delegated",
+    "activity_asset": "asset_type",
+    "activity_fund": "fund_scheme_code",
+    "activity_training": "training_category_code",
+    "activity_community_service": "community_service_code",
+}
+
+
+def _real_satellites(con: duckdb.DuckDBPyConnection, *tables: str) -> None:
+    """Replace stub satellites with the DDL the build actually ships.
+
+    FULL_DDL's satellites carry only `activity_code`, which is right for the
+    checks that only count rows -- but a payload check needs payload columns,
+    and inventing a shape here would test a table nobody builds. Nothing holds
+    a foreign key onto a satellite, so this needs no _drop_with_dependents.
+    """
+
+    for table in tables or tuple(_SATELLITE_FIRST_PAYLOAD_COLUMN):
+        con.execute(f"DROP TABLE {table}")
+        con.execute(REAL_DDL[table])
+
+
+def _real_activity_asset(con: duckdb.DuckDBPyConnection) -> None:
+    _real_satellites(con, "activity_asset")
+
+
+def _populate_satellite(con: duckdb.DuckDBPyConnection, table: str, activity_code: str) -> None:
+    """One row with EVERY payload column non-NULL, typed from the live schema.
+
+    Typed by asking the catalog rather than by a hand-kept list, so a column
+    added to a satellite is populated here automatically instead of quietly
+    becoming the fixture's own dead column.
+    """
+
+    columns = con.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = ? ORDER BY ordinal_position", [table],
+    ).fetchall()
+    names, values = [], []
+    for name, data_type in columns:
+        names.append(name)
+        upper = data_type.upper()
+        if name == "activity_code":
+            values.append(activity_code)
+        elif name == "source_system":
+            values.append("egramSwaraj")
+        elif name == "source_run_id":
+            values.append("run-1")
+        elif "BOOL" in upper:
+            values.append(True)
+        elif any(kind in upper for kind in ("INT", "DOUBLE", "DECIMAL", "FLOAT", "NUMERIC")):
+            values.append(1)
+        else:
+            values.append("x")
+    placeholders = ", ".join("?" for _ in names)
+    quoted = ", ".join(f'"{name}"' for name in names)
+    con.execute(f"INSERT INTO {table} ({quoted}) VALUES ({placeholders})", values)
+
+
+def test_satellite_payload_flags_a_table_that_is_all_padding(tmp_path):
+    """The exact shape #159 shipped in, which every existing check passed.
+
+    The 1:1 satellites are padded to one row per planned_activity by design,
+    so row parity is silent about whether any data arrived. activity_asset
+    held 4,073,745 rows with every asset column NULL and conformance said
+    PASS; the deployed chatbot answered every asset question with
+    'Uncategorised' over a healthy-looking four-million-row table.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+    findings = check_satellite_payload_population(con)
+    assert [f.check for f in findings] == ["data.satellite_payload.activity_asset"]
+    assert findings[0].severity == "violation"
+    assert "every payload column is NULL" in findings[0].actual
+    con.close()
+
+
+def test_satellite_payload_reports_one_dead_column_without_failing(tmp_path):
+    """A column the source never sends is worth stating, not worth failing.
+
+    asset_name is the real case: the portal sends `astNm` on every record and
+    its value is always null, so nothing can populate it from this source.
+    The five asset_loc_* columns are a different story (#177) -- the source
+    does carry them and normalize drops them -- but neither is a reason to
+    fail a build, and both are a reason to say so in the report.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code, asset_category) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1', 'Roads')"
+    )
+    findings = check_satellite_payload_population(con)
+    assert findings, "a dead column must still be reported"
+    assert all(f.severity == "informational" for f in findings), (
+        "one populated column means the table is working; the rest are notes"
+    )
+    dead = {f.check for f in findings}
+    assert "data.satellite_payload.activity_asset.asset_name" in dead
+    assert "data.satellite_payload.activity_asset.asset_category" not in dead
+    con.close()
+
+
+def test_satellite_payload_says_nothing_about_an_empty_satellite(tmp_path):
+    """An empty table is section 5's business, not this check's.
+
+    Firing here as well would report the same fixture twice and make the
+    synthetic-fixture path noisy for a condition row parity already owns.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    assert check_satellite_payload_population(con) == []
+    con.close()
+
+
+def test_all_null_satellite_is_a_violation_only_at_full_state(tmp_path):
+    """The same fact means different things about a fixture and about the state.
+
+    A three-activity fixture whose records carry no training or delegation
+    fields has an all-NULL satellite and is not wrong for it. The full-state
+    build is: 4,073,745 rows of nothing means whatever routes data into that
+    table is broken. So this rides `skip_geography`, which already answers
+    exactly that question -- is this the state, or a fixture? -- rather than
+    inventing a second flag that could disagree with it.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+
+    def severity_of(*, full_state: bool) -> str:
+        findings = check_satellite_payload_population(con, full_state=full_state)
+        table_level = [f for f in findings if f.check == "data.satellite_payload.activity_asset"]
+        assert len(table_level) == 1
+        return table_level[0].severity
+
+    assert severity_of(full_state=True) == "violation"
+    assert severity_of(full_state=False) == "informational", (
+        "a fixture must not be failed for a satellite its records never populate"
+    )
+    con.close()
+
+
+def test_a_satellite_with_no_payload_columns_at_all_is_drift(tmp_path):
+    """This check's own blind spot, one level up from the one it was written for.
+
+    A satellite reduced to its identity columns cannot hold data, and nothing
+    else notices: check_table_existence compares table NAMES, and row parity,
+    primary keys and foreign keys all still pass on a table with no payload.
+    Skipping it quietly -- which is what the first version of this check did --
+    reproduces the #159 failure in a form the check itself could not see.
+
+    FULL_DDL's stub satellites are exactly this shape, which is why it needs
+    the same full_state gate: a fixture is allowed to be a stub.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)  # stub satellites: activity_code and nothing else
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute("INSERT INTO activity_asset VALUES ('A1')")
+
+    findings = check_satellite_payload_population(con, full_state=True)
+    asset = [f for f in findings if f.check == "data.satellite_payload.activity_asset"]
+    assert len(asset) == 1
+    assert asset[0].severity == "violation"
+    assert "only identity columns" in asset[0].actual
+
+    assert check_satellite_payload_population(con, full_state=False) == [], (
+        "a stub fixture must not be failed for being a stub"
+    )
+    con.close()
+
+
+def test_satellite_payload_runs_by_default(tmp_path):
+    """Registered in ALL_CHECKS, not merely available to be called.
+
+    #159 is a check that existed in nobody's head; one that exists but is
+    never invoked would be the same defect wearing a test.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+    findings = check_conformance(
+        con, skip_derived=True, skip_reconciliation=True, skip_geography=True,
+    )
+    assert any(f.check == "data.satellite_payload.activity_asset" for f in findings)
+    con.close()
+
+
 def test_satellite_row_parity_passes_when_empty(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
@@ -733,7 +966,7 @@ def test_reconciliation_skippable_for_synthetic_fixtures(tmp_path):
     build_full_schema(con)
     # No voucher/expenditure/planned-cost rows inserted at all -- would
     # normally fail every reconciliation total (0.00 != the real totals).
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert not any(f.check.startswith("reconciliation.") for f in findings)
     con.close()
 
@@ -741,11 +974,84 @@ def test_reconciliation_skippable_for_synthetic_fixtures(tmp_path):
 def test_reconciliation_included_by_default_and_fails_on_empty_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
-    findings = check_conformance(con, skip_reconciliation=False)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=False)
     reconciliation_findings = [f for f in findings if f.check.startswith("reconciliation.")]
     assert len(reconciliation_findings) == 3
     assert all(f.severity == "violation" for f in reconciliation_findings)
     con.close()
+
+
+def test_exempting_one_total_still_checks_the_others(tmp_path):
+    """The point of #175: one unhittable total must not switch off the rest.
+
+    Before this, `make warehouse` passed a blanket --skip-reconciliation
+    because the voucher total cannot be hit until #171. The cost was that
+    nothing checked the other two either -- so the cross-snapshot defect
+    fixed in f128944, which silently doubles activity_expenditure, would have
+    reached a green build AND a green conformance run.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
+    # The voucher total is short, exactly as the real build's is (#171).
+    con.execute(
+        "INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', ?, 'payment')",
+        [EXPECTED_VOUCHER_AMOUNT_TOTAL - Decimal("1000000.00")],
+    )
+    # And the expenditure total is doubled, as an overlapping snapshot would
+    # have made it.
+    con.execute(
+        "INSERT INTO activity_expenditure VALUES (1, 'A1', ?, NULL)",
+        [EXPECTED_ACTIVITY_EXPENDITURE_TOTAL * 2],
+    )
+    con.execute(
+        "INSERT INTO planned_activity VALUES ('A1', NULL, ?, NULL)",
+        [float(EXPECTED_PLANNED_COST_TOTAL)],
+    )
+
+    exempt = frozenset({"reconciliation.voucher_amount_total"})
+    findings = check_reconciliation_totals(con, exempt)
+    by_check = {f.check: f for f in findings}
+
+    violations = [f for f in findings if f.severity == "violation"]
+    assert [f.check for f in violations] == ["reconciliation.activity_expenditure_total"], (
+        "the doubled expenditure must still be caught while voucher is exempt"
+    )
+    # The exemption is reported, not silent: a clean-looking report that
+    # quietly checked nothing is the failure mode this replaces.
+    exempted = by_check["reconciliation.voucher_amount_total"]
+    assert exempted.severity == "informational"
+    assert exempted.actual == "not checked"
+    assert exempted.expected == str(EXPECTED_VOUCHER_AMOUNT_TOTAL)
+    con.close()
+
+
+def test_exemption_names_are_derived_from_the_targets(tmp_path):
+    """A stale exemption must not silently match nothing.
+
+    The CLI restricts --exempt-reconciliation to this set, so a target that
+    gets renamed takes its accepted spelling with it rather than leaving an
+    exemption that quietly enforces a check the operator believes is off.
+    """
+
+    assert EXEMPTABLE_RECONCILIATION_CHECKS == {
+        name for name, *_ in RECONCILIATION_TARGETS
+    }
+    assert "reconciliation.voucher_amount_total" in EXEMPTABLE_RECONCILIATION_CHECKS
+
+
+def test_the_cli_refuses_an_unknown_exemption(tmp_path):
+    """Rejected at the boundary rather than accepted and ignored."""
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.close()
+    database = str(tmp_path / "test.duckdb")
+
+    with pytest.raises(SystemExit) as exit_info:
+        conformance_cli.main([database, "--exempt-reconciliation", "reconciliation.typo"])
+    assert exit_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -815,11 +1121,11 @@ def test_geography_has_its_own_opt_out(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
 
-    skipped = check_conformance(con, skip_reconciliation=True, skip_geography=True)
+    skipped = check_conformance(con, skip_derived=True, skip_reconciliation=True, skip_geography=True)
     assert not any(f.check.startswith("geography.") for f in skipped)
 
     # Skipping only the totals must still assert scale.
-    checked = check_conformance(con, skip_reconciliation=True)
+    checked = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert any(f.check.startswith("geography.") for f in checked)
     con.close()
 
@@ -848,12 +1154,23 @@ def _seed_full_state_geography(con):
         "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
+    # Demographics too: "full state" now means both coverage checks, and a
+    # fixture that seeds one and not the other is the shape of artifact this
+    # is meant to refuse. Every measure is populated -- naming a subset is the
+    # trap `check_gp_profile_completeness` exists to close.
+    measures = ", ".join(GP_PROFILE_MEASURES)
+    placeholders = ", ".join("?" for _ in GP_PROFILE_MEASURES)
+    con.executemany(
+        f"INSERT INTO gp_profile (gp_lgd_code, {measures}) VALUES (?, {placeholders})",
+        [(row[0], *range(1, len(GP_PROFILE_MEASURES) + 1)) for row in rows],
+    )
     return rows[0][0]
 
 
 def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
+    _real_satellites(con)
     gp_code = _seed_full_state_geography(con)
     con.execute(
         "INSERT INTO voucher VALUES (1, ?, '2025-2026', 'V1', ?, 'payment')",
@@ -867,12 +1184,13 @@ def test_check_conformance_passes_on_fully_conformant_populated_fixture(tmp_path
         "INSERT INTO planned_activity VALUES ('A1', NULL, ?, NULL)",
         [float(EXPECTED_PLANNED_COST_TOTAL)],
     )
-    con.execute("INSERT INTO activity_delegation VALUES ('A1')")
-    con.execute("INSERT INTO activity_asset VALUES ('A1')")
-    con.execute("INSERT INTO activity_fund VALUES ('A1')")
-    con.execute("INSERT INTO activity_training VALUES ('A1')")
-    con.execute("INSERT INTO activity_community_service VALUES ('A1')")
-    findings = check_conformance(con, skip_reconciliation=False)
+    # Real satellite DDL, every payload column populated. A satellite reduced
+    # to identity columns is schema drift now, and one whose columns are all
+    # NULL is reported -- so a fixture calling itself "fully conformant" has
+    # to actually carry data, not just the right shape.
+    for table in _SATELLITE_FIRST_PAYLOAD_COLUMN:
+        _populate_satellite(con, table, "A1")
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=False)
     assert findings == []
     assert not has_violations(findings)
     assert format_report(findings) == "PASS: no deviations from spec found."
@@ -883,7 +1201,7 @@ def test_check_conformance_fails_and_reports_on_broken_fixture(tmp_path):
     con = _connect(tmp_path)
     build_full_schema(con)
     con.execute("DROP TABLE dim_welfare_scheme")
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     assert has_violations(findings)
     report = format_report(findings)
     assert "VIOLATION" in report
@@ -920,9 +1238,54 @@ def test_check_conformance_rejects_schema_previously_passed_as_conformant(tmp_pa
             FOREIGN KEY (gp_lgd_code) REFERENCES gram_panchayat (gp_lgd_code)
         )
     """)
-    findings = check_conformance(con, skip_reconciliation=True)
+    findings = check_conformance(con, skip_derived=True, skip_reconciliation=True)
     checks_fired = {f.check for f in findings}
     assert "type.money.voucher.amount" in checks_fired
     assert "constraint.foreign_key.planned_activity.plan_code" in checks_fired
     assert has_violations(findings)
+    con.close()
+
+
+def test_gp_profile_with_the_right_row_count_and_no_data_is_a_violation(tmp_path):
+    """Row count is not the check -- that was #61's mistake, one table over.
+
+    An artifact can hold a profile row for every GP and carry nothing in it.
+    `transform.gp_profile` raises `EmptyRequiredColumn` on that, but only
+    while it is building the table; an artifact produced elsewhere, by an
+    older version, or hand-patched never goes through it. This is the check
+    that sees such an artifact.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    rows = [
+        (code, f"GP {code}", geo["state_code"], geo["state_name"],
+         geo["district_code"], geo["zp_name"], geo["block_code"], geo["block_name"])
+        for code, geo in gp_geography().items()
+    ]
+    con.executemany(
+        "INSERT INTO gram_panchayat (gp_lgd_code, gp_name, state_code, state_name, "
+        "district_code, zp_name, block_code, block_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    # Right count, every measure NULL.
+    con.executemany("INSERT INTO gp_profile (gp_lgd_code) VALUES (?)", [(r[0],) for r in rows])
+    findings = check_gp_profile_completeness(con)
+    assert [f.check for f in findings] == ["gp_profile.populated"]
+
+    # And the subset case, which is how the manifest fixture hid this: two of
+    # the ten populated still leaves eight columns of nothing.
+    con.execute("UPDATE gp_profile SET total_population = 1, households = 2")
+    assert [f.check for f in check_gp_profile_completeness(con)] == ["gp_profile.populated"]
+
+    con.execute(
+        "UPDATE gp_profile SET "
+        + ", ".join(f"{col} = 1" for col in GP_PROFILE_MEASURES)
+    )
+    assert check_gp_profile_completeness(con) == []
+
+    # A negative count is impossible, and nothing else here would catch it:
+    # it is not null, not fractional and not non-finite.
+    con.execute("UPDATE gp_profile SET male_population = -1")
+    assert [f.check for f in check_gp_profile_completeness(con)] == ["gp_profile.non_negative"]
     con.close()

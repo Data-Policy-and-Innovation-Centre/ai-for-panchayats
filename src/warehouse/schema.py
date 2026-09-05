@@ -9,7 +9,8 @@ description (19 tables in four groups: dimensions; planning core + its 1:1
 satellites; expenditure and accounting; approvals and physical progress;
 plus three lookup tables) rather than the earlier from-first-principles
 design. Departures from that spec are deliberate and documented where they
-occur below: the ``activity_code`` foreign key on ``activity_expenditure``
+occur below: ``gp_profile`` is a twentieth table the spec does not have
+(GP demographics, #123), the ``activity_code`` foreign key on ``activity_expenditure``
 is intentionally unenforced, the ``plan_code`` foreign key the spec gives
 for that same table is deliberately NOT added, and ``dim_lsdg_theme`` has
 no declared primary key (the spec itself gives none).
@@ -148,6 +149,31 @@ DDL: dict[str, str] = {
             zp_name       VARCHAR,
             block_code    VARCHAR,
             block_name    VARCHAR
+        )""",
+    # One row per GP, from the eGramSwaraj panchayat profile extract (#123).
+    # Ten of the file's 99 columns: the nine population counts and the
+    # household count. The amenities, education, health, infrastructure,
+    # sports and learning-centre blocks are deliberately left in the CSV
+    # until something asks for them -- a column nothing reads is a column
+    # nothing notices going wrong.
+    #
+    # Right after gram_panchayat so the FOREIGN KEY resolves at CREATE time.
+    "gp_profile": """
+        CREATE TABLE gp_profile (
+            source_system           VARCHAR,
+            source_run_id           VARCHAR,
+            gp_lgd_code             VARCHAR PRIMARY KEY,
+            total_population        INTEGER,
+            male_population         INTEGER,
+            female_population       INTEGER,
+            transgender_population  INTEGER,
+            children_population     INTEGER,
+            sc_population           INTEGER,
+            st_population           INTEGER,
+            obc_population          INTEGER,
+            general_population      INTEGER,
+            households              INTEGER,
+            FOREIGN KEY (gp_lgd_code) REFERENCES gram_panchayat (gp_lgd_code)
         )""",
     "plan": """
         CREATE TABLE plan (
@@ -489,10 +515,19 @@ DDL: dict[str, str] = {
     # No primary key: the spec gives none for this lookup (unlike dim_code
     # and dim_welfare_scheme, which do). Taken at face value rather than
     # inventing one.
+    # focus_area -> LSDG theme is many-to-many in the source: 9 of the 17
+    # focus areas carry activities under more than one theme. The reference
+    # file records a single theme per focus area, so this table is a
+    # *reduction*, and `distinct_themes` is what says so -- 3 for Sanitation,
+    # 1 for Roads. Carried for the same reason dim_code carries source and
+    # confidence: a consumer presenting a label must be able to tell a clean
+    # mapping from a collapsed one. `source_rows` is the support behind it.
     "dim_lsdg_theme": """
         CREATE TABLE dim_lsdg_theme (
             focus_area_name VARCHAR,
-            lsdg_theme      VARCHAR
+            lsdg_theme      VARCHAR,
+            distinct_themes INTEGER,
+            source_rows     INTEGER
         )""",
     # Rows rejected by a foreign key, a uniqueness rule, or a missing
     # identity field, with the reason. Nothing is discarded silently; every
@@ -549,4 +584,32 @@ KIND_TABLES: dict[str, tuple[str, ...]] = {
     # The key still belongs here -- select.py requires every kind to be
     # present in a snapshot -- so the empty value is the accurate one.
     "RE": (),
+    # The panchayat profile extract: one flat CSV, its own raw run, its own
+    # snapshot (#123). Recognized here so `select` accepts a snapshot that
+    # declares it and `build` knows what it fills -- but NOT required, see
+    # REQUIRED_KINDS.
+    "PROFILE": ("gp_profile",),
+    # The accounting extract: nested per-GP-per-year JSON, its own raw run,
+    # its own snapshot (#129). Like PROFILE, recognized but NOT required --
+    # requiring it would mean no rebuild of the scrape could be done without
+    # it. activity_voucher is deliberately not listed: it is filled from the
+    # expenditure source (#49), not from this one.
+    "VOUCHER": ("voucher",),
+    # The activity-wise expenditure extract: one large flat CSV, its own raw
+    # run, its own snapshot (#49). Fills two tables -- the expenditure lines
+    # and the bridge to voucher that its own pipe-delimited cells describe.
+    # Recognized but not required, like PROFILE and VOUCHER.
+    "EXPENDITURE": ("activity_expenditure", "activity_voucher"),
 }
+
+# The kinds a build cannot be missing. The five eGramSwaraj endpoints arrive
+# together from one scrape and depend on each other -- aa/ta/pp are filtered
+# against the activities pl produces -- so a selection carrying only some of
+# them is a partial normalization, and select.resolve_snapshots refuses it.
+#
+# PROFILE is not in that set on purpose. It is an independent reference
+# extract with its own run, and requiring it would mean no rebuild of the
+# scraped data could ever be done without it. Completeness of the *published*
+# build is measured where it belongs instead: the row-count guard in
+# build_snapshot_manifest.py and deploy.expectations at container startup.
+REQUIRED_KINDS: frozenset[str] = frozenset({"PL", "AA", "TA", "PP", "RE"})

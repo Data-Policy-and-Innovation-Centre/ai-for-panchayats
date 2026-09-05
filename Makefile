@@ -1,6 +1,7 @@
 .DEFAULT_GOAL  := help
-.PHONY: help setup pull ingest publish-raw push run run-staging warehouse \
-        warehouse-staging sample exhibits deliver box-paths status _require_mode_env
+.PHONY: help setup pull ingest publish-raw push run run-staging run-profile \
+        run-profile-staging run-accounting run-accounting-staging run-expenditure run-expenditure-staging warehouse warehouse-staging sample exhibits deliver \
+        box-paths status _require_mode_env
 BOX_REMOTE      ?= box
 BOX_PROJECT_ROOT ?= /2. Projects/11. PR&DW/AI for Panchayats
 INCOMING_REMOTE ?= $(BOX_REMOTE):'$(BOX_PROJECT_ROOT)/Data/Raw/'
@@ -18,6 +19,9 @@ help:
 	@echo "  make setup           First-time setup on a new machine"
 	@echo "  make pull            Get latest code, deps, and approved DVC data"
 	@echo "  make ingest DATA=f.csv Copy an original source file from Box"
+	@echo "  make run-profile      Publish+normalize the GP profile extract (#123)"
+	@echo "  make run-accounting   Publish+normalize the accounting extract (#129)"
+	@echo "  make run-expenditure  Publish+normalize the expenditure extract (#49)"
 	@echo "  make publish-raw DATA=f.csv Copy a local raw file to Box"
 	@echo "  make push DATA=f.csv Version and share a locally-ingested file via DVC"
 	@echo "  make run             Publish + normalize the scraped tree (full state)"
@@ -87,8 +91,28 @@ push: _require_data _check_git_clean
 # CODE_SHA carries a -dirty suffix when the tree has uncommitted changes: a
 # bare commit hash for a build that did not come from that commit is worse
 # than "unknown", because it looks authoritative.
+#
+# `git status --porcelain` rather than `git diff --quiet HEAD` (#137): the
+# latter only sees modifications to *tracked* files, so a new module that was
+# never `git add`ed -- the most common way a working tree stops matching its
+# commit -- stamped a clean sha. Porcelain also lists untracked files, and
+# respects .gitignore, so throwaway worktrees and per-developer settings do
+# not produce a false -dirty.
+#
+# Two ways this could quietly go back to lying, both closed here:
+#
+#   --untracked-files=normal is passed explicitly, because a developer with
+#   status.showUntrackedFiles=no in their git config would otherwise get
+#   empty porcelain output and a clean sha over an untracked module. What
+#   provenance a build records must not depend on a personal git setting.
+#
+#   The exit status is checked, not just the output. `git status` failing --
+#   an unreadable index, say -- also produces empty output, and treating
+#   that as "clean" would be the worst possible reading. Anything other than
+#   "succeeded and said nothing" is -dirty.
 CODE_SHA    := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$(shell \
-                 git diff --quiet HEAD 2>/dev/null || echo -dirty)
+                 if status=$$(git status --porcelain --untracked-files=normal 2>/dev/null) \
+                    && test -z "$$status"; then :; else echo -dirty; fi)
 # The mode file is what decides every path this run reads and writes, so it
 # is the configuration a rebuild would need to reproduce.
 CONFIG_HASH  = $(shell shasum -a 256 $(MODE_ENV) 2>/dev/null | cut -c1-12 || echo unknown)
@@ -164,6 +188,107 @@ sample:
 run-staging: sample
 	@$(MAKE) run MODE=staging PIPELINE_TREE=$(SAMPLE_TREE)
 
+# The same two stages for the flat-CSV reference extract (#123), which is a
+# separate source with its own run and its own snapshot.
+#
+# This exists because doing it by hand is a trap, not for convenience. The
+# printed "paste this into ..." stanza names $(PIPELINE_SNAPSHOTS), which is
+# only set because `-include $(MODE_ENV)` above exports it -- so a hand-typed
+# `python main.py ingest` outside make prints the PRODUCTION registry path
+# whatever mode you believe you are in, and following that hint parks a
+# staging snapshot in the real registry. Going through make is what keeps the
+# two modes apart.
+PROFILE_SOURCE  ?= egramswaraj_profile
+PROFILE_RUN_ID  ?= $(RUN_ID)
+PROFILE_CSV     ?= data/raw/eGramSwaraj_Data/Panchayat_profile/eGramSwaraj_panchayat_master.csv
+PROFILE_RUN     := $(PIPELINE_RAW_ROOT)/$(PROFILE_SOURCE)/$(PROFILE_RUN_ID)
+
+run-profile: _require_mode_env
+	@test -f "$(PROFILE_CSV)" || { \
+	  echo "No profile extract at $(PROFILE_CSV); pull it with"; \
+	  echo "  make ingest DATA='eGramSwaraj_Data/Panchayat_profile/$(notdir $(PROFILE_CSV))'"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing profile run $(PROFILE_RUN_ID) from $(PROFILE_CSV)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(PROFILE_SOURCE) --run-id $(PROFILE_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload $(notdir $(PROFILE_CSV))=$(PROFILE_CSV)
+	@echo "[$(MODE)] verifying the published file against its hash..."
+	uv run python main.py validate-run $(PROFILE_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(PROFILE_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with BOTH snapshots --"
+	@echo "  make warehouse MODE=$(MODE) SNAPSHOT_ID='<scrape-id> --snapshot-id <profile-id>'"
+
+# The sample shares the whole 6,794-row extract on purpose: gp_profile rows
+# for GPs outside the sample are quarantined as orphans, which is the path
+# worth exercising rather than avoiding.
+run-profile-staging:
+	@$(MAKE) run-profile MODE=staging
+
+# The same two stages for the nested accounting extract (#129), which fills
+# `voucher`. A tree rather than one file, so it publishes with --payload-tree
+# exactly as `run` does; going through make is what keeps prod and staging
+# registries apart, for the reason spelled out above run-profile.
+ACCOUNTING_SOURCE ?= egramswaraj_accounting
+ACCOUNTING_RUN_ID ?= $(RUN_ID)
+ACCOUNTING_TREE   ?= data/raw/eGramSwaraj_Data/Expenditure/Accounting_All_GPs
+ACCOUNTING_RUN    := $(PIPELINE_RAW_ROOT)/$(ACCOUNTING_SOURCE)/$(ACCOUNTING_RUN_ID)
+
+run-accounting: _require_mode_env
+	@test -d "$(ACCOUNTING_TREE)" || { \
+	  echo "No accounting tree at $(ACCOUNTING_TREE); pull it from Box with"; \
+	  echo "  rclone copy \"$(INCOMING_REMOTE)eGramSwaraj_Data/Expenditure/Accounting_All_GPs\" \\"; \
+	  echo "    $(ACCOUNTING_TREE) --transfers 16 --progress"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing accounting run $(ACCOUNTING_RUN_ID) from $(ACCOUNTING_TREE)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(ACCOUNTING_SOURCE) --run-id $(ACCOUNTING_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload-tree $(ACCOUNTING_TREE)
+	@echo "[$(MODE)] verifying every published file against its hash..."
+	uv run python main.py validate-run $(ACCOUNTING_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(ACCOUNTING_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with ALL snapshots --"
+	@echo "  make warehouse MODE=$(MODE) SNAPSHOT_ID='<scrape-id> --snapshot-id <profile-id> --snapshot-id <accounting-id>'"
+
+run-accounting-staging:
+	@$(MAKE) run-accounting MODE=staging
+
+# The same two stages for the activity-wise expenditure extract (#49), which
+# fills activity_expenditure and activity_voucher. One 770 MB CSV, so it
+# publishes with --payload like run-profile rather than --payload-tree.
+EXPENDITURE_SOURCE ?= egramswaraj_expenditure
+EXPENDITURE_RUN_ID ?= $(RUN_ID)
+EXPENDITURE_CSV    ?= data/raw/eGramSwaraj_Data/Expenditure/Activity_wise_Expenditure_all_GPs/expenditure_all.csv
+EXPENDITURE_RUN    := $(PIPELINE_RAW_ROOT)/$(EXPENDITURE_SOURCE)/$(EXPENDITURE_RUN_ID)
+
+run-expenditure: _require_mode_env
+	@test -f "$(EXPENDITURE_CSV)" || { \
+	  echo "No expenditure extract at $(EXPENDITURE_CSV); pull it from Box with"; \
+	  echo "  make ingest DATA='eGramSwaraj_Data/Expenditure/Activity_wise_Expenditure_all_GPs/expenditure_all.csv'"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing expenditure run $(EXPENDITURE_RUN_ID) from $(EXPENDITURE_CSV)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(EXPENDITURE_SOURCE) --run-id $(EXPENDITURE_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload $(notdir $(EXPENDITURE_CSV))=$(EXPENDITURE_CSV)
+	@echo "[$(MODE)] verifying the published file against its hash..."
+	uv run python main.py validate-run $(EXPENDITURE_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(EXPENDITURE_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with ALL snapshots."
+
+run-expenditure-staging:
+	@$(MAKE) run-expenditure MODE=staging
+
 # Stage 3-4: build the warehouse from an approved snapshot, then check it.
 #
 # The build goes to a candidate path and is renamed over the real one only
@@ -180,6 +305,13 @@ run-staging: sample
 # atomic too.
 CANDIDATE_DB := $(PANCHAYAT_DB_PATH).candidate
 
+# Exempt the one total whose source is known to be short (#171), by name, so
+# the other two are enforced on every full-state build. Before #175 this was a
+# blanket --skip-reconciliation, which meant a defect that silently doubled
+# activity_expenditure could reach a green build AND a green conformance run.
+# Staging overrides it: a 20-GP sample cannot hit a full-state total at all.
+RECONCILIATION ?= --exempt-reconciliation reconciliation.voucher_amount_total
+
 warehouse: _require_mode_env
 	@test -n "$(SNAPSHOT_ID)" || { \
 	  echo "SNAPSHOT_ID is required: make warehouse SNAPSHOT_ID=<id>"; exit 1; }
@@ -187,12 +319,30 @@ warehouse: _require_mode_env
 	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
-	@echo "  --skip-reconciliation: voucher/dim_code have no loader yet (#46, #48,"
-	@echo "  #129), so the published totals cannot be hit. The build is provisional"
-	@echo "  until they do -- see #50. Geography coverage is NOT skipped here: it"
-	@echo "  is what catches a sample built as if it were the state."
+	@# Derived from the flags actually passed, never spelled a second time:
+	@# a recipe that describes a build it is not running is how the note
+	@# above this one came to claim activity_expenditure had no loader.
+	@case "$(RECONCILIATION) $(CONFORMANCE_EXTRA)" in \
+	  *--skip-reconciliation*) \
+	    echo "  Reconciliation is OFF: a 20-GP sample cannot hit a full-state" ; \
+	    echo "  total, so all three are skipped." ;; \
+	  *) \
+	    echo "  Reconciliation is ON for activity_expenditure and planned_cost," ; \
+	    echo "  which match production exactly. Only voucher_amount_total is" ; \
+	    echo "  exempted, because its extract covers 6,436 of 6,794 GPs (#171)" ; \
+	    echo "  and #172 would move it even then -- and it is exempted by name," ; \
+	    echo "  so the other two are still checked. Baselines are full-state as" ; \
+	    echo "  of #175; #62 and #50 track what remains." ;; \
+	esac
+	@case "$(CONFORMANCE_EXTRA)" in \
+	  *--skip-geography*) \
+	    echo "  Geography coverage is skipped: this build is not the state." ;; \
+	  *) \
+	    echo "  Geography coverage is NOT skipped: it is what catches a sample" ; \
+	    echo "  built as if it were the state." ;; \
+	esac
 	uv run python scripts/check_warehouse_conformance.py \
-	  $(CANDIDATE_DB) --skip-reconciliation $(CONFORMANCE_EXTRA)
+	  $(CANDIDATE_DB) $(RECONCILIATION) $(CONFORMANCE_EXTRA)
 	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)
 	@echo "[$(MODE)] promoted to $(PANCHAYAT_DB_PATH)"
 
@@ -200,7 +350,7 @@ warehouse: _require_mode_env
 # not pretending to be.
 warehouse-staging:
 	@$(MAKE) warehouse MODE=staging SNAPSHOT_ID=$(SNAPSHOT_ID) \
-	  CONFORMANCE_EXTRA=--skip-geography
+	  RECONCILIATION=--skip-reconciliation CONFORMANCE_EXTRA=--skip-geography
 
 exhibits:
 	uv run dvc repro

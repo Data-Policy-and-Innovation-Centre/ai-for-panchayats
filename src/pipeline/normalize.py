@@ -6,6 +6,7 @@ contract and currently implements the eGramSwaraj JSON shape only.
 
 from __future__ import annotations
 
+import csv
 import json
 import hashlib
 import os
@@ -13,22 +14,138 @@ import re
 import shutil
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .manifest import ManifestError, RunManifest, approve_run
+from .manifest import ManifestError, RunManifest, approve_run, load_manifest
 
 KNOWN_ENVELOPE_KEYS = frozenset({"data", "response", "result", "records", "rows"})
 SUPPORTED_KINDS = frozenset({"PL", "AA", "TA", "PP", "RE"})
+# Not a source table: the sink for records no adapter could turn into rows.
+QUARANTINE_TABLE = "quarantine"
 KIND_RE = re.compile(
     r"(?i)(?P<year>\d{4}(?:-\d{2,4})?)[_-](?P<kind>PL|AA|TA|PP|RE)(?:$|[_-])"
 )
 GP_RE = re.compile(r"^LGD[_-]?(?P<code>\d+)[_-](?P<name>.+)$", re.IGNORECASE)
+# Flat reference extracts, each published as its own raw run: one CSV, one
+# canonical table, no per-GP folder tree and no fiscal year in the filename.
+# Keyed by the raw run's `source` -- the same field the snapshot registry
+# records -- so `normalize_run` picks the lane without a new CLI flag and
+# without either lane having to sniff the other's payloads.
+#
+# The value is (source_kind, key_column). The key column stands in for the
+# JSON lane's business id: these files carry no activityCd, and identity has
+# to follow the row's own key rather than its line number (#110).
+FLAT_CSV_SOURCES: dict[str, tuple[str, str]] = {
+    "egramswaraj_profile": ("PROFILE", "basic_info_lgd"),
+}
+# Nested per-GP-per-year accounting JSON, published as its own raw run (#129).
+# Keyed by the raw run's `source`, exactly as FLAT_CSV_SOURCES is, so
+# `normalize_run` picks the lane from the manifest rather than a CLI flag.
+#
+# Not a `SUPPORTED_KINDS` entry, despite #129's wording. That set drives the
+# eGramSwaraj lane, which finds a GP by parsing `LGD_<code>_<name>` out of a
+# parent directory and a kind out of the filename. The accounting tree is
+# `District/Block/GP/YYYY-YYYY.json` -- neither pattern matches, and every
+# file would be skipped as unrecognized. The GP is carried *inside* the
+# payload as `gp_lgd_code`, which is also the safer source: 505 GP names are
+# shared, so a name-derived path could not identify a GP at all.
+NESTED_JSON_SOURCES: dict[str, str] = {
+    "egramswaraj_accounting": "VOUCHER",
+}
+# One very large flat CSV, streamed rather than held (#49). Keyed by the raw
+# run's `source` like the two lanes above.
+#
+# A fourth lane rather than a mode on `normalize_flat_csv`, because that lane
+# reads the whole file into a list to decide which identities repeat, and says
+# so: its ceiling is one row per GP. This source is 4,075,935 rows and 770 MB.
+#
+# `key_columns` is a *composite* key, where the flat lane takes a single
+# column: this source has no one-column identity, and the four together were
+# measured unique across all 4,075,935 rows -- which is what lets the lane
+# stream at all, since a row's identity does not depend on rows not yet read.
+#
+# `business_id_column` is separate from the key on purpose. `row_id` needs the
+# composite to be unique, but `transform._base_identity` reads `business_id`
+# as the row's activity_code, so putting the composite there would fill
+# activity_expenditure.activity_code with JSON.
+#
+# Headers are carried through verbatim, NOT snake_cased. `transform`'s
+# RE_CANDIDATES already lists this source's own spellings -- "planCode",
+# "S.No.", "Scheme Name", "Approved Cost in Action Plan" -- so renaming here
+# would silently break every one of them and leave the columns unresolved.
+class LargeCsvSpec(NamedTuple):
+    source_kind: str
+    key_columns: tuple[str, ...]
+    business_id_column: str
+    gp_column: str
+    gp_name_column: str
+    year_column: str
+
+
+LARGE_CSV_SOURCES: dict[str, LargeCsvSpec] = {
+    "egramswaraj_expenditure": LargeCsvSpec(
+        source_kind="EXPENDITURE",
+        key_columns=("gpCode", "planCode", "Activity Code", "S.No."),
+        business_id_column="Activity Code",
+        gp_column="gpCode",
+        gp_name_column="gpName",
+        year_column="planYear",
+    ),
+}
+# The two arrays a single accounting file carries, and the `direction` each
+# one means. The warehouse's `voucher.direction` CHECK admits exactly these
+# two spellings.
+VOUCHER_DIRECTIONS: tuple[tuple[str, str], ...] = (
+    ("receipts", "receipt"),
+    ("payments", "payment"),
+)
+# Per-voucher fields kept from each array element. The file's sibling
+# `receipt_count`/`payment_count`/`total_receipts`/`total_payments` keys are
+# deliberately NOT here: they are per-GP-per-year aggregates repeated
+# alongside every voucher, and #46 records that summing them once per voucher
+# row is the specific mistake to avoid. They are recomputable from the rows
+# themselves, so carrying them would add a second, disagreeing answer.
+VOUCHER_FIELDS: tuple[str, ...] = (
+    "month", "date", "voucher_no", "type", "amount", "voucher_id",
+)
 ID_KEYS = ("activityCd", "activity_cd", "activityId", "activity_id", "id")
+# Identity keys for child collections, by the array's own JSON key (#163).
+#
+# `ID_KEYS` recognizes activity-style fields only, so every one of these
+# collections fell back to hashing the whole element: an ordinary edit to an
+# amount re-identified a logically unchanged row and moved every descendant
+# prefix beneath it.
+#
+# Chosen by measurement, not by reading field names. Across 250 random GPs
+# and every kind, each key below is present, non-blank, and unique within its
+# array in 100% of the arrays observed:
+#
+#   fundList                                    76,902 arrays  (max len   4)
+#   physicalProgressAssetStageWebService        28,502 arrays  (max len  41)
+#   admApprovalSchemeWebService                 27,672 arrays  (max len   2)
+#   physicalProgressAssetStageUploadWebService  23,773 arrays  (max len 177)
+#   budgetaryAllocationSchemeWebService          1,500 arrays  (max len  58)
+#
+# Composites are used where the collection has a natural parent code, even
+# though the component code alone was also unique in the sample: a component
+# code is only meaningful under its scheme, and a key that is more specific
+# than it needs to be costs nothing -- it moves only when a code moves, which
+# is the same as the row being a different row.
+#
+# These feed `_record_identity` only. `business_id` is untouched.
+CHILD_IDENTITY_KEYS: dict[str, tuple[str, ...]] = {
+    "fundList": ("schemeCode", "componentCode"),
+    "admApprovalSchemeWebService": ("wrkSchmCd", "wrkSchmCmpntCd"),
+    "budgetaryAllocationSchemeWebService": ("schemeCode", "schemeComponentCode"),
+    "physicalProgressAssetStageWebService": ("physclPrgrssAstStgCd",),
+    "physicalProgressAssetStageUploadWebService": ("fileUploadId",),
+}
 PROVENANCE_COLUMNS = (
     "row_id", "parent_row_id", "pos", "source_system", "source_run_id",
     "source_record_id", "schema_version", "source_file", "source_kind",
@@ -346,10 +463,32 @@ def _gp_context(path: Path, payload_root: Path) -> tuple[str | None, str | None]
 
 
 def _business_id(record: Mapping[str, Any]) -> str | None:
+    """The record's own business identifier, or None.
+
+    Stripped, and blank-after-stripping is treated as absent -- the same test
+    `_collection_key` applies to its parts. The two are alternatives in one
+    expression (`_collection_key(...) or _business_id(...)`), so a `" "`
+    accepted here while rejected there would be an identity that exists only
+    because of which field it happened to come from.
+
+    Stripping also matches the warehouse side rather than diverging from it:
+    every `activity_code` column is written through `clean.to_code`, which
+    strips. A padded id would otherwise make a parent's stripped
+    `activity_code` and a child's unstripped one fail to match, and the child
+    would be quarantined as an orphan of a row that is right there.
+
+    No value in the scrape needs either: 420,821 id values sampled across 200
+    GPs, none padded and none whitespace-only. This is here so the two
+    spellings cannot disagree, not because they currently do.
+    """
+
     for key in ID_KEYS:
         value = record.get(key)
-        if value not in (None, "") and not isinstance(value, (list, dict)):
-            return str(value)
+        if value is None or isinstance(value, (list, dict)):
+            continue
+        text = value.strip() if isinstance(value, str) else str(value)
+        if text:
+            return text
     return None
 
 
@@ -398,24 +537,158 @@ def _provenance(
     }
 
 
-def _record_identity(record: Mapping[str, Any], business_id: str | None) -> str:
-    """A stable, content-derived identity for a top-level record.
+def _canonical_json(value: Any) -> str:
+    """A byte-stable serialisation of a record, nested content included.
+
+    ``sort_keys`` makes mapping order irrelevant; list order is preserved,
+    because for these payloads the order of a child array is content rather
+    than presentation.
+    """
+
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), default=str,
+    )
+
+
+def _occurrence_key(identity: str, occurrence: int) -> str:
+    """Identity plus its occurrence, as two components that cannot be confused.
+
+    The obvious spelling -- the identity alone when first, and the identity
+    with a "#" and a counter appended after -- puts the counter inside the
+    identity's own namespace. A second element with business id ``A`` then
+    yields the same key as a *first* element whose business id genuinely is
+    ``A#1``, so the two share a ``row_id`` and their nested descendants
+    collide under the shared prefix. Encoding both as a JSON pair keeps them
+    separate whatever the business id contains.
+
+    The positional child ids this replaced could not collide, so getting it
+    wrong would have traded an ordering bug for a uniqueness one.
+    """
+
+    return _canonical_json([identity, occurrence])
+
+
+def _record_identity(record: Any, business_id: str | None) -> str:
+    """A stable, content-derived identity for a record or a child element.
 
     Prefers a business identifier (e.g. activityCd) when present. Falling
     back to array position would let two records swap identities (and all
-    child links) if the source ever returns them in a different order across
-    runs, so the fallback instead hashes the record's own scalar content.
-    Genuine duplicates (identical business_id or identical content) are
-    disambiguated deterministically by their order of appearance within the
-    same file, not by raw array position.
+    child links) if the source ever returned them in a different order across
+    runs, so the fallback hashes the record's own content instead. Genuine
+    duplicates (identical business_id or identical content) are disambiguated
+    deterministically by their order of appearance among their siblings, not
+    by raw array position.
+
+    The hash covers the **whole** record, nested arrays included. Hashing only
+    the flattened scalars -- as this did until #110 -- gave the same identity
+    to two records that differed solely in their children, so the occurrence
+    suffix decided which was which and reordering the two swapped every
+    `row_id` and child link between them.
     """
+
     if business_id is not None:
         return f"id:{business_id}"
-    content = json.dumps(
-        _flatten_scalars(record), sort_keys=True, ensure_ascii=False,
-        separators=(",", ":"), default=str,
+    return "content:" + hashlib.sha256(_canonical_json(record).encode("utf-8")).hexdigest()
+
+
+def _collection_key(collection: str | None, element: Mapping[str, Any]) -> str | None:
+    """The identity key for one element of a known child collection.
+
+    Returns ``None`` unless EVERY part is present and non-blank. A partial
+    composite is not an identity: two elements agreeing on the half that
+    happens to be filled in would share it, and the caller would treat that
+    as a stable key rather than falling back to content.
+
+    The parts are joined as JSON rather than with a separator, so a value
+    containing the separator cannot forge another element's key.
+    """
+
+    parts = CHILD_IDENTITY_KEYS.get(collection or "")
+    if not parts:
+        return None
+    values: list[str] = []
+    for part in parts:
+        value = element.get(part)
+        if value is None or isinstance(value, (list, dict)):
+            return None
+        # Stripped before the blank test, not after: `" "` is as absent as
+        # `""`, and accepting it would hand a lone row a stable-looking key
+        # that survives arbitrary content changes -- the opposite of what a
+        # missing key is supposed to do here. Stripped in the key too, so
+        # `"S1"` and `" S1 "` are the same scheme rather than two.
+        text = value.strip() if isinstance(value, str) else str(value)
+        if not text:
+            return None
+        values.append(text)
+    return _canonical_json(values)
+
+
+def _element_identity(element: Any, *, collection: str | None = None) -> str:
+    """`_record_identity` for anything that may not be a mapping.
+
+    Child arrays hold scalars as well as records, and a scalar has no
+    business id to look up.
+
+    ``collection`` is the array's own JSON key, which selects the child
+    identity key. It is used for identity ONLY -- the `business_id`
+    provenance column is computed separately by the caller and keeps its
+    inherit-from-parent behaviour, because two loaders read that column as an
+    activity code (`transform._base_identity`, `transform.admin_approval_scheme`).
+    Letting a scheme code reach it would put a wrong value in a loaded column,
+    which is worse than the instability this fixes (#163).
+    """
+
+    if not isinstance(element, Mapping):
+        return _record_identity(element, None)
+    return _record_identity(
+        element, _collection_key(collection, element) or _business_id(element)
     )
-    return "content:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _repeated_identities(identities: Iterable[str]) -> frozenset[str]:
+    """Identities that more than one sibling carries.
+
+    The first of the two passes `_refine_identity` needs. Holds one entry per
+    *distinct* identity, which is what the occurrence counter downstream
+    already costs, so this adds no term to the memory the caller was paying.
+
+    Takes identities rather than elements so that a lane whose key is not one
+    of `ID_KEYS` -- the flat-CSV lane, whose key column is named by its
+    caller -- reuses this rather than growing a second copy beside it.
+    """
+
+    seen: set[str] = set()
+    repeated: set[str] = set()
+    for identity in identities:
+        if identity in seen:
+            repeated.add(identity)
+        seen.add(identity)
+    return frozenset(repeated)
+
+
+def _refine_identity(element: Any, identity: str, repeated: frozenset[str]) -> str:
+    """Break a tie between siblings sharing an identity, using their content.
+
+    Two elements carrying the same business id but differing in their other
+    fields hash to the same identity, so the occurrence counter alone decided
+    which was which -- and reversing the array swapped their row_ids and every
+    descendant link beneath them. That is the defect the business id was meant
+    to close, reappearing wherever the id is not unique among its siblings.
+
+    Content stays a *tiebreaker*, deliberately. Folding it into every identity
+    is the obvious spelling and is worse: a record's content includes its own
+    child arrays in order, so reordering a grandchild would move the parent
+    and orphan the children underneath it. Only an identity a sibling
+    duplicates gets refined, so an unambiguous record is untouched.
+
+    Elements duplicated in both id and content are interchangeable; those
+    still fall back to order of appearance, which is all that is left.
+    """
+
+    if identity not in repeated:
+        return identity
+    return _canonical_json([identity, _record_identity(element, None)])
 
 
 def _record_rows(
@@ -469,11 +742,36 @@ def _child_rows(
         if not isinstance(value, list):
             continue
         child_table = f"{table_name}__{_sanitize(str(key))}"
+        # Occurrence counts are per array, so two identical elements under the
+        # same key are told apart while identical elements under *different*
+        # keys do not interfere.
+        occurrences: dict[str, int] = {}
+        collection = str(key)
+        repeated = _repeated_identities(
+            _element_identity(e, collection=collection) for e in value
+        )
         for position, element in enumerate(value):
-            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{position}"
-            business_id = (
+            # The element's OWN business id, not the inherited one: inheriting
+            # the parent's id here would give every sibling the same identity
+            # and put us straight back on positional row_ids.
+            own_business_id = (
                 _business_id(element) if isinstance(element, Mapping) else None
-            ) or inherited_business_id
+            )
+            identity = _refine_identity(
+                element, _element_identity(element, collection=collection), repeated
+            )
+            seen = occurrences.get(identity, 0)
+            occurrences[identity] = seen + 1
+            identity_key = _occurrence_key(identity, seen)
+            # Identity-derived rather than positional (#110). `pos` below still
+            # carries the array index, so ordering is retained as metadata --
+            # it just no longer decides which row is which. Truncated to 16 hex
+            # (64 bits) because it only has to be unique among one parent's
+            # children, and a full digest at every level makes a deeply nested
+            # row_id unreadable without buying anything.
+            token = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:16]
+            row_id = f"{row_id_prefix}/{_sanitize(str(key))}:{token}"
+            business_id = own_business_id or inherited_business_id
             provenance = _provenance(
                 manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,
@@ -538,12 +836,19 @@ def _iter_run_items(
         gp_code, gp_name = _gp_context(path, payload_root)
         table_name = source_kind.lower()
         identity_counts: dict[str, int] = {}
+        # A second call rather than a materialized list: `to_records` is a pure
+        # function of the already-parsed payload, so it hands back a fresh
+        # generator and the identity pass stays as streaming as the row pass.
+        repeated = _repeated_identities(
+            _element_identity(record) for record in to_records(payload)[0]
+        )
         for record in records:
-            business_id = _business_id(record)
-            identity = _record_identity(record, business_id)
+            identity = _refine_identity(
+                record, _element_identity(record), repeated
+            )
             occurrence = identity_counts.get(identity, 0)
             identity_counts[identity] = occurrence + 1
-            identity_key = identity if occurrence == 0 else f"{identity}#{occurrence}"
+            identity_key = _occurrence_key(identity, occurrence)
             yield from _record_rows(
                 record, manifest=manifest, source_file=source_file, source_kind=source_kind,
                 year=year, gp_code=gp_code, gp_name=gp_name, identity_key=identity_key,
@@ -678,60 +983,95 @@ def normalize_egramswaraj(
         _merge_table_types(table_types.setdefault(table_name, dict(PROVENANCE_SCHEMA)), [value])
 
     destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
-    staged_tables: dict[str, list[Path]] = {}
     observed_max_buffered_rows = 0
     with AtomicParquetPublication(destination) as publication:
+        # One pass over the input, one buffer per table, rather than a full
+        # re-read and re-parse of every file for each table in turn.
+        #
+        # The old shape cost 1 schema-inference walk + one walk per table + a
+        # quarantine walk. On the full state that is 12 walks of ~204,000
+        # files -- ~118 GiB parsed to produce ~1.3 GiB of Parquet, with 88% of
+        # wall-clock in json.loads. Eleven of those twelve walks parsed each
+        # file only to discard it (#145).
+        #
+        # Memory is deliberately unchanged. Buffers share one budget: when the
+        # rows held across every table reach chunk_size, the fullest buffers
+        # are written out until the total is back under it. Giving each table
+        # its own chunk_size threshold would have been simpler and would have
+        # raised peak buffered rows by the number of tables.
+        #
+        # Fullest-first, and stopping at the budget rather than emptying every
+        # buffer, is what protects the *small* tables. A table holding 40 rows
+        # when a big table trips the budget would otherwise be written as a
+        # 40-row Parquet file -- once per flush, so hundreds of near-empty
+        # files per small table at full-state scale.
+        #
+        # It does not restore the old part sizes for the big tables, and does
+        # not try to. Sharing one budget across N filling tables means the
+        # fullest holds roughly chunk_size/N when it trips, so at 1,000 GPs
+        # the run writes 718 part files where the old shape wrote 199, and
+        # 227.4 MB where it wrote 218.0 (+4.3%, from per-file overhead).
+        # Buying those back means a budget of N x chunk_size, which is a real
+        # memory regression; --chunk-size is the knob for anyone who wants
+        # that trade. Note it now bounds rows buffered in *total*, where it
+        # used to bound rows per part per table.
+        schemas = {name: _arrow_schema(types) for name, types in table_types.items()}
+        schemas[QUARANTINE_TABLE] = _arrow_schema({
+            "source_system": pa.string(), "source_run_id": pa.string(),
+            "source_record_id": pa.string(), "schema_version": pa.string(),
+            "source_file": pa.string(), "source_kind": pa.string(),
+            "reason_code": pa.string(), "reason": pa.string(), "raw_value": pa.string(),
+        })
+        paths_by_table: dict[str, list[Path]] = {name: [] for name in schemas}
+        buffers: dict[str, list[Mapping[str, Any]]] = {name: [] for name in schemas}
+        buffered_rows = 0
+
+        def flush(*, final: bool) -> None:
+            nonlocal buffered_rows
+            # Ties broken by name so the write order never depends on dict
+            # insertion order, which depends on which file was read first.
+            # (Order *within* a table is the walk order either way, so this
+            # decides only which files rows land in, not their sequence.)
+            for name in sorted(buffers, key=lambda n: (-len(buffers[n]), n)):
+                if not final and buffered_rows < chunk_size:
+                    return
+                rows = buffers[name]
+                if not rows:
+                    continue
+                paths_by_table[name].extend(publication.write_rows(
+                    name, rows, chunk_size=chunk_size, schema=schemas[name],
+                    partition_by_fiscal_year=name != QUARANTINE_TABLE,
+                ))
+                buffered_rows -= len(rows)
+                rows.clear()
+
+        for item_name, value in _iter_run_items(payload_root, manifest, wanted):
+            if item_name is None:
+                buffers[QUARANTINE_TABLE].append(value.as_row(manifest))
+            else:
+                # Present by construction: the inference pass above walked the
+                # same input with the same `wanted`, so it saw every table name
+                # this pass can produce.
+                buffers[item_name].append(value)
+            buffered_rows += 1
+            observed_max_buffered_rows = max(observed_max_buffered_rows, buffered_rows)
+            if buffered_rows >= chunk_size:
+                flush(final=False)
+        flush(final=True)
+
         for table_name in sorted(table_types):
-            schema = _arrow_schema(table_types[table_name])
-            paths: list[Path] = []
-            buffer: list[Mapping[str, Any]] = []
-            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
-                if item_name != table_name:
-                    continue
-                buffer.append(value)
-                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
-                if len(buffer) >= chunk_size:
-                    paths.extend(publication.write_rows(
-                        table_name, buffer, chunk_size=chunk_size, schema=schema,
-                    ))
-                    buffer.clear()
-            if buffer:
-                paths.extend(publication.write_rows(
-                    table_name, buffer, chunk_size=chunk_size, schema=schema,
-                ))
-                buffer.clear()
-            if not paths:
-                paths.extend(publication.write_empty(table_name, schema))
-            staged_tables[table_name] = paths
+            if not paths_by_table[table_name]:
+                paths_by_table[table_name].extend(
+                    publication.write_empty(table_name, schemas[table_name])
+                )
+        staged_tables = {name: paths_by_table[name] for name in sorted(table_types)}
         if quarantine_count:
-            qschema = _arrow_schema({
-                "source_system": pa.string(), "source_run_id": pa.string(),
-                "source_record_id": pa.string(), "schema_version": pa.string(),
-                "source_file": pa.string(), "source_kind": pa.string(),
-                "reason_code": pa.string(), "reason": pa.string(), "raw_value": pa.string(),
-            })
-            paths = []
-            buffer = []
-            for item_name, value in _iter_run_items(payload_root, manifest, wanted):
-                if item_name is not None:
-                    continue
-                buffer.append(value.as_row(manifest))
-                observed_max_buffered_rows = max(observed_max_buffered_rows, len(buffer))
-                if len(buffer) >= chunk_size:
-                    paths.extend(publication.write_rows(
-                        "quarantine", buffer, chunk_size=chunk_size,
-                        partition_by_fiscal_year=False, schema=qschema,
-                    ))
-                    buffer.clear()
-            if buffer:
-                paths.extend(publication.write_rows(
-                    "quarantine", buffer, chunk_size=chunk_size,
-                    partition_by_fiscal_year=False, schema=qschema,
-                ))
-            staged_tables["quarantine"] = paths
+            staged_tables[QUARANTINE_TABLE] = paths_by_table[QUARANTINE_TABLE]
         files = {
             table_name: {
-                "row_count": table_counts.get(table_name, quarantine_count if table_name == "quarantine" else 0),
+                "row_count": table_counts.get(
+                    table_name, quarantine_count if table_name == QUARANTINE_TABLE else 0
+                ),
                 "files": [_canonical_file_record(publication.staging_root, path) for path in paths],
             }
             for table_name, paths in staged_tables.items()
@@ -762,7 +1102,596 @@ def normalize_egramswaraj(
     )
 
 
-def normalize_run(*args: Any, **kwargs: Any) -> NormalizationResult:
-    """Stable generic entry point; eGramSwaraj is the first supported source."""
+def _checked_record(
+    record: dict[Any, Any], fieldnames: list[str], source_file: str, line_number: int,
+) -> dict[str, Any]:
+    """A CSV record whose width disagrees with the header, rejected.
 
-    return normalize_egramswaraj(*args, **kwargs)
+    `csv.DictReader` neither raises nor marks a ragged line. A short one is
+    padded with None, so a truncated record publishes null money under
+    provenance that says it is fine. A long one -- one unescaped comma in a
+    name -- shifts every later value one column across and parks the overflow
+    under the None key, which `_flatten_scalars` drops (it is a list) and the
+    large-CSV lane's `if k` discards. Either way the row loads, and the
+    reconciliation totals move with nothing to point at (#49).
+
+    Both extracts are rectangular today (4,075,935 x 26 and 6,794 x 99,
+    counted), so this rejects nothing that exists -- it is here for the day
+    the source changes shape.
+    """
+
+    surplus = record.pop(None, None)
+    if surplus is not None or any(value is None for value in record.values()):
+        width = (
+            len(fieldnames) + len(surplus) if surplus is not None
+            else sum(value is not None for value in record.values())
+        )
+        raise NormalizationError(
+            f"{source_file} line {line_number} has {width} field(s) against a "
+            f"{len(fieldnames)}-column header; refusing to publish a record whose "
+            f"columns may be shifted"
+        )
+    return record
+
+
+def normalize_flat_csv(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    source_kind: str,
+    key_column: str,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize a validated one-row-per-entity CSV run into an atomic Parquet tree.
+
+    A second lane rather than a CSV mode bolted onto the JSON one. Nothing
+    the JSON lane does applies here: there is no `LGD_<code>_<name>` folder to
+    parse a GP out of, no fiscal year in the filename, no envelope to unwrap
+    and no nested child arrays to recurse into. What the two lanes do share is
+    the *output* contract -- the same provenance columns, the same atomic
+    publication, the same canonical manifest -- and that is the half a
+    snapshot has to honour.
+
+    The records are held in memory rather than streamed, which the identity
+    pass requires anyway -- deciding which keys are duplicated needs the whole
+    file before any row can be written. These extracts are one row per entity,
+    so the ceiling is the number of GPs in Odisha (6,794 x 99 string columns,
+    ~3 MB on disk); the JSON lane's chunked multi-table budget exists for a
+    204,000-file walk and would be machinery with nothing to do here.
+    `chunk_size` still bounds the part files that get written.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    csv_paths = sorted(payload_root.rglob("*.csv"))
+    if len(csv_paths) != 1:
+        # Not a convenience restriction. Two CSVs in one run would share a
+        # run_id and a canonical table, so their rows would be
+        # indistinguishable in provenance and their identities could collide.
+        raise NormalizationError(
+            f"a flat-CSV run must publish exactly one .csv payload; "
+            f"{payload_root} has {len(csv_paths)}"
+        )
+    csv_path = csv_paths[0]
+    source_file = csv_path.relative_to(payload_root).as_posix()
+    table_name = source_kind.lower()
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or key_column not in reader.fieldnames:
+            raise NormalizationError(
+                f"{source_file} has no {key_column!r} column; "
+                f"found {list(reader.fieldnames or ())}"
+            )
+        fieldnames = list(reader.fieldnames)
+        records = [
+            _checked_record(record, fieldnames, source_file, line_number)
+            for line_number, record in enumerate(reader, start=2)
+        ]
+
+    # A blank key is not an error here -- 84 of the profile rows carry one, and
+    # they must reach the warehouse's quarantine rather than be dropped where
+    # nothing counts them. `_record_identity` falls back to content, so they
+    # still get distinct row_ids.
+    #
+    # The key column stands in for the JSON lane's `_business_id`; everything
+    # after that is the same two passes, using the same helpers. Mirroring
+    # rather than re-spelling matters: the pre-#110 `f"{identity}#{n}"` form
+    # put the counter inside the identity's own namespace, so a key that
+    # literally read `X#1` collided with the second occurrence of `X`. LGD
+    # codes are numeric and cannot, but this lane is generic -- #48's
+    # spreadsheet brings its own key column.
+    business_ids = [(r.get(key_column) or "").strip() or None for r in records]
+    identities = [
+        _record_identity(record, business_id)
+        for record, business_id in zip(records, business_ids)
+    ]
+    repeated = _repeated_identities(identities)
+
+    rows: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}
+    for record, business_id, identity in zip(records, business_ids, identities):
+        identity = _refine_identity(record, identity, repeated)
+        seen = occurrences.get(identity, 0)
+        occurrences[identity] = seen + 1
+        root_key = hashlib.sha256("|".join(
+            (manifest.source, source_kind, source_file, "", "",
+             _occurrence_key(identity, seen))
+        ).encode("utf-8")).hexdigest()
+        row = _flatten_scalars(record)
+        row.update(_provenance(
+            manifest=manifest, source_file=source_file, source_kind=source_kind,
+            year=None, gp_code=None, gp_name=None, row_id=root_key,
+            source_record_id=root_key, parent_row_id=None, pos=None,
+            business_id=business_id,
+        ))
+        rows.append(row)
+
+    types = dict(PROVENANCE_SCHEMA)
+    _merge_table_types(types, rows)
+    schema = _arrow_schema(types)
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+    with AtomicParquetPublication(destination) as publication:
+        # No fiscal-year partitioning: the source has no fiscal year, so every
+        # row would land in one `fiscal_year-unknown` directory that says
+        # nothing and reads as missing data rather than as inapplicable.
+        paths = publication.write_rows(
+            table_name, rows, chunk_size=chunk_size, schema=schema,
+            partition_by_fiscal_year=False,
+        ) or publication.write_empty(table_name, schema)
+        canonical = {
+            "source": manifest.source,
+            "run_id": manifest.run_id,
+            "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+            "raw_manifest_identity": {
+                "source": manifest.source, "run_id": manifest.run_id,
+                "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+            },
+            "schema_version": manifest.schema_version,
+            "tables": {
+                table_name: {
+                    "row_count": len(rows),
+                    "files": [
+                        _canonical_file_record(publication.staging_root, path)
+                        for path in paths
+                    ],
+                },
+            },
+            "quarantine_count": 0,
+            "terminal_state": "complete",
+        }
+        publication.write_canonical_manifest(canonical)
+        validate_canonical_manifest(publication.staging_root)
+        publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), len(rows), 0,
+    )
+
+
+def normalize_accounting(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    source_kind: str,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize a nested per-GP-per-year accounting run to canonical Parquet (#129).
+
+    A third lane, for the same reason the flat-CSV lane is a second one: the
+    input shares nothing with the eGramSwaraj walk but its output contract.
+    Each payload is one GP and one fiscal year, holding independent
+    ``receipts`` and ``payments`` arrays; one canonical row is emitted per
+    voucher, tagged with the ``direction`` its array means.
+
+    **Money is carried as source text, not as a float.** ``json.load`` is
+    given ``parse_float=str``, so ``"amount": 44280.0`` reaches Parquet as
+    ``"44280.0"`` and the warehouse parses it with ``clean.to_decimal_money``
+    into an exact ``Decimal``. This is not defensive habit: #46's acceptance
+    is a rupee total matching to the paisa, and this source has ~3.7M rows.
+    Binary floating point accumulated over that many addends does not
+    reliably reproduce a decimal total, and the error would appear as a
+    reconciliation failure with no bad row to point at.
+
+    **The schema is declared, not inferred.** The other two lanes see every
+    row before writing and can merge observed types. Streaming a 657 MB tree
+    means writing the first batch before the last file is read, so the type
+    of a column cannot depend on rows not yet seen -- a late file whose
+    ``voucher_id`` happened to be numeric would otherwise change a column's
+    type midway and produce parts that will not read back as one table.
+
+    Rows are written in batches as files are read, so the whole tree is never
+    resident. The identity pass is per file, which is sound here and is not
+    in the flat-CSV lane: a canonical ``row_id`` already mixes in the source
+    file, and one file is exactly one GP and fiscal year, so two vouchers can
+    only collide if they collide *within* that pair -- which is precisely the
+    natural key ``(gp_lgd_code, fiscal_year, voucher_no)`` that #46 verified
+    unique. A repeat inside one file is still refined by content rather than
+    silently deduplicated, because a genuine duplicate is a source defect for
+    the warehouse's quarantine to count, not for this lane to hide.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    json_paths = sorted(payload_root.rglob("*.json"))
+    if not json_paths:
+        raise NormalizationError(f"accounting run publishes no .json payloads: {payload_root}")
+
+    table_name = source_kind.lower()
+    types = dict(PROVENANCE_SCHEMA)
+    for column in ("direction", *VOUCHER_FIELDS):
+        types[column] = pa.string()
+    schema = _arrow_schema(types)
+
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+    total_rows = 0
+    paths: list[Path] = []
+    pending: list[dict[str, Any]] = []
+    observed_max_buffered_rows = 0
+
+    with AtomicParquetPublication(destination) as publication:
+        def flush() -> None:
+            # `pending` only grows between flushes, so its length here is
+            # the peak. This lane batches by file, so the peak overshoots
+            # chunk_size by whatever the file that crossed it carried --
+            # which is the number worth reporting, and why it is observed
+            # rather than inferred. Returning `total_rows`, as both streaming
+            # lanes did, made the diagnostic #109 is measured against unable
+            # to fail (#49).
+            nonlocal pending, observed_max_buffered_rows
+            if pending:
+                observed_max_buffered_rows = max(observed_max_buffered_rows, len(pending))
+                paths.extend(publication.write_rows(
+                    table_name, pending, chunk_size=chunk_size, schema=schema,
+                ))
+                pending = []
+
+        for json_path in json_paths:
+            source_file = json_path.relative_to(payload_root).as_posix()
+            rows = _accounting_rows(json_path, source_file, manifest, source_kind)
+            total_rows += len(rows)
+            pending.extend(rows)
+            # Batched by row count rather than by file: a per-file flush would
+            # write ~38,600 tiny Parquet parts, and one flush at the end would
+            # defeat the streaming this lane exists for.
+            if len(pending) >= chunk_size:
+                flush()
+        flush()
+
+        if not paths:
+            paths.extend(publication.write_empty(table_name, schema))
+        canonical = {
+            "source": manifest.source,
+            "run_id": manifest.run_id,
+            "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+            "raw_manifest_identity": {
+                "source": manifest.source, "run_id": manifest.run_id,
+                "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+            },
+            "schema_version": manifest.schema_version,
+            "tables": {
+                table_name: {
+                    "row_count": total_rows,
+                    "files": [
+                        _canonical_file_record(publication.staging_root, path)
+                        for path in paths
+                    ],
+                },
+            },
+            "quarantine_count": 0,
+            "terminal_state": "complete",
+        }
+        publication.write_canonical_manifest(canonical)
+        validate_canonical_manifest(publication.staging_root)
+        publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), observed_max_buffered_rows, 0,
+    )
+
+
+def _accounting_rows(
+    json_path: Path, source_file: str, manifest: RunManifest, source_kind: str,
+) -> list[dict[str, Any]]:
+    """One canonical row per voucher in a single GP/fiscal-year payload."""
+
+    try:
+        # parse_float=str keeps the source's exact decimal text; see the
+        # money note in `normalize_accounting`.
+        payload = json.loads(json_path.read_text(encoding="utf-8"), parse_float=str)
+    except (OSError, json.JSONDecodeError) as error:
+        raise NormalizationError(f"unreadable accounting payload {source_file}: {error}") from error
+    if not isinstance(payload, dict):
+        raise NormalizationError(
+            f"accounting payload {source_file} is {type(payload).__name__}, expected an object"
+        )
+
+    gp_code = _blank_to_none(payload.get("gp_lgd_code"))
+    gp_name = _blank_to_none(payload.get("gp_name"))
+    year = _blank_to_none(payload.get("year"))
+    # A payload naming no GP cannot be attributed, and the file path cannot
+    # stand in for it: the tree is keyed by GP *name*, and 505 of those are
+    # shared. Loading such a row would attach real money to a guess.
+    if gp_code is None:
+        raise NormalizationError(f"accounting payload {source_file} carries no gp_lgd_code")
+    if year is None:
+        raise NormalizationError(f"accounting payload {source_file} carries no year")
+
+    records: list[tuple[str, Mapping[str, Any]]] = []
+    for array_key, direction in VOUCHER_DIRECTIONS:
+        entries = payload.get(array_key)
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise NormalizationError(
+                f"accounting payload {source_file} has {array_key!r} as "
+                f"{type(entries).__name__}, expected a list"
+            )
+        # The payload counts its own vouchers, and the canonical manifest
+        # verifies only the rows that were emitted -- so an array that arrived
+        # short, or not at all, publishes as `complete` with the difference
+        # gone and nothing anywhere to point at. Checking the source against
+        # its own declaration is the only thing that can see it (#129).
+        #
+        # This fires on nothing in the current extract: 38,616 payloads, no
+        # absent array, and 3,515,445 declared vouchers against 3,515,445
+        # present. That is the measurement, not an assumption -- and it means
+        # the count is not where #171's missing money went.
+        declared = payload.get(f"{direction}_count")
+        if isinstance(declared, int) and declared != len(entries):
+            raise NormalizationError(
+                f"accounting payload {source_file} declares {declared} "
+                f"{direction}(s) but carries {len(entries)}"
+            )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise NormalizationError(
+                    f"accounting payload {source_file} has a non-object entry in {array_key!r}"
+                )
+            records.append((direction, entry))
+
+    business_ids = [_blank_to_none(entry.get("voucher_no")) for _, entry in records]
+    identities = [
+        _record_identity(entry, business_id)
+        for (_, entry), business_id in zip(records, business_ids)
+    ]
+    repeated = _repeated_identities(identities)
+
+    rows: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}
+    for (direction, entry), business_id, identity in zip(records, business_ids, identities):
+        identity = _refine_identity(entry, identity, repeated)
+        seen = occurrences.get(identity, 0)
+        occurrences[identity] = seen + 1
+        row_id = hashlib.sha256("|".join(
+            (manifest.source, source_kind, source_file, gp_code, year,
+             _occurrence_key(identity, seen))
+        ).encode("utf-8")).hexdigest()
+        row: dict[str, Any] = {"direction": direction}
+        for column in VOUCHER_FIELDS:
+            row[column] = _blank_to_none(entry.get(column))
+        row.update(_provenance(
+            manifest=manifest, source_file=source_file, source_kind=source_kind,
+            year=year, gp_code=gp_code, gp_name=gp_name, row_id=row_id,
+            source_record_id=row_id, parent_row_id=None, pos=None,
+            business_id=business_id,
+        ))
+        rows.append(row)
+    return rows
+
+
+def _blank_to_none(value: Any) -> str | None:
+    """Source text, stripped; blank-after-stripping is absent.
+
+    The same test `_business_id` and `_collection_key` apply, so a padded
+    voucher number cannot become an identity that differs from its own
+    stripped spelling in the warehouse (every code column goes through
+    `clean.to_code`, which strips).
+    """
+
+    if value is None or isinstance(value, (list, dict)):
+        return None
+    text = value.strip() if isinstance(value, str) else str(value)
+    return text or None
+
+
+def normalize_large_csv(
+    run_path: str | Path,
+    output_root: str | Path,
+    *,
+    spec: LargeCsvSpec,
+    chunk_size: int = 100_000,
+) -> NormalizationResult:
+    """Normalize one very large flat CSV to canonical Parquet, streaming (#49).
+
+    `normalize_flat_csv` cannot be used and cannot simply be widened: it holds
+    every row in memory because deciding which identities repeat needs the
+    whole file before any row can be written, and its docstring bounds that at
+    one row per GP. This source is 4,075,935 rows.
+
+    Streaming is possible here only because the identity is knowable per row.
+    `key_columns` is a composite natural key measured unique across every row
+    of the real extract, so a row's `row_id` does not depend on rows not yet
+    read. That measurement is not assumed: the lane keeps a digest of every
+    key it has seen and **raises** on a repeat rather than emitting two rows
+    with one `row_id`. If the source gains duplicates, the run fails and names
+    the key, instead of quietly publishing a canonical tree whose identities
+    collide.
+
+    Digests rather than the keys themselves, because 4M composite key strings
+    would cost more than the rows being streamed. A 64-bit collision would
+    only produce a spurious failure naming a real key, never a silent
+    duplicate -- the safe direction for a check to be wrong in.
+
+    The schema is declared from the header rather than inferred, for the same
+    reason as the accounting lane: the first batch is written long before the
+    last row is read, so no column's type may depend on rows not yet seen.
+    Every column is a string, which is what the warehouse's own parsers
+    (`clean.to_code`, `to_decimal_money`, `to_datetime`) expect anyway.
+    """
+
+    report = approve_run(run_path)
+    manifest = report.manifest
+    if chunk_size <= 0:
+        raise NormalizationError("chunk_size must be positive")
+    payload_root = Path(run_path).resolve() / "payloads"
+    if not payload_root.is_dir():
+        raise NormalizationError(f"raw run has no payloads directory: {payload_root}")
+    csv_paths = sorted(payload_root.rglob("*.csv"))
+    if len(csv_paths) != 1:
+        raise NormalizationError(
+            f"a large-CSV run must publish exactly one .csv payload; "
+            f"{payload_root} has {len(csv_paths)}"
+        )
+    csv_path = csv_paths[0]
+    source_file = csv_path.relative_to(payload_root).as_posix()
+    source_kind = spec.source_kind
+    table_name = source_kind.lower()
+
+    total_rows = 0
+    paths: list[Path] = []
+    pending: list[dict[str, Any]] = []
+    observed_max_buffered_rows = 0
+    seen: set[int] = set()
+    destination = Path(output_root).expanduser().resolve() / manifest.source / manifest.run_id
+
+    # utf-8-sig, not utf-8: this file carries a BOM, and without it the first
+    # header reads as "\ufeffplanYear" so every lookup of it returns None (#49).
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or ())
+        required = (*spec.key_columns, spec.business_id_column, spec.gp_column,
+                    spec.gp_name_column, spec.year_column)
+        missing = tuple(dict.fromkeys(c for c in required if c not in fieldnames))
+        if missing:
+            raise NormalizationError(
+                f"{source_file} is missing required column(s) {list(missing)}; "
+                f"found {fieldnames}"
+            )
+        types = dict(PROVENANCE_SCHEMA)
+        for column in fieldnames:
+            types.setdefault(column, pa.string())
+        schema = _arrow_schema(types)
+
+        with AtomicParquetPublication(destination) as publication:
+            def flush() -> None:
+                nonlocal pending, observed_max_buffered_rows
+                if pending:
+                    observed_max_buffered_rows = max(observed_max_buffered_rows, len(pending))
+                    paths.extend(publication.write_rows(
+                        table_name, pending, chunk_size=chunk_size, schema=schema,
+                    ))
+                    pending = []
+
+            for line_number, record in enumerate(reader, start=2):
+                record = _checked_record(record, fieldnames, source_file, line_number)
+                parts = [_blank_to_none(record.get(column)) for column in spec.key_columns]
+                if any(part is None for part in parts):
+                    raise NormalizationError(
+                        f"{source_file} line {line_number} has a blank key column "
+                        f"among {list(spec.key_columns)}; identity cannot be established"
+                    )
+                business_id = _canonical_json(parts)
+                digest = int.from_bytes(
+                    hashlib.blake2b(business_id.encode("utf-8"), digest_size=8).digest(), "big",
+                )
+                if digest in seen:
+                    raise NormalizationError(
+                        f"{source_file} line {line_number} repeats the key {business_id}; "
+                        f"{list(spec.key_columns)} was measured unique across this source, so a "
+                        f"repeat means the source changed shape -- refusing to publish two "
+                        f"rows with one row_id"
+                    )
+                seen.add(digest)
+                row_id = hashlib.sha256("|".join(
+                    (manifest.source, source_kind, source_file, business_id)
+                ).encode("utf-8")).hexdigest()
+                row = {k: _blank_to_none(v) for k, v in record.items() if k}
+                row.update(_provenance(
+                    manifest=manifest, source_file=source_file, source_kind=source_kind,
+                    year=_blank_to_none(record.get(spec.year_column)),
+                    gp_code=_blank_to_none(record.get(spec.gp_column)),
+                    gp_name=_blank_to_none(record.get(spec.gp_name_column)),
+                    row_id=row_id, source_record_id=row_id, parent_row_id=None, pos=None,
+                    business_id=_blank_to_none(record.get(spec.business_id_column)),
+                ))
+                pending.append(row)
+                total_rows += 1
+                if len(pending) >= chunk_size:
+                    flush()
+            flush()
+
+            if not paths:
+                paths.extend(publication.write_empty(table_name, schema))
+            canonical = {
+                "source": manifest.source,
+                "run_id": manifest.run_id,
+                "raw_manifest_sha256": _file_sha256(Path(run_path).resolve() / "manifest.json")[0],
+                "raw_manifest_identity": {
+                    "source": manifest.source, "run_id": manifest.run_id,
+                    "code_sha": manifest.code_sha, "config_hash": manifest.config_hash,
+                },
+                "schema_version": manifest.schema_version,
+                "tables": {
+                    table_name: {
+                        "row_count": total_rows,
+                        "files": [
+                            _canonical_file_record(publication.staging_root, path)
+                            for path in paths
+                        ],
+                    },
+                },
+                "quarantine_count": 0,
+                "terminal_state": "complete",
+            }
+            publication.write_canonical_manifest(canonical)
+            validate_canonical_manifest(publication.staging_root)
+            publication.publish()
+    return NormalizationResult(
+        destination, manifest.run_id,
+        {table_name: tuple(destination / path for path in paths)},
+        (), observed_max_buffered_rows, 0,
+    )
+
+
+def normalize_run(
+    run_path: str | Path, output_root: str | Path, **kwargs: Any,
+) -> NormalizationResult:
+    """Stable generic entry point; the raw run's own `source` picks the lane.
+
+    Dispatching on the manifest rather than on a CLI flag keeps the choice
+    where it cannot be got wrong: a run published as `egramswaraj_profile`
+    cannot be normalized as if it were the JSON scrape, whatever the caller
+    passes. Reading the manifest twice (here and again inside the lane) is
+    cheap next to the walk that follows.
+    """
+
+    source = load_manifest(run_path).source.casefold()
+    nested = NESTED_JSON_SOURCES.get(source)
+    if nested is not None:
+        kwargs.pop("kinds", None)
+        return normalize_accounting(run_path, output_root, source_kind=nested, **kwargs)
+    large = LARGE_CSV_SOURCES.get(source)
+    if large is not None:
+        kwargs.pop("kinds", None)
+        return normalize_large_csv(run_path, output_root, spec=large, **kwargs)
+    flat = FLAT_CSV_SOURCES.get(source)
+    if flat is None:
+        return normalize_egramswaraj(run_path, output_root, **kwargs)
+    source_kind, key_column = flat
+    kwargs.pop("kinds", None)
+    return normalize_flat_csv(
+        run_path, output_root, source_kind=source_kind, key_column=key_column, **kwargs,
+    )

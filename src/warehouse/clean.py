@@ -17,13 +17,37 @@ from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
+from .load_common import MONEY_GROUPED
+
 _TRAILING_DOT_ZERO = re.compile(r"^(-?\d+)\.0$")
 # A trailing \b after an optional literal "." never matches ("." and the
 # following space/digit are both non-word characters, so there is no
 # word/non-word transition there): "Rs. 1,25,000" would then strip only
 # "Rs", leaving a stray "." that breaks Decimal parsing. The leading \b is
 # enough to avoid matching "rs" mid-word.
-_CURRENCY_NOISE = re.compile(r"(?i)\brs\.?|[₹,]")
+_CURRENCY_NOISE = re.compile(r"(?i)\brs\.?|₹")
+
+
+def ungroup_digits(text: str) -> str | None:
+    """Strip digit-group commas, or return None if they are malformed.
+
+    Stripping unconditionally turns bad input into a plausible number rather
+    than a null: ``"1,2"`` becomes 12 and ``"12,,34"`` becomes 1234, so a
+    typo in an expenditure amount arrives in the warehouse as a number
+    nobody can tell is wrong (#127).
+
+    ``MONEY_GROUPED`` comes from ``load_common``, which already had to
+    answer this for the CSV loaders and documents the reasoning: both Indian
+    and Western grouping are accepted, because 1,00,000 is one lakh and not
+    a malformed 100,000, and a validator that only knew three-digit groups
+    would reject Odisha financial data wholesale.
+    """
+
+    if "," not in text:
+        return text
+    if not MONEY_GROUPED.match(text):
+        return None
+    return text.replace(",", "")
 
 
 def to_code(series: pd.Series) -> pd.Series:
@@ -73,8 +97,11 @@ def to_decimal_money(series: pd.Series, *, places: int = 2) -> pd.Series:
         text = _CURRENCY_NOISE.sub("", text).strip()
         if not text:
             return None
+        ungrouped = ungroup_digits(text)
+        if ungrouped is None:
+            return None
         try:
-            return Decimal(text).quantize(quantum)
+            return Decimal(ungrouped).quantize(quantum)
         except InvalidOperation:
             return None
 
@@ -84,10 +111,20 @@ def to_decimal_money(series: pd.Series, *, places: int = 2) -> pd.Series:
 def to_int(series: pd.Series) -> pd.Series:
     """Convert integer-like values to pandas nullable Int64."""
 
-    numeric = pd.to_numeric(
-        series.astype("string").str.replace(",", "", regex=False).str.strip(),
-        errors="coerce",
-    )
+    # Same grouping rule as to_decimal_money above: a count is not money, but
+    # "1,2" -> 12 is the identical silent rewrite, and leaving one spelling
+    # of the defect fixed and its neighbour broken is worse than either.
+    # ungroup_digits returns None for a malformed value, which to_numeric
+    # then reads as NA instead of inventing a number.
+    text = series.astype("string").str.strip()
+    # .astype("string") after .map is load-bearing, not tidiness: map returns
+    # an object-dtype Series, pd.to_numeric then produces a numpy dtype, and
+    # .astype("Int64") *raises* on values it used to coerce -- an out-of-range
+    # count would abort the build instead of becoming NA.
+    ungrouped = text.map(
+        lambda value: value if not isinstance(value, str) else ungroup_digits(value)
+    ).astype("string")
+    numeric = pd.to_numeric(ungrouped, errors="coerce")
     return numeric.round().astype("Int64")
 
 

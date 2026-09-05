@@ -300,14 +300,20 @@ class RunPublisher:
                 else:
                     data = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
                     handle.write(data)
+            os.replace(temporary, target)
         except BaseException:
             # A stream that raises mid-read must not leave a partial temp
             # file behind in payloads/: publish() would otherwise inventory
             # and publish it under its random temp name.
+            #
+            # The replace is INSIDE this scope (#110). It used to sit after
+            # the handler, so a failing rename left the fully-written temp
+            # file in payloads/ under its random name -- and a caller that
+            # caught the error and carried on to publish() would inventory it
+            # as though it were a source file.
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             raise
-        os.replace(temporary, target)
         return target
 
     def append_audit(self, event: Mapping[str, Any]) -> None:

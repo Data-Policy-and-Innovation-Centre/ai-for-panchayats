@@ -74,7 +74,31 @@ def test_failed_terminal_run_is_integrity_valid_but_not_approvable(tmp_path: Pat
 
 
 def test_snapshot_registry_has_only_approved_entries():
-    assert load_snapshot_registry(Path(__file__).parents[1] / "config" / "snapshots.yaml").snapshots == ()
+    """What the name says, rather than that the registry is empty.
+
+    It asserted `== ()` because it was written when no snapshot had been
+    approved yet. That made the first real approval fail CI for the wrong
+    reason -- an empty registry is a starting state, not an invariant.
+
+    Being precise about what each half pins: `load_snapshot_registry` already
+    raises SnapshotRegistryError on a non-approved entry, so the status
+    assertion below is unreachable defence-in-depth and would only start
+    doing work if that refusal were ever relaxed. The duplicate-id check is
+    the half that adds coverage -- nothing else rejects two entries sharing
+    a snapshot_id, and `--snapshot-id` would then silently pick one of them.
+    """
+
+    registry = load_snapshot_registry(
+        Path(__file__).parents[1] / "config" / "snapshots.yaml"
+    )
+    assert all(spec.status == "approved" for spec in registry.snapshots), [
+        (spec.snapshot_id, spec.status) for spec in registry.snapshots
+        if spec.status != "approved"
+    ]
+    ids = [spec.snapshot_id for spec in registry.snapshots]
+    # A duplicated id would make `--snapshot-id` ambiguous, and the build
+    # would silently pick one of two runs.
+    assert len(ids) == len(set(ids)), ids
 
 
 def test_file_like_payloads_are_streamed_in_bounded_chunks(tmp_path: Path):
@@ -117,6 +141,41 @@ def test_write_payload_removes_partial_temp_file_after_stream_failure(tmp_path: 
         run_path = publisher.publish()
 
     # The partial payload never made it into the published, hash-verified run.
+    assert list((run_path / "payloads").iterdir()) == []
+    assert validate_run(run_path)
+
+
+def test_write_payload_removes_the_temp_file_when_the_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The sibling case above, one line later (#110).
+
+    The cleanup handler used to end *before* `os.replace`. Streaming could
+    therefore succeed, the rename fail, and the fully-written temp file stay
+    in payloads/ under its random name -- and a caller that caught the error
+    and carried on to publish() would inventory it as a source file. Worse
+    than the partial-stream case it sat next to, because the file is complete
+    and looks entirely legitimate.
+
+    `os.replace` is patched rather than provoked: the natural provocation --
+    a target that already exists -- is refused earlier by write_payload's own
+    duplicate-path guard, so it cannot reach the rename.
+    """
+
+    def refuse(src, dst):
+        raise OSError("synthetic replace failure")
+
+    with RunPublisher(tmp_path / "raw", "synthetic", "fail-replace") as publisher:
+        staging_payloads = list(
+            (tmp_path / "raw" / "synthetic").glob(".fail-replace.staging-*")
+        )[0] / "payloads"
+        monkeypatch.setattr("src.pipeline.manifest.os.replace", refuse)
+        with pytest.raises(OSError, match="synthetic replace failure"):
+            publisher.write_payload("stream.bin", b"complete-data")
+        assert list(staging_payloads.iterdir()) == [], "temp file left in payloads/"
+        monkeypatch.undo()
+        run_path = publisher.publish()
+
     assert list((run_path / "payloads").iterdir()) == []
     assert validate_run(run_path)
 
@@ -326,3 +385,27 @@ def test_normalize_prints_a_pasteable_registry_stanza(tmp_path: Path, capsys):
     assert spec.run_id == "2026-09-03"
     assert spec.schema_version == "1"
     assert spec.status == "approved"
+
+
+def test_cli_normalize_picks_the_lane_from_the_run_manifest(tmp_path: Path, capsys):
+    """`main.py normalize` must not need to be told which normalizer to use.
+
+    The CLI called `normalize_egramswaraj` directly, so the lane a run takes
+    was decided by which function the caller happened to import rather than
+    by what the run actually is. Dispatching on the manifest's `source`
+    means a profile CSV cannot be pushed through the JSON normalizer -- which
+    would quarantine every file as `unknown_source_kind` and publish an empty
+    snapshot without failing (#123).
+    """
+
+    with RunPublisher(tmp_path / "raw", "egramswaraj_profile", "profile-cli") as publisher:
+        publisher.write_payload("master.csv", b"basic_info_lgd,pop\n115550,120\n")
+        run = publisher.publish()
+
+    assert main([
+        "normalize", "--run-path", str(run),
+        "--output-root", str(tmp_path / "canonical"),
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "0 quarantined" in out
+    assert (tmp_path / "canonical" / "egramswaraj_profile" / "profile-cli" / "profile").is_dir()

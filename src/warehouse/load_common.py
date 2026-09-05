@@ -154,7 +154,11 @@ _CURRENCY_PREFIX = re.compile(r"(?i)^\s*(?:₹|rs\.?|inr)\s*")
 # validator that only knows three-digit grouping would reject the real data
 # wholesale. That failure would be worse than the one being fixed: silent
 # corruption of some rows traded for rejection of nearly all of them.
-_MONEY_GROUPED = re.compile(
+# Public, deliberately: warehouse.clean parses money on the live transform
+# path and must apply the same rule. Two copies of this expression would
+# drift, and the one that drifted would silently accept what the other
+# rejects.
+MONEY_GROUPED = re.compile(
     r"""^[+-]?(?:
           \d{1,3}(?:,\d{3})*          # 1  123  1,234  12,345,678
         | \d{1,2}(?:,\d{2})*,\d{3}    # 1,00,000  12,34,567  1,23,45,678
@@ -662,7 +666,7 @@ def _decimal_from_value(
         if "," in text:
             # Only grouped values are checked; an ungrouped string falls
             # through to Decimal() below, which rejects its own garbage.
-            if not _MONEY_GROUPED.match(text):
+            if not MONEY_GROUPED.match(text):
                 raise MoneyParseError(
                     column=column,
                     value=value,

@@ -62,24 +62,50 @@ class Finding:
 # THE SPECIFICATION -- authoritative constants, easy to update in one place.
 # ---------------------------------------------------------------------------
 
-# Section 1: exactly these 19 tables must exist.
+# Section 1: exactly these tables must exist -- the spec's 19 plus gp_profile.
+# The count is deliberately not written into the check messages below: it
+# has drifted once already, and this set is the only place that should
+# have to change when it drifts again.
 EXPECTED_TABLES: frozenset[str] = frozenset({
     "gram_panchayat", "plan", "planned_activity", "activity_delegation",
     "activity_asset", "activity_fund", "activity_training", "activity_community_service",
     "activity_nsap", "activity_expenditure", "voucher", "activity_voucher",
     "admin_approval", "admin_approval_scheme", "technical_approval", "physical_progress",
     "dim_code", "dim_welfare_scheme", "dim_lsdg_theme",
+    # The twentieth: GP demographics from the panchayat profile extract
+    # (#123). The Box spec documents "19 tables" and needs the same
+    # amendment, or the checker and the documents now disagree.
+    "gp_profile",
 })
 
-# An internal bookkeeping table that may legitimately exist alongside the 19.
+# An internal bookkeeping table that may legitimately exist alongside the 20.
 # Its presence is informational, never a violation.
 ALLOWED_EXTRA_TABLES: frozenset[str] = frozenset({"quarantine"})
+
+# The consumer-facing relations, materialised as tables by warehouse.views
+# (#51). They are derived from the fact tables -- no new facts -- so they are allowed
+# alongside them rather than counted among them. Checked for presence
+# separately: a warehouse missing them builds but is not consumable.
+DERIVED_RELATIONS: frozenset[str] = frozenset({
+    "v_exp", "v_approval", "v_activity", "v_activity_base", "v_plan",
+    "v_asset", "v_progress", "v_voucher",
+})
+
+# The one derived relation that must NOT be stored. `v_activity` adds
+# `days_since_sanction`, which counts days up to CURRENT_DATE, so a stored
+# copy would answer as of the build date and drift for as long as the
+# snapshot stayed deployed. Its join graph is stored as `v_activity_base`
+# instead, so the cost #51 exists to remove is still paid once. Named here
+# rather than merely omitted from a list, so that storing it later trips the
+# check instead of silently reintroducing the staleness.
+DYNAMIC_RELATIONS: frozenset[str] = frozenset({"v_activity"})
 
 # Section 2: primary keys. ``None`` means "no primary key is expected" --
 # a table appearing here with None is a documented fact from the spec
 # (activity_voucher, dim_lsdg_theme), not an omission.
 EXPECTED_PRIMARY_KEYS: dict[str, tuple[str, ...] | None] = {
     "gram_panchayat": ("gp_lgd_code",),
+    "gp_profile": ("gp_lgd_code",),
     "plan": ("plan_code",),
     "planned_activity": ("activity_code",),
     "activity_delegation": ("activity_code",),
@@ -113,6 +139,7 @@ NULLABLE_REQUIRED: tuple[str, str] = ("activity_voucher", "voucher_pk")
 # activity_expenditure.plan_code -> plan is deliberately excluded here too,
 # for the same "not verified to always resolve" reason NO_ENFORCED_FK is.
 EXPECTED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("gp_profile", "gp_lgd_code", "gram_panchayat"),
     ("plan", "gp_lgd_code", "gram_panchayat"),
     ("planned_activity", "plan_code", "plan"),
     ("planned_activity", "gp_lgd_code", "gram_panchayat"),
@@ -163,6 +190,13 @@ SATELLITE_TABLES: tuple[str, ...] = (
     "activity_training", "activity_community_service",
 )
 PARENT_TABLE_FOR_SATELLITES = "planned_activity"
+# The three columns every satellite carries that are not payload: two
+# provenance columns and the foreign key. Everything else in a satellite is
+# data the source was supposed to supply, which is what
+# ``check_satellite_payload_population`` looks at.
+SATELLITE_IDENTITY_COLUMNS: frozenset[str] = frozenset({
+    "source_system", "source_run_id", "activity_code",
+})
 VOUCHER_DIRECTION_TABLE = "voucher"
 VOUCHER_DIRECTION_COLUMN = "direction"
 VOUCHER_ALLOWED_DIRECTIONS: frozenset[str] = frozenset({"payment", "receipt"})
@@ -195,12 +229,41 @@ EXPECTED_BLOCK_COUNT = 314
 # Anything between is neither, and should be looked at by a person.
 MIN_GP_COVERAGE = 0.90
 
+# The demographic measures, spelled out here rather than imported from
+# `transform` on purpose: this module is written against the spec, not against
+# our loader's inputs, so a rename on one side has to fail loudly instead of
+# being followed silently by the checker meant to catch it.
+#
+# Listed in full for the reason the geography list is: naming a subset let a
+# table with 100% NULL district_code pass clean, which is what #61 is named
+# for. The same trap is already visible here -- the manifest test fixture
+# populated total_population and households and left the other eight NULL,
+# and every check passed.
+GP_PROFILE_TABLE = "gp_profile"
+GP_PROFILE_MEASURES: tuple[str, ...] = (
+    "total_population", "male_population", "female_population",
+    "transgender_population", "children_population", "sc_population",
+    "st_population", "obc_population", "general_population", "households",
+)
+
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
 # decimal arithmetic, never binary float ``==``.
-EXPECTED_VOUCHER_AMOUNT_TOTAL = Decimal("1350542247.18")
-EXPECTED_ACTIVITY_EXPENDITURE_TOTAL = Decimal("253475090.46")
-EXPECTED_PLANNED_COST_TOTAL = Decimal("773088536.00")
+#
+# Full-state figures (#175). The first two were measured from the full-state
+# build and agree with the externally-built production database exactly, to
+# the paisa; they were the 20-GP pilot figures until #175, which is why every
+# real build had to skip this whole section and so checked none of it.
+#
+# The voucher total is NOT the production figure. Production reads
+# 455046197982.47; ours reads what our source can support, because the
+# accounting extract covers 6,436 of 6,794 GPs (#171). It is recorded here
+# rather than left at the pilot value so that the number is visible and the
+# gap is one subtraction, but it is exempted by name in every real build
+# until #171 lands -- see EXEMPTABLE_RECONCILIATION_CHECKS.
+EXPECTED_VOUCHER_AMOUNT_TOTAL = Decimal("428724765277.36")
+EXPECTED_ACTIVITY_EXPENDITURE_TOTAL = Decimal("78053445024.44")
+EXPECTED_PLANNED_COST_TOTAL = Decimal("258086866807.00")
 
 RECONCILIATION_TARGETS: tuple[tuple[str, str, str, Decimal], ...] = (
     ("reconciliation.voucher_amount_total", "voucher", "amount", EXPECTED_VOUCHER_AMOUNT_TOTAL),
@@ -213,6 +276,11 @@ RECONCILIATION_TARGETS: tuple[tuple[str, str, str, Decimal], ...] = (
         "total_cost", EXPECTED_PLANNED_COST_TOTAL,
     ),
 )
+
+# The names ``exempt_reconciliation`` accepts, derived from the targets rather
+# than spelled a second time, so a renamed target cannot leave a stale
+# exemption quietly matching nothing.
+EXEMPTABLE_RECONCILIATION_CHECKS = frozenset(name for name, *_ in RECONCILIATION_TARGETS)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +363,7 @@ def _decimal_sum(con: duckdb.DuckDBPyConnection, table: str, column: str) -> Dec
 # ---------------------------------------------------------------------------
 
 def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
-    """Section 1: exactly the 19 tables, missing/extra reported separately."""
+    """Section 1: exactly EXPECTED_TABLES, missing/extra reported separately."""
 
     findings: list[Finding] = []
     actual = _existing_tables(con)
@@ -306,17 +374,17 @@ def check_table_existence(con: duckdb.DuckDBPyConnection) -> list[Finding]:
             expected=f"table {table!r} exists", actual="absent",
         ))
 
-    unexpected = actual - EXPECTED_TABLES - ALLOWED_EXTRA_TABLES
+    unexpected = actual - EXPECTED_TABLES - ALLOWED_EXTRA_TABLES - DERIVED_RELATIONS
     for table in sorted(unexpected):
         findings.append(Finding(
             check="tables.unexpected", severity="violation",
-            expected="only the 19 spec tables", actual=f"unexpected table {table!r}",
+            expected="only the expected tables", actual=f"unexpected table {table!r}",
         ))
 
     for table in sorted(actual & ALLOWED_EXTRA_TABLES):
         findings.append(Finding(
             check="tables.internal", severity="informational",
-            expected="not part of the spec's 19 tables", actual=f"{table!r} present",
+            expected="not part of the expected inventory", actual=f"{table!r} present",
             detail="internal bookkeeping table, not a violation",
         ))
     return findings
@@ -515,6 +583,82 @@ def check_beneficiary_count_type(con: duckdb.DuckDBPyConnection) -> list[Finding
     return []
 
 
+def check_satellite_payload_population(
+    con: duckdb.DuckDBPyConnection, *, full_state: bool = True,
+) -> list[Finding]:
+    """Section 5b: a satellite must carry data, not just the right row count.
+
+    The 1:1 satellites are padded to one row per planned_activity on purpose
+    (see ``transform._pl_child``), so row parity -- which section 5 already
+    checks -- says nothing at all about whether the payload arrived. That is
+    the exact shape #159 shipped in: ``activity_asset`` held 4,073,745 rows,
+    every asset column NULL, and passed every check the warehouse had. A
+    deployed chatbot answered every asset question with 'Uncategorised' over
+    a healthy-looking four-million-row table.
+
+    Two levels, because the two mean different things:
+
+    * every payload column NULL is a **violation** -- the table is filler,
+      and whatever routes data into it is not working. Only on a full-state
+      build: a three-activity fixture whose records carry no training or
+      delegation fields has an all-NULL satellite and is not wrong for it,
+      so ``full_state=False`` reports the same thing as a note. This rides
+      the same "is this the state?" question as geography and gp_profile
+      completeness, and takes it from the same flag.
+    * one column NULL throughout is **informational** -- usually the source
+      simply never sends it, which is worth stating in the report rather
+      than leaving to be rediscovered. Two are known as of this writing:
+      ``asset_name`` (the portal sends ``astNm`` on every record and its
+      value is always null) and the five ``asset_loc_*`` columns (the source
+      does carry ``assetLocationDetails``, but it is a list nested inside a
+      flattened dict, so normalize drops it -- see #177).
+    """
+
+    findings: list[Finding] = []
+    actual_tables = _existing_tables(con)
+    for table in SATELLITE_TABLES:
+        if table not in actual_tables:
+            continue
+        if _row_count(con, table) == 0:
+            continue  # an empty satellite is section 5's business, not this one
+        payload = [c for c in _columns(con, table) if c not in SATELLITE_IDENTITY_COLUMNS]
+        if not payload:
+            # A satellite reduced to its identity columns cannot hold data at
+            # all, and nothing else notices: check_table_existence compares
+            # table NAMES, and row parity, primary keys and foreign keys all
+            # still pass on a table with no payload. That is this check's own
+            # blind spot, one level up from the one it was written for.
+            if full_state:
+                findings.append(Finding(
+                    check=f"data.satellite_payload.{table}", severity="violation",
+                    expected="payload column(s) beyond "
+                             f"{sorted(SATELLITE_IDENTITY_COLUMNS)}",
+                    actual="the table has only identity columns",
+                    detail="schema drift: this table cannot carry data, and every "
+                           "other check still passes on it",
+                ))
+            continue
+        selects = ", ".join(f'COUNT("{column}")' for column in payload)
+        counts = con.execute(f"SELECT {selects} FROM {table}").fetchone() or ()
+        empty = [column for column, count in zip(payload, counts) if count == 0]
+        if len(empty) == len(payload):
+            findings.append(Finding(
+                check=f"data.satellite_payload.{table}",
+                severity="violation" if full_state else "informational",
+                expected=f"at least one of {len(payload)} payload column(s) populated",
+                actual="every payload column is NULL in every row",
+                detail="row parity passes because these rows are 1:1 padding; "
+                       "nothing is routing data into this table",
+            ))
+            continue
+        for column in empty:
+            findings.append(Finding(
+                check=f"data.satellite_payload.{table}.{column}", severity="informational",
+                expected="some non-NULL value", actual="NULL in every row",
+            ))
+    return findings
+
+
 def check_satellite_row_parity(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """Section 5: the five 1:1 satellites match planned_activity exactly."""
 
@@ -652,6 +796,71 @@ def check_dim_code_uniqueness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     )]
 
 
+def check_derived_relations(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """The consumer relations exist, and each is stored or dynamic as intended.
+
+    Behind its own ``skip_derived`` flag for the reason
+    ``check_geography_completeness`` is behind ``skip_geography``: a fixture
+    that creates the spec tables to exercise a schema rule is not wrong
+    for having no ``v_activity``. A real build is.
+
+    Three things can be wrong, and this checks all three.
+
+    **Absent** means the chatbot has nothing to query -- it reads these and
+    nothing else, so a warehouse without them is not consumable however
+    complete its facts are.
+
+    **A view where a table was expected** means the join graph is still being
+    re-run per question, which is the 36x cost #51 exists to remove (#99,
+    #98).
+
+    **A table where a view was expected** is the opposite mistake and is
+    quieter, which is why ``DYNAMIC_RELATIONS`` is named rather than merely
+    left out of a list. ``v_activity`` adds ``days_since_sanction``, a count
+    of days up to ``CURRENT_DATE``; stored, it answers as of the build date
+    and drifts for every day the snapshot stays deployed. Nothing fails --
+    the number is simply wrong, and grows more wrong.
+    """
+
+    relations = {
+        name: kind for name, kind in con.execute(
+            "SELECT table_name, table_type FROM information_schema.tables "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+    }
+    findings: list[Finding] = []
+    missing = DERIVED_RELATIONS - set(relations)
+    if missing:
+        findings.append(Finding(
+            check="relations.derived", severity="violation",
+            expected=f"the {len(DERIVED_RELATIONS)} consumer relations",
+            actual=f"missing {sorted(missing)}",
+        ))
+    not_stored = sorted(
+        name for name in (DERIVED_RELATIONS - DYNAMIC_RELATIONS) & set(relations)
+        if relations[name] != "BASE TABLE"
+    )
+    wrongly_stored = sorted(
+        name for name in DYNAMIC_RELATIONS & set(relations)
+        if relations[name] == "BASE TABLE"
+    )
+    if wrongly_stored:
+        findings.append(Finding(
+            check="relations.dynamic", severity="violation",
+            expected=f"{sorted(DYNAMIC_RELATIONS)} recomputed per query",
+            actual=f"stored as tables: {wrongly_stored}",
+            detail="days_since_sanction counts up to CURRENT_DATE; a stored "
+                   "copy freezes it at build time and drifts thereafter",
+        ))
+    if not_stored:
+        findings.append(Finding(
+            check="relations.materialized", severity="violation",
+            expected="stored tables, so the joins are paid once at build time",
+            actual=f"still views: {not_stored}",
+        ))
+    return findings
+
+
 def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
     """gram_panchayat carries geography for the whole state.
 
@@ -732,17 +941,99 @@ def check_geography_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding
     return findings
 
 
-def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+def check_gp_profile_completeness(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+    """gp_profile carries real demographics for the whole state (#123).
+
+    The artifact-level counterpart to ``transform.gp_profile``'s
+    ``EmptyRequiredColumn``, and not a duplicate of it. That one runs while
+    the table is being built, so it protects nothing about an artifact built
+    somewhere else, built by an older version, or hand-patched -- and this
+    script is what decides such an artifact is deployable.
+
+    Row count alone is exactly the mistake #61 was: 6,710 keys with every
+    measure NULL is the right count and no data. Checked the same three ways
+    geography is -- columns present, every row populated, count within the
+    roster -- plus non-negativity, because ``clean.to_int`` will happily carry
+    a -1 through and a negative population is not a number anyone observed.
+
+    Coverage, not equality: 84 of the 6,794 GPs have no profile upstream at
+    all, so demanding one row per GP would refuse a complete build.
+    """
+
+    table = GP_PROFILE_TABLE
+    if table not in _existing_tables(con):
+        return []  # already reported by check_table_existence
+    columns = _columns(con, table)
+    missing = tuple(col for col in GP_PROFILE_MEASURES if col not in columns)
+    if missing:
+        return [Finding(
+            check="gp_profile.columns", severity="violation",
+            expected=f"{table} has {list(GP_PROFILE_MEASURES)}",
+            actual=f"missing {list(missing)}",
+        )]
+
+    findings: list[Finding] = []
+    total = _row_count(con, table)
+    floor = int(EXPECTED_GP_COUNT * MIN_GP_COVERAGE)
+    if not floor <= total <= EXPECTED_GP_COUNT:
+        findings.append(Finding(
+            check="gp_profile.gp_count", severity="violation",
+            expected=f"between {floor} and {EXPECTED_GP_COUNT} rows",
+            actual=str(total),
+            detail="a build well short of the roster is a sample, not the state",
+        ))
+    blank = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} IS NULL" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if blank:
+        findings.append(Finding(
+            check="gp_profile.populated", severity="violation",
+            expected=f"every row has all of {', '.join(GP_PROFILE_MEASURES)}",
+            actual=f"{blank} row(s) with a null measure",
+        ))
+    negative = con.execute(
+        f"SELECT count(*) FROM {table} WHERE "
+        + " OR ".join(f"{col} < 0" for col in GP_PROFILE_MEASURES)
+    ).fetchone()[0]
+    if negative:
+        findings.append(Finding(
+            check="gp_profile.non_negative", severity="violation",
+            expected="no negative population or household count",
+            actual=f"{negative} row(s) with a negative measure",
+        ))
+    return findings
+
+
+def check_reconciliation_totals(
+    con: duckdb.DuckDBPyConnection, exempt: frozenset[str] = frozenset(),
+) -> list[Finding]:
     """Section 6: the exact published totals from the reference build.
 
     Skipped entirely by the caller (via ``check_conformance``'s
     ``skip_reconciliation``) when the database under test is a synthetic
     fixture rather than the real build.
+
+    ``exempt`` names individual targets to leave unchecked, for a total whose
+    source is known to be incomplete. It exists so that "one total cannot be
+    hit yet" stops meaning "check none of them" -- which is how a defect that
+    silently doubled activity_expenditure could have reached a green build
+    and a green conformance run (#175).
+
+    An exemption is never silent: it reports what it did not check and what
+    the target was, so the report says so rather than simply looking clean.
     """
 
     findings: list[Finding] = []
     actual_tables = _existing_tables(con)
     for check_name, table, column, expected in RECONCILIATION_TARGETS:
+        if check_name in exempt:
+            findings.append(Finding(
+                check=check_name, severity="informational",
+                expected=str(expected), actual="not checked",
+                detail="exempted for this run; the target is recorded, not asserted",
+            ))
+            continue
         if table not in actual_tables:
             continue  # already reported by check_table_existence
         if column not in _columns(con, table):
@@ -788,6 +1079,7 @@ ALL_CHECKS = (
 def check_conformance(
     con: duckdb.DuckDBPyConnection, *,
     skip_reconciliation: bool = False, skip_geography: bool = False,
+    skip_derived: bool = False, exempt_reconciliation: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     """Run every check and return the combined findings, in a stable order.
 
@@ -797,18 +1089,36 @@ def check_conformance(
     reconciliation totals -- and while geography rode that same flag, no real
     build ever asserted its own scale. A 20-GP build reported "PASS".
 
-    ``skip_reconciliation`` omits the exact published totals.
-    ``skip_geography`` omits full-state coverage; use it for synthetic
+    ``skip_reconciliation`` omits the exact published totals; prefer
+    ``exempt_reconciliation`` on a real build, which omits named targets only
+    and reports each one it skipped (#175).
+    ``skip_geography`` omits full-state coverage -- geography AND gp_profile
+    demographics, which are the same question about two tables; use it for
+    synthetic
     fixtures, which are not wrong for holding three GPs.
+    ``skip_derived`` omits the consumer relations (#51), for the same
+    reason: a fixture exercising a schema rule need not materialise them.
     """
 
     findings: list[Finding] = []
     for check in ALL_CHECKS:
         findings.extend(check(con))
+    if not skip_derived:
+        findings.extend(check_derived_relations(con))
     if not skip_geography:
+        # Both are full-state coverage checks and are skipped together: a
+        # synthetic fixture holding three GPs is not wrong for having three
+        # districts, and it is not wrong for having three profiles either.
+        # The flag keeps its name because that is what the CLI and the
+        # Makefile pass; what it means is "this is not the state".
         findings.extend(check_geography_completeness(con))
+        findings.extend(check_gp_profile_completeness(con))
+    # Always runs; ``skip_geography`` decides only whether an all-NULL
+    # satellite is a violation or a note, because that is the same question
+    # the flag already answers -- is this the state, or a fixture?
+    findings.extend(check_satellite_payload_population(con, full_state=not skip_geography))
     if not skip_reconciliation:
-        findings.extend(check_reconciliation_totals(con))
+        findings.extend(check_reconciliation_totals(con, exempt_reconciliation))
     return findings
 
 

@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.warehouse.build import build  # noqa: E402
+from src.warehouse.dimensions import DimensionError  # noqa: E402
 from src.warehouse.geography import GeographyError  # noqa: E402
 from src.warehouse.select import SelectionError  # noqa: E402
 from src.warehouse.validate import ValidationFailed  # noqa: E402
@@ -43,11 +44,11 @@ def cmd_build(args: argparse.Namespace) -> int:
             target=args.database,
             validate=not args.no_validate,
         )
-    except (SelectionError, GeographyError) as exc:
-        # Both are "this build cannot start" conditions raised before any
-        # DuckDB file is touched: a bad snapshot selection, or an LGD
-        # reference tree that is missing or malformed. Same controlled exit
-        # rather than a traceback.
+    except (SelectionError, GeographyError, DimensionError) as exc:
+        # All three are "this build cannot start" conditions raised before
+        # any DuckDB file is touched: a bad snapshot selection, an LGD
+        # reference tree that is missing or malformed, or a code dictionary
+        # that is. Same controlled exit rather than a traceback.
         logger.error("%s", exc)
         return 2
     except ValidationFailed as exc:

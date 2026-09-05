@@ -180,6 +180,17 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Claude Code. Only two things under .claude/ are per-developer: the agent
+# worktrees (throwaway checkouts -- 5 GB of them here) and settings.local.json.
+# Named individually rather than ignoring the directory, so project skills,
+# agents, commands and a shared settings.json are tracked the moment they
+# appear, without anyone having to remember to edit this file.
+.claude/worktrees/
+.claude/settings.local.json
+
+# Git worktrees for parallel branch work.
+.worktrees/
+
 data/raw/*
 # config/staging.env puts a staging run's raw tree here, outside every
 # rule above it -- ~600 payload files that would otherwise be committable.
@@ -188,6 +199,17 @@ data/clean/*
 data/interim/*
 data/processed/*
 !data/raw/*.dvc
+# One level deeper, for eGramSwaraj only. `data/raw/*` stops git at the
+# top-level directory, so a pointer inside it is unreachable however many
+# `!` rules follow -- git does not look inside a directory it has already
+# excluded. Named explicitly rather than with `**` so that `git status` does
+# not walk the ~204,000 payload files of the Gram_Panchayat tree (#156) on
+# every invocation. One pointer per dataset directory, as SabhaSaar_MoMs.dvc
+# already is; a future Gram_Panchayat.dvc sits at this same level and needs
+# no further rule.
+!data/raw/eGramSwaraj_Data/
+data/raw/eGramSwaraj_Data/*
+!data/raw/eGramSwaraj_Data/*.dvc
 !data/clean/*.dvc
 !data/interim/*.dvc
 !data/processed/*.dvc

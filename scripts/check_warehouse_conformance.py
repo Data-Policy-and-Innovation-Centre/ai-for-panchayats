@@ -23,7 +23,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import duckdb  # noqa: E402
 
-from warehouse.conformance import check_conformance, format_report, has_violations  # noqa: E402
+from warehouse.conformance import (  # noqa: E402
+    EXEMPTABLE_RECONCILIATION_CHECKS,
+    check_conformance,
+    format_report,
+    has_violations,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,11 +41,24 @@ def main(argv: list[str] | None = None) -> int:
         help="omit the exact reference-build reconciliation totals (use for synthetic fixtures)",
     )
     parser.add_argument(
+        "--exempt-reconciliation", action="append", default=[], metavar="CHECK",
+        choices=sorted(EXEMPTABLE_RECONCILIATION_CHECKS),
+        help="omit ONE named reconciliation target and check the rest. Prefer this to "
+             "--skip-reconciliation on a real build: a total whose source is known to be "
+             "incomplete is a reason to exempt that total, not to stop checking the "
+             "others (#175). Repeatable. Each exemption is reported, not silent",
+    )
+    parser.add_argument(
         "--skip-geography", action="store_true",
         help="omit full-state geography coverage (use for synthetic fixtures). Separate "
-             "from --skip-reconciliation on purpose: every real build skips the totals "
-             "today (#46, #48, #129), and folding the two together meant no real build "
-             "ever checked its own scale",
+             "from the reconciliation flags on purpose: folding the two together meant "
+             "no real build ever checked its own scale, and a 20-GP build reported PASS",
+    )
+    parser.add_argument(
+        "--skip-derived", action="store_true",
+        help="omit the consumer relations v_activity/v_asset/... (#51), for synthetic "
+             "fixtures. A real build should not skip this: the chatbot queries these "
+             "and nothing else, so a warehouse without them is not consumable",
     )
     args = parser.parse_args(argv)
 
@@ -50,8 +68,11 @@ def main(argv: list[str] | None = None) -> int:
 
     con = duckdb.connect(str(args.database), read_only=True)
     try:
-        findings = check_conformance(con, skip_reconciliation=args.skip_reconciliation,
-                             skip_geography=args.skip_geography)
+        findings = check_conformance(
+            con, skip_reconciliation=args.skip_reconciliation,
+            skip_geography=args.skip_geography, skip_derived=args.skip_derived,
+            exempt_reconciliation=frozenset(args.exempt_reconciliation),
+        )
     finally:
         con.close()
 

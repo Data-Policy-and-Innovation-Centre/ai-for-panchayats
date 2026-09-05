@@ -45,13 +45,17 @@ conflicting duplicate: quarantined, not kept as a second row.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Mapping
 
 import pandas as pd
 
-from .clean import strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int
+from .clean import (
+    strip_leading_zeros, to_code, to_datetime, to_decimal_money, to_int, ungroup_digits,
+)
 from .geography import GEOGRAPHY_COLUMNS
 
 # --------------------------------------------------------------------- quarantine
@@ -169,6 +173,64 @@ class FieldResolutions:
         """Fields that resolved to null because no candidate was present."""
 
         return tuple(r for r in self.records if r.matched_candidate is None)
+
+
+def _is_fractional(text: object) -> bool:
+    """A count that is not a whole number is malformed, not roundable.
+
+    ``clean.to_int`` ends in ``numeric.round()``, so "1.5" becomes 2 and looks
+    like a clean parse to anything that only checks for null afterwards. A
+    rounded count is an invented one.
+
+    Module level rather than nested in one transform: activity_nsap's
+    beneficiary counts and gp_profile's populations are the same question
+    about the same kind of column, and two copies of this predicate would
+    drift (#116, #123).
+    """
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    if not value.is_finite():
+        return False
+    return value != value.to_integral_value()
+
+
+def _is_non_finite(text: object) -> bool:
+    """NaN and Infinity: not fractional, and still not a count."""
+
+    if pd.isna(text) or text == "":
+        return False
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return False
+    return not value.is_finite()
+
+
+class EmptyRequiredColumn(ValueError):
+    """A required column resolved by name, but none of its values survived.
+
+    The sibling case ``RequiredFieldUnresolved`` does not cover, and the one
+    that is easier to reach: the header is still there and the values are not.
+    ``_first_present`` proves a column NAME exists; nothing proved the values
+    parsed. A scrape emitting blanks -- or text where a count belongs -- would
+    otherwise publish the right number of rows with entirely NULL measures,
+    past every check there is, because the columns are nullable and no
+    conformance rule reads their contents (#123).
+    """
+
+    def __init__(self, *, table: str, columns: tuple[str, ...], rows: int) -> None:
+        self.table = table
+        self.columns = columns
+        self.rows = rows
+        super().__init__(
+            f"{table}: required column(s) {columns!r} are null in all {rows:,} loaded "
+            "row(s); the source column is present but carries no readable values"
+        )
 
 
 def _dedupe(frame: pd.DataFrame, keys: list[str], table: str, quarantine: Quarantine,
@@ -316,6 +378,455 @@ def gram_panchayat(root_frames: list[pd.DataFrame], quarantine: Quarantine,
             lambda code, _c=column: lookup.get(code, {}).get(_c)
         ).astype("string")
     return deduped
+
+
+# --------------------------------------------------------------------- gp_profile
+
+# The profile CSV's own header spelling -> the DDL column. Ten of its 99
+# columns, written out rather than taken by prefix: the file's columns are
+# whatever the scrape happened to see, so a pattern match would silently
+# widen the table the next time the portal adds a field.
+GP_PROFILE_KEY = "basic_info_lgd"
+GP_PROFILE_RENAMES = {
+    "demographic_details_total_gender_wise_population": "total_population",
+    "demographic_details_male_population": "male_population",
+    "demographic_details_female_population": "female_population",
+    "demographic_details_transgender_population": "transgender_population",
+    "demographic_details_children_population": "children_population",
+    "demographic_details_sc_population": "sc_population",
+    "demographic_details_st_population": "st_population",
+    "demographic_details_obc_population": "obc_population",
+    "demographic_details_general_population": "general_population",
+    "general_no_of_households": "households",
+}
+GP_PROFILE_COLUMNS = [
+    "source_system", "source_run_id", "gp_lgd_code", *GP_PROFILE_RENAMES.values(),
+]
+
+
+VOUCHER_COLUMNS: list[str] = [
+    "gp_lgd_code", "fiscal_year", "voucher_no", "voucher_id",
+    "direction", "type", "date", "month", "amount",
+]
+
+ACTIVITY_VOUCHER_COLUMNS: list[str] = [
+    "expenditure_id", "voucher_pk", "gp_lgd_code", "fiscal_year",
+    "voucher_no", "voucher_date", "voucher_cost",
+]
+# The three parallel pipe-delimited cells, and the column each becomes.
+AV_PIPE_COLUMNS: dict[str, str] = {
+    "Voucher No": "voucher_no",
+    "Voucher Cost": "voucher_cost",
+    "Voucher Date": "voucher_date",
+}
+# `XVFC/2021-22/P/2` -> 2021-22. The fiscal year of a voucher comes from the
+# voucher number, never from the plan year: #49 records that vouchers are
+# often paid in a later year than the plan they settle, and voucher.fiscal_year
+# is half the key this table joins on.
+VOUCHER_NO_YEAR_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})(?!\d)")
+
+
+class MisalignedVoucherCells(ValueError):
+    """The parallel voucher cells of one row split to different lengths."""
+
+
+def _voucher_fiscal_year(voucher_no: object) -> str | None:
+    """The `YYYY-YYYY` fiscal year named inside a voucher number."""
+
+    if not isinstance(voucher_no, str):
+        return None
+    match = VOUCHER_NO_YEAR_RE.search(voucher_no)
+    if match is None:
+        return None
+    start, end = match.group(1), match.group(2)
+    # "2021-22" -> "2021-2022": the century comes from the start year, so the
+    # 1999-00 rollover cannot produce "1999-1900".
+    return f"{start}-{int(start) // 100 * 100 + int(end) + (100 if int(end) < int(start) % 100 else 0)}"
+
+
+def activity_voucher(
+    source: pd.DataFrame, expenditures: pd.DataFrame, voucher_keys: pd.DataFrame,
+    quarantine: Quarantine, *, source_system: str, source_run_id: str,
+    linked_expenditure_ids: set[int] | None = None,
+) -> pd.DataFrame:
+    """Explode the parallel voucher cells into one row per voucher reference (#49).
+
+    The source packs a variable number of voucher references into three
+    pipe-delimited cells that line up positionally::
+
+        Voucher No:   XVFC/2023-24/P/7 | XVFC/2023-24/P/7 | XVFC/2023-24/P/7
+        Voucher Cost: 1028.0           | 1143.0           | 116972.0
+        Voucher Date: 05/07/2023       | 05/07/2023       | 05/07/2023
+
+    **Different lengths raise rather than truncate**, which #49 names
+    explicitly. `zip` would silently drop the tail of the longer cells, and
+    the rows it dropped would be real payments -- money vanishing with no
+    error and no quarantine row. A row whose cells disagree is corrupt, and
+    the whole load should stop rather than publish a partial ledger.
+
+    Note the same `voucher_no` legitimately repeats within one row, as above:
+    three separate payments settled against one voucher. That is why
+    `activity_voucher` has no primary key, and why nothing here deduplicates.
+
+    ``voucher_pk`` is left NULL where the accounting extract does not reach
+    the cited voucher. #49 records this as by design -- vouchers cited by the
+    expenditure file but absent from accounting are legitimately unmatched,
+    not invalid -- and #171 makes it much more common than the pilot's 488,
+    since the accounting extract is missing 358 GPs entirely. The rows are
+    kept either way; dropping them would lose the expenditure's own record of
+    what it paid.
+    """
+
+    if source.empty:
+        return pd.DataFrame(columns=ACTIVITY_VOUCHER_COLUMNS)
+
+    keep = ["gp_lgd_code", "plan_code", "activity_code", "s_no"]
+    identity = _base_identity(source)
+    frame = pd.DataFrame({
+        "gp_lgd_code": identity["gp_lgd_code"],
+        "activity_code": to_code(identity["activity_code"]),
+    })
+    for canonical, candidates in (("plan_code", RE_CANDIDATES["plan_code"]),
+                                  ("s_no", RE_CANDIDATES["s_no"])):
+        series, _ = _first_present(source, "activity_voucher", canonical, candidates, required=True)
+        frame[canonical] = to_code(series)
+    for column, target in AV_PIPE_COLUMNS.items():
+        series, _ = _first_present(
+            source, "activity_voucher", target, (column, target), required=True,
+        )
+        frame[target] = series.astype("string")
+
+    split = {
+        target: frame[target].fillna("").map(lambda text: [p.strip() for p in text.split("|")])
+        for target in AV_PIPE_COLUMNS.values()
+    }
+    lengths = pd.DataFrame(split).map(len)
+    misaligned = (lengths.nunique(axis=1) > 1)
+    if misaligned.any():
+        offending = frame.loc[misaligned, keep].head(3).to_dict("records")
+        raise MisalignedVoucherCells(
+            f"{int(misaligned.sum())} row(s) have Voucher No/Cost/Date cells of "
+            f"differing lengths; the first few are {offending}. Positional "
+            f"recombination is only meaningful when the three agree, so this is "
+            f"refused rather than zip-truncated (#49)."
+        )
+
+    exploded = frame.assign(**split).explode(list(AV_PIPE_COLUMNS.values()))
+    def _blank(column: str) -> pd.Series:
+        return exploded[column].astype("string").fillna("").str.strip() == ""
+
+    # A position with nothing in any of the three cells is not a voucher
+    # reference at all -- a row citing no vouchers explodes to one empty
+    # position -- and is dropped silently.
+    #
+    # A position with a blank voucher_no but a populated cost or date is a
+    # different thing entirely: a payment whose voucher number is missing.
+    # Dropping it silently (as `str.len() > 0` alone did) would make
+    # sum(voucher_cost) quietly fall below the expenditure row's own
+    # total_expenditure, which is the one arithmetic anybody would use to
+    # check this table. Quarantined instead, keyed by activity_code since the
+    # voucher number is exactly what it lacks.
+    all_blank = _blank("voucher_no") & _blank("voucher_cost") & _blank("voucher_date")
+    partial = _blank("voucher_no") & ~all_blank
+    if partial.any():
+        quarantine.add(
+            "activity_voucher", "partial_voucher_slot",
+            "voucher position has a cost or date but no voucher number",
+            "activity_code", exploded.loc[partial, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    exploded = exploded[~all_blank & ~partial]
+    if exploded.empty:
+        return pd.DataFrame(columns=ACTIVITY_VOUCHER_COLUMNS)
+
+    exploded["fiscal_year"] = exploded["voucher_no"].map(_voucher_fiscal_year)
+    exploded["voucher_cost"] = to_decimal_money(exploded["voucher_cost"])
+    # dayfirst: the expenditure file writes DD/MM/YYYY here, same as the
+    # accounting source, even though its other dates are ISO.
+    exploded["voucher_date"] = to_datetime(exploded["voucher_date"], dayfirst=True)
+
+    # `indicator`, not an index comparison: `merge` returns a fresh RangeIndex
+    # while `explode` leaves repeated original labels, so `linked.index` and
+    # `exploded.index` share no meaning and selecting the unmatched rows by
+    # index membership names the wrong vouchers. Same device `_dedupe` uses.
+    linked = exploded.merge(
+        expenditures[["expenditure_id", *keep]], how="left", on=keep, indicator=True,
+    )
+    unmatched = linked["_merge"].to_numpy() == "left_only"
+    if unmatched.any():
+        # An expenditure line that did not survive its own quarantine cannot
+        # have a bridge row: expenditure_id is a foreign key into it.
+        quarantine.add(
+            "activity_voucher", "orphan_expenditure",
+            "voucher reference has no loaded activity_expenditure row",
+            "voucher_no", linked.loc[unmatched, "voucher_no"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    linked = linked.loc[~unmatched].drop(columns="_merge")
+
+    # An expenditure line that already has its bridge rows must not get them
+    # again from a second snapshot restating the same line. This table is
+    # legitimately 1:many -- three payments can settle against one voucher
+    # number, so row-level dedupe would be wrong -- and the unit that must
+    # not repeat is therefore the expenditure_id's whole set of references,
+    # not an individual row.
+    #
+    # The case this exists for: two overlapping EXPENDITURE snapshots. The
+    # second one's activity_expenditure rows are suppressed by the
+    # cross-snapshot key guard, but its voucher references still RESOLVE --
+    # against the surviving row -- so without this they would double the
+    # bridge while the fact table stayed correct.
+    if linked_expenditure_ids:
+        repeated = linked["expenditure_id"].isin(linked_expenditure_ids).to_numpy()
+        if repeated.any():
+            quarantine.add(
+                "activity_voucher", "cross_snapshot_duplicate_key",
+                "this expenditure line already has its voucher references loaded",
+                "voucher_no", linked.loc[repeated, "voucher_no"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        linked = linked.loc[~repeated]
+
+    linked = linked.merge(
+        voucher_keys, how="left", on=["gp_lgd_code", "fiscal_year", "voucher_no"],
+    )
+    out = _ensure_columns(linked, ACTIVITY_VOUCHER_COLUMNS)
+    return out[ACTIVITY_VOUCHER_COLUMNS].reset_index(drop=True)
+
+
+def voucher(
+    frame: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+    *, source_system: str, source_run_id: str, start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str]] | None = None,
+) -> pd.DataFrame:
+    """Shape one voucher frame and assign its voucher_pk (#46, #129).
+
+    ``voucher_pk`` is an INTEGER surrogate assigned exactly the way
+    ``activity_expenditure.expenditure_id`` is: contiguously from
+    ``start_id``, *after* every quarantine step, so ids are dense and 1:1
+    with the rows returned, and the caller advances ``start_id`` between
+    snapshots. Mirrored rather than reinvented -- #129 asks for the
+    deterministic assignment #69 built with a SQLite ``ROW_NUMBER``, and the
+    property that actually matters (ids independent of chunk size and
+    iteration order) already holds here, because the frame is fully
+    materialised and sorted before ids are handed out.
+
+    ``voucher_id`` is **not** the key and is never treated as one. #46
+    verified it repeats across 116 distinct GP/year/direction combinations:
+    it is a portal-internal sequence, unique only within a GP. The real
+    identity is ``(gp_lgd_code, fiscal_year, voucher_no)``, which the DDL
+    carries as a UNIQUE constraint, so a collision has to reach quarantine
+    rather than fail the insert.
+
+    Rows are sorted by that natural key before ids are assigned. Without it
+    ``voucher_pk`` would follow the order files happened to be walked in, and
+    two builds of the same snapshot could disagree about which voucher is 7 --
+    which matters because ``activity_voucher.voucher_pk`` (#49) is a foreign
+    key into this table.
+    """
+
+    columns = ["voucher_pk"] + VOUCHER_COLUMNS
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame({
+        "source_system": frame["source_system"],
+        "source_run_id": frame["source_run_id"],
+        "gp_lgd_code": to_code(frame["gp_code"]),
+        "fiscal_year": frame["fiscal_year"],
+    })
+    for column in ("voucher_no", "voucher_id", "direction", "type", "month"):
+        out[column] = _ensure_columns(frame, [column])[column]
+    out["amount"] = to_decimal_money(_ensure_columns(frame, ["amount"])["amount"])
+    # dayfirst because the source writes DD/MM/YYYY (#46). Parsed without it,
+    # 03/04/2022 silently becomes 4 March instead of 3 April -- a wrong answer
+    # for every voucher before the 13th of a month, and no error anywhere.
+    out["date"] = to_datetime(_ensure_columns(frame, ["date"])["date"], dayfirst=True)
+
+    # No guard on `direction`'s spelling: the normalizer sets it from the
+    # array a voucher came out of (`normalize.VOUCHER_DIRECTIONS`), so it is
+    # 'receipt' or 'payment' by construction and a validity check here could
+    # not be reached, let alone tested. An absent column is a different
+    # matter and is caught below.
+    missing = out["voucher_no"].isna() | out["gp_lgd_code"].isna() | out["direction"].isna()
+    if missing.any():
+        quarantine.add(
+            "voucher", "missing_key",
+            "voucher row lacks gp_lgd_code, voucher_no or direction",
+            "voucher_no", out.loc[missing, "voucher_no"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    out = out[~missing]
+
+    out = _dedupe(
+        out, ["gp_lgd_code", "fiscal_year", "voucher_no"], "voucher", quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    out = _restrict(
+        out, "voucher", "gp_lgd_code", gp_codes, quarantine,
+        source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
+    )
+    # `_dedupe` above only sees this frame. Two accounting snapshots in one
+    # build can each hold the same (gp, year, voucher_no) -- legitimately, if
+    # a later run re-scrapes GPs the first one covered -- and each would
+    # survive its own dedupe, so the second insert would hit the table's
+    # UNIQUE constraint and abort the build. Checked against what earlier
+    # snapshots already inserted, the way `_merge_gram_panchayat` does for the
+    # conformed dimension, and passed in as a set the way `_restrict` takes
+    # `gp_codes`. Filtered before ids are handed out, so voucher_pk stays
+    # dense and activity_voucher's foreign key has no gaps to explain.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                out["gp_lgd_code"], out["fiscal_year"], out["voucher_no"], strict=True,
+            )],
+            index=out.index,
+        )
+        if already.any():
+            quarantine.add(
+                "voucher", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this voucher",
+                "voucher_no", out.loc[already, "voucher_no"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
+    out = out.sort_values(
+        ["gp_lgd_code", "fiscal_year", "voucher_no"], kind="mergesort",
+    ).reset_index(drop=True)
+    out = _ensure_columns(out, VOUCHER_COLUMNS)
+    result = out[VOUCHER_COLUMNS].copy()
+    result.insert(0, "voucher_pk", range(start_id, start_id + len(result)))
+    return result
+
+
+def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
+               *, source_system: str, source_run_id: str,
+               loaded_keys: set[str] | None = None) -> pd.DataFrame:
+    """One row per GP, from the panchayat profile extract (#123).
+
+    Two rejections, kept apart because they mean different things:
+
+    * **84 rows carry no LGD code at all** -- placeholders for GPs whose
+      profile was never filled in. Loaded unfiltered, 83 of them collide on
+      the empty string and fail the primary key. They are quarantined rather
+      than filtered so the count stays visible; dropping them silently is how
+      a shrinking source goes unnoticed. Note they are not blank rows: they
+      still carry the scrape's own `param__*` request fields, which is why
+      "the row is empty" is not a safe test for them.
+    * **A keyed row whose GP is not in `gram_panchayat`** is an orphan, and
+      goes to quarantine under the standard reason code.
+
+    Every one of the ten measures is resolved with ``required=True``, and then
+    checked again after conversion. The two catch different failures and only
+    the pair is sufficient: ``required=True`` catches an upstream *rename*,
+    while ``EmptyRequiredColumn`` catches the header surviving with no readable
+    values behind it. Either way, loading 6,710 rows of all-NULL demographics
+    would pass every other check this repo has -- right row count, no orphans,
+    valid key -- and be wrong in the only way that matters.
+
+    A row carrying a value that is present but unreadable is quarantined
+    rather than loaded with a hole: nine good measures do not make a tenth
+    trustworthy, and a silently-NULL cell is the thing this whole function is
+    arranged to prevent. "Unreadable" includes values that parse *too*
+    willingly: ``to_int`` rounds, so a population of "1.5" would otherwise be
+    stored as 2 -- an invented number rather than a missing one -- and it
+    carries a negative through untouched, though nobody ever counted -1
+    people.
+    """
+
+    if profile.empty:
+        return pd.DataFrame(columns=GP_PROFILE_COLUMNS)
+
+    key, _ = _first_present(
+        profile, "gp_profile", "gp_lgd_code", (GP_PROFILE_KEY,), required=True,
+    )
+    out = pd.DataFrame({
+        "source_system": profile["source_system"],
+        "source_run_id": profile["source_run_id"],
+        "gp_lgd_code": to_code(key),
+    })
+    # A value that was present in the source and did NOT survive the cast is a
+    # parse failure, not an absent measure, and `to_int` cannot tell them apart
+    # -- it coerces both to NA. Tracked here, while the raw text is still in
+    # reach, so the row can be quarantined rather than loaded with a hole.
+    unreadable = pd.Series(False, index=profile.index)
+    for source, target in GP_PROFILE_RENAMES.items():
+        series, _ = _first_present(
+            profile, "gp_profile", target, (source,), required=True,
+        )
+        converted = to_int(series)
+        text = series.astype("string").str.strip()
+        # `to_int` rounds, so a fractional count parses cleanly and a
+        # null-check alone would accept an invented one. Same grouping cleanup
+        # and same two predicates as activity_nsap, which asks this about the
+        # same kind of column.
+        cleaned = text.map(
+            lambda value: ungroup_digits(value) if isinstance(value, str) else value
+        ).astype("string")
+        present = text.notna() & (text != "")
+        # A negative population or household count is impossible, and `to_int`
+        # carries it through untouched -- it is neither null, fractional nor
+        # non-finite, so every other predicate here accepts it.
+        unreadable |= present & (
+            converted.isna()
+            | cleaned.map(_is_fractional)
+            | cleaned.map(_is_non_finite)
+            | (converted < 0)
+        )
+        out[target] = converted
+
+    unkeyed = out["gp_lgd_code"].isna()
+    if unkeyed.any():
+        quarantine.add(
+            "gp_profile", "missing_key", "profile row carries no LGD code",
+            "gp_lgd_code", out.loc[unkeyed, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~unkeyed]
+
+    out = _dedupe(
+        out, ["gp_lgd_code"], "gp_profile", quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    out = _restrict(
+        out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
+        source_system=source_system, source_run_id=source_run_id,
+    )
+    # The same cross-snapshot collision `voucher` guards against, and for the
+    # same reason: `_dedupe` sees one frame, but two profile snapshots in one
+    # build can both carry a GP and the second insert would hit gp_lgd_code's
+    # PRIMARY KEY. Present since #123; found by reviewing the sibling.
+    if loaded_keys:
+        already = out["gp_lgd_code"].isin(loaded_keys)
+        if already.any():
+            quarantine.add(
+                "gp_profile", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this GP's profile",
+                "gp_lgd_code", out.loc[already, "gp_lgd_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
+
+    bad = unreadable.reindex(out.index, fill_value=False)
+    if bad.any():
+        quarantine.add(
+            "gp_profile", "unreadable_measure",
+            "a population or household value could not be read as a whole number",
+            "gp_lgd_code", out.loc[bad, "gp_lgd_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+        out = out.loc[~bad]
+
+    # Last, on the rows actually being loaded. `required=True` above only
+    # proves the column NAME survived upstream; this is what makes the
+    # docstring's claim true rather than aspirational.
+    if not out.empty:
+        empty = tuple(
+            column for column in GP_PROFILE_RENAMES.values() if out[column].isna().all()
+        )
+        if empty:
+            raise EmptyRequiredColumn(table="gp_profile", columns=empty, rows=len(out))
+    return out[GP_PROFILE_COLUMNS]
 
 
 # --------------------------------------------------------------------- PL: plan + planned_activity + satellites
@@ -521,27 +1032,17 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
     # beneficiary_count is a COUNT, not money: parsed as a nullable integer
     # (see warehouse.schema's activity_nsap DDL), never routed through
     # decimal money parsing.
-    cleaned = melted["beneficiary_count"].astype("string").str.replace(",", "", regex=False).str.strip()
-
-    def _is_fractional(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        if not value.is_finite():
-            return False
-        return value != value.to_integral_value()
-
-    def _is_non_finite(text: object) -> bool:
-        if pd.isna(text) or text == "":
-            return False
-        try:
-            value = Decimal(text)
-        except InvalidOperation:
-            return False
-        return not value.is_finite()
+    # Digit grouping is validated here, not stripped, for the same reason
+    # clean.to_int validates it (#127): "1,2" is malformed, not twelve.
+    # Checked in this function as well as in to_int because the detectors
+    # below read `cleaned` -- and because a value that only became NA inside
+    # to_int would be dropped by the notna() filter with no quarantine row,
+    # which is the one outcome this function exists to prevent.
+    raw = melted["beneficiary_count"].astype("string").str.strip()
+    cleaned = raw.map(
+        lambda text: ungroup_digits(text) if isinstance(text, str) else text
+    ).astype("string")
+    malformed = raw.notna() & (raw != "") & cleaned.isna()
 
     fractional = cleaned.map(_is_fractional)
     non_finite = cleaned.map(_is_non_finite)
@@ -553,8 +1054,15 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
             "activity_code", melted.loc[fractional, "activity_code"],
             source_system=source_system, source_run_id=source_run_id,
         )
+    if malformed.any():
+        quarantine.add(
+            "activity_nsap", "malformed_beneficiary_count",
+            "beneficiary_count has malformed digit grouping",
+            "activity_code", melted.loc[malformed, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
     # NaN/Infinity are non-fractional but still unparseable by to_int.
-    melted = melted[~fractional & ~non_finite]
+    melted = melted[~fractional & ~non_finite & ~malformed]
     melted["beneficiary_count"] = to_int(melted["beneficiary_count"])
     melted = melted[melted["beneficiary_count"].notna() & (melted["beneficiary_count"] != 0)]
     melted["category"] = melted["column"].map(lambda c: NSAP_COLUMNS[c][0])
@@ -569,7 +1077,7 @@ def activity_nsap(pl: pd.DataFrame, activity_codes: set[str], quarantine: Quaran
 
 # --------------------------------------------------------------------- PL children: asset, fund
 
-ASSET_CHILD_RENAMES = {
+_ASSET_FIELDS = {
     "astTyp": "asset_type", "astCtgry": "asset_category", "astSubCtgry": "asset_subcategory",
     "astCvrgCd": "asset_coverage_code", "astNm": "asset_name", "astUntTyp": "asset_unit_type",
     "astNumOfUnt": "asset_unit_count", "astUnitCost": "asset_unit_cost",
@@ -579,6 +1087,30 @@ ASSET_CHILD_RENAMES = {
     "assetLocationDetails_astPlnUntTyp": "asset_loc_unit_type",
     "assetLocationDetails_astNoOfUnt": "asset_loc_unit_count",
     "assetLocationDetails_astUnitCostTot": "asset_loc_unit_cost_total",
+}
+
+# Both spellings the same fields arrive under, because `assetDetails` is not
+# always the same JSON type (#159).
+#
+# When it is a LIST, `normalize._child_rows` emits a `pl__*` child table whose
+# columns are the bare names above. When it is a MAPPING -- which is what the
+# full-state eGramSwaraj payload actually sends, `None` or `dict` and never a
+# list across every record sampled -- `_child_rows` does not descend at all,
+# and `_flatten_scalars` folds it into the parent `pl` frame prefixed
+# `assetDetails_`.
+#
+# Only the bare spelling was recognised, so on the real source nothing matched
+# the asset signature, `activity_asset` received an empty frame, and all
+# 4,073,745 rows were 1:1 filler with every asset column NULL -- against
+# 1,861,715 real rows in the externally built database. The data was never
+# lost; it was sitting in `pl`, unread.
+#
+# The two key sets are disjoint, so one map handles both shapes and a source
+# that changes type does not need a second code path. `pandas.rename` ignores
+# keys a frame does not carry.
+ASSET_CHILD_RENAMES = {
+    **_ASSET_FIELDS,
+    **{f"assetDetails_{source}": target for source, target in _ASSET_FIELDS.items()},
 }
 
 ACTIVITY_ASSET_COLUMNS = [
@@ -766,7 +1298,14 @@ def admin_approval_scheme(child: pd.DataFrame, parent_row_ids: set[str], quarant
     out["source_run_id"] = out["source_run_id"]
     out["row_id"] = out["row_id"]
     out["parent_row_id"] = out["parent_row_id"]
-    out["activity_code"] = out["business_id"]
+    # Through to_code like every other activity_code column in this module
+    # (eight of them). This was the one that assigned the raw provenance value
+    # straight through, so the same activity could be spelled one way here and
+    # another in planned_activity -- in a column whose only purpose is to join
+    # them. Inert on today's data (every sampled activityCd is a JSON int, so
+    # str() and to_code() agree), which is why it is a one-line alignment
+    # rather than an issue.
+    out["activity_code"] = to_code(out["business_id"])
     out = _ensure_columns(out, columns)
     frame = out[columns].copy()
     for column in AA_SCHEME_MONEY_COLUMNS:
@@ -948,6 +1487,7 @@ def activity_expenditure(
     *, source_system: str, source_run_id: str,
     resolutions: FieldResolutions | None = None,
     start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shape one activity_expenditure frame and assign its expenditure_id.
 
@@ -998,6 +1538,38 @@ def activity_expenditure(
         frame, "activity_expenditure", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    # The same cross-snapshot guard voucher and gp_profile carry, and the most
+    # important of the three: those two collide on a UNIQUE/PRIMARY KEY and
+    # abort the build, so a second overlapping snapshot fails loudly. This
+    # table's only key is the `expenditure_id` surrogate assigned below, so
+    # nothing would stop the duplicates -- `total_expenditure` would silently
+    # double and the activity_voucher bridge would duplicate with it, on a
+    # green build and a green conformance run.
+    #
+    # Note the `_dedupe` above cannot catch this even in principle: its key
+    # includes source_run_id, so the same business row observed by two runs is
+    # two rows to it. That is right within a frame and wrong across them.
+    #
+    # Bridge rows for the rows dropped here find no expenditure_id and are
+    # counted by activity_voucher's own orphan_expenditure path, which is the
+    # correct outcome -- they are duplicate references to an already-loaded
+    # expenditure line.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                frame["gp_lgd_code"], frame["plan_code"],
+                frame["activity_code"], frame["s_no"], strict=True,
+            )],
+            index=frame.index,
+        )
+        if already.any():
+            quarantine.add(
+                "activity_expenditure", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this expenditure line",
+                "activity_code", frame.loc[already, "activity_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        frame = frame[~already]
     frame = frame.reset_index(drop=True)
     frame.insert(0, "expenditure_id", range(start_id, start_id + len(frame)))
     return frame

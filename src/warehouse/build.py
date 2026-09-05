@@ -32,7 +32,9 @@ import pandas as pd
 
 from . import transform
 from .config import WarehouseSettings, load_settings
+from .dimensions import dimension_frames
 from .geography import gp_geography
+from .views import materialize
 from .load import DEFAULT_BATCH_SIZE, insert, read_table
 from .schema import CREATE_ORDER, DDL, RESET_ORDER
 from .select import SelectedSnapshot, resolve_snapshots
@@ -118,6 +120,27 @@ def _merge_gram_panchayat(
     return insert(con, "gram_panchayat", new_rows, batch_size=batch_size)
 
 
+def _canonical_asset_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Asset columns under one spelling, so the two shapes can be concatenated.
+
+    `assetDetails` is a mapping in this source and a list elsewhere, and
+    `ASSET_CHILD_RENAMES` accepts both spellings -- `astTyp` from a child
+    table, `assetDetails_astTyp` folded onto the `pl` frame. Concatenating
+    the two raw and renaming afterwards produces two columns both called
+    `asset_type`, and the build dies in `load.insert` on a duplicate column
+    label. Renaming each frame to the canonical name *before* the concat
+    makes them align instead.
+
+    A frame carrying both spellings for one field would still collide, so the
+    duplicate is dropped rather than left to fail deeper in: the first
+    occurrence wins, which is the prefixed `pl` spelling this source actually
+    uses.
+    """
+
+    renamed = frame.rename(columns=transform.ASSET_CHILD_RENAMES)
+    return renamed.loc[:, ~renamed.columns.duplicated()]
+
+
 def populate(
     con: duckdb.DuckDBPyConnection, selected: tuple[SelectedSnapshot, ...],
     *, batch_size: int = DEFAULT_BATCH_SIZE,
@@ -144,9 +167,33 @@ def populate(
     # here rather than in transform keeps that module free of file system
     # access (see its docstring).
     geography = gp_geography()
+    # Held back until every snapshot has contributed to gram_panchayat.
+    # gp_profile has a FOREIGN KEY to it, so loading a profile snapshot
+    # before the scrape snapshots that name the same GPs would quarantine
+    # every row as an orphan and still finish green -- the order dependence
+    # #161 is open about elsewhere in this function. Deferring is the whole
+    # fix here: one row per GP, no per-snapshot state, nothing to interleave.
+    profile_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for exactly the reason profile_frames is: voucher has a
+    # FOREIGN KEY to gram_panchayat, so loading an accounting snapshot ahead
+    # of the scrape snapshots naming the same GPs would quarantine every
+    # voucher as an orphan and still finish green (#161).
+    voucher_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for a further reason than voucher's: activity_voucher bridges
+    # activity_expenditure to voucher, so it needs expenditure_id AND
+    # voucher_pk to exist. Both are assigned after the loop, so the
+    # expenditure source has to be held until they are.
+    expenditure_frames: list[tuple[str, str, pd.DataFrame]] = []
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
+
+    # The code dictionaries are build-wide, not per-snapshot: they are the
+    # same 717/17/12 rows whatever was scraped, so they are loaded once here
+    # rather than inside the loop, where every snapshot after the first would
+    # collide on dim_code's (variable, code) primary key.
+    for table_name, frame in dimension_frames().items():
+        add_count(table_name, insert(con, table_name, frame, batch_size=batch_size))
 
     for snapshot in selected:
         source_system, source_run_id = snapshot.spec.source, snapshot.spec.run_id
@@ -163,6 +210,24 @@ def populate(
             if kind in tables and kind != "re":
                 used.append(kind)
         pl, aa, ta, pp, re = (top_level[k] for k in ("pl", "aa", "ta", "pp", "re"))
+
+        if "profile" in tables:
+            profile_frames.append(
+                (source_system, source_run_id, _read(root, tables, "profile"))
+            )
+            used.append("profile")
+
+        if "voucher" in tables:
+            voucher_frames.append(
+                (source_system, source_run_id, _read(root, tables, "voucher"))
+            )
+            used.append("voucher")
+
+        if "expenditure" in tables:
+            expenditure_frames.append(
+                (source_system, source_run_id, _read(root, tables, "expenditure"))
+            )
+            used.append("expenditure")
 
         # Every kind independently records its own GP via the same
         # folder-name parser, so the dimension is built from all of them,
@@ -208,10 +273,37 @@ def populate(
             asset_children: list[str] = []
             fund_frames: list[pd.DataFrame] = []
             fund_children: list[str] = []
+            # `pl` itself is an asset source, not only its child tables (#159).
+            # `assetDetails` arrives as a MAPPING in the real payload, so
+            # normalize folds it into this frame as `assetDetails_*` rather
+            # than emitting a child table. Considered first so the ordering
+            # matches the DDL comment's "one row per activity"; the signature
+            # test below is what decides, not the position.
+            #
+            # Not added to `asset_children`: that list feeds `used`, which
+            # tracks which canonical DATASETS were consumed, and `pl` is
+            # already counted there. Adding it would double-count.
+            #
+            # Only the rows that actually carry mapped asset values. A single
+            # mapping-shaped record puts the `assetDetails_*` columns on the
+            # whole union schema, so an unfiltered `pl` contributes a row for
+            # EVERY activity -- including ones whose assets came from a list
+            # and are about to arrive as real child rows. `_pl_child` dedupes
+            # with keep="first" and `pl` is appended first, so the empty
+            # parent row would win and the populated child row would be
+            # quarantined as a conflict: real asset data replaced by padding,
+            # on a green build. Dropping the empty rows here costs nothing --
+            # `_pl_child` synthesizes the 1:1 padding itself, from
+            # activity_codes, after the dedupe.
+            asset_columns = [c for c in pl.columns if c in transform.ASSET_CHILD_RENAMES]
+            if asset_columns:
+                populated = pl[asset_columns].notna().any(axis=1)
+                if populated.any():
+                    asset_frames.append(_canonical_asset_columns(pl.loc[populated]))
             for name in _child_tables(tables, "pl", ""):
                 frame = _read(root, tables, name)
                 if set(frame.columns) & set(transform.ASSET_CHILD_RENAMES):
-                    asset_frames.append(frame)
+                    asset_frames.append(_canonical_asset_columns(frame))
                     asset_children.append(name)
                 elif set(frame.columns) & set(transform.FUND_CHILD_RENAMES):
                     fund_frames.append(frame)
@@ -240,8 +332,14 @@ def populate(
         add_count("admin_approval", insert(con, "admin_approval", approvals, batch_size=batch_size))
         parent_row_ids = set(approvals["row_id"].dropna())
 
-        # The scheme array's own JSON key is unverified (see transform.py's
-        # module docstring), so candidates are still found by prefix alone --
+        # The scheme array's JSON key IS now verified -- it is
+        # `admApprovalSchemeWebService`, the only child array key found in
+        # 27,672 AA arrays across 250 random GPs (#163). Discovery is still by
+        # prefix plus a field signature rather than by that literal, on
+        # purpose: the survey proves what the portal emits today, not what it
+        # will emit next year, and a signature match degrades to "found
+        # nothing" where a hardcoded key would degrade to silently loading an
+        # unrelated array. So candidates are found by prefix, and --
         # but a direct AA child is only kept if it actually carries a
         # recognized scheme field. Without this, ANY unrelated AA child array
         # (attachments, comments, ...) would match the empty keyword, get
@@ -299,6 +397,101 @@ def populate(
         if leftover:
             unconsumed[f"{source_system}/{source_run_id}"] = leftover
 
+    # After the loop, deliberately: see profile_frames above.
+    all_gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+    loaded_profile_keys: set[str] = set()
+    for source_system, source_run_id, frame in profile_frames:
+        profiles = transform.gp_profile(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            loaded_keys=loaded_profile_keys,
+        )
+        add_count("gp_profile", insert(con, "gp_profile", profiles, batch_size=batch_size))
+        loaded_profile_keys.update(profiles["gp_lgd_code"])
+
+    # voucher_pk advances across snapshots the same way expenditure_id and
+    # nsap_id do inside the loop: the counter is the caller's, so two
+    # accounting snapshots in one build cannot both claim id 1 and collide on
+    # the INTEGER PRIMARY KEY.
+    next_voucher_pk = 1
+    loaded_voucher_keys: set[tuple[str, str, str]] = set()
+    for source_system, source_run_id, frame in voucher_frames:
+        vouchers = transform.voucher(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            start_id=next_voucher_pk, loaded_keys=loaded_voucher_keys,
+        )
+        add_count("voucher", insert(con, "voucher", vouchers, batch_size=batch_size))
+        next_voucher_pk += len(vouchers)
+        loaded_voucher_keys.update(zip(
+            vouchers["gp_lgd_code"], vouchers["fiscal_year"], vouchers["voucher_no"],
+            strict=True,
+        ))
+
+    # activity_expenditure and its bridge, after voucher so voucher_pk exists
+    # to resolve against. The expenditure_id counter continues from the loop's
+    # `re`-driven call above rather than restarting, so the two paths cannot
+    # both claim id 1 -- the same rule voucher_pk follows across snapshots.
+    # Seeded from what is already in the table, not empty. The loop above has
+    # its own `re`-driven call into transform.activity_expenditure, and the
+    # comment right there says the expenditure_id counter continues across the
+    # two paths rather than restarting -- the key set has to as well, or an
+    # overlapping EXPENDITURE snapshot walks straight past the guard added for
+    # exactly this and double-counts the money and the bridge under fresh
+    # surrogate ids. Read back rather than accumulated, for the same reason
+    # voucher_keys is read back below: this has to cover every row in the
+    # build, not only the ones this code path put there.
+    loaded_expenditure_keys: set[tuple[str, str, str, str]] = {
+        (gp, plan, activity, s_no)
+        for gp, plan, activity, s_no in con.execute(
+            "SELECT gp_lgd_code, plan_code, activity_code, s_no FROM activity_expenditure"
+        ).fetchall()
+    }
+    for source_system, source_run_id, frame in expenditure_frames:
+        expenditures = transform.activity_expenditure(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            resolutions=resolutions, start_id=next_expenditure_id,
+            loaded_keys=loaded_expenditure_keys,
+        )
+        add_count("activity_expenditure", insert(
+            con, "activity_expenditure", expenditures, batch_size=batch_size,
+        ))
+        next_expenditure_id += len(expenditures)
+        loaded_expenditure_keys.update(zip(
+            expenditures["gp_lgd_code"], expenditures["plan_code"],
+            expenditures["activity_code"], expenditures["s_no"], strict=True,
+        ))
+        # Read back rather than held: voucher may span several snapshots, and
+        # the bridge has to resolve against every voucher in the build, not
+        # only the ones this snapshot happened to carry.
+        voucher_keys = con.execute(
+            "SELECT gp_lgd_code, fiscal_year, voucher_no, voucher_pk FROM voucher"
+        ).fetchdf()
+        # And the expenditures, for exactly the same reason. `expenditures`
+        # is this frame's surviving rows only: the cross-snapshot guard above
+        # drops a line already loaded through the `re` path, and resolving the
+        # bridge against that filtered frame would quarantine its vouchers as
+        # orphan_expenditure -- suppressing the duplicate fact row and losing
+        # the bridge rows with it, which is a worse trade than the duplicate.
+        expenditure_keys = con.execute(
+            "SELECT gp_lgd_code, plan_code, activity_code, s_no, expenditure_id "
+            "FROM activity_expenditure"
+        ).fetchdf()
+        # Which expenditure lines already carry their references, so a second
+        # snapshot restating the same line cannot contribute them twice now
+        # that the resolution above spans the whole table.
+        linked_expenditure_ids = {
+            row[0] for row in con.execute(
+                "SELECT DISTINCT expenditure_id FROM activity_voucher"
+            ).fetchall()
+        }
+        add_count("activity_voucher", insert(con, "activity_voucher", transform.activity_voucher(
+            frame, expenditure_keys, voucher_keys, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            linked_expenditure_ids=linked_expenditure_ids,
+        ), batch_size=batch_size))
+
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))
     return counts, quarantine, consumed, unconsumed, resolutions
 
@@ -317,6 +510,12 @@ def build_into(
         con.execute("BEGIN TRANSACTION")
         try:
             result = populate(con, selected, batch_size=batch_size)
+            # Inside the same transaction as the load: a warehouse that has
+            # the facts but not the consumer relations is not consumable
+            # (#51), so it must not be publishable either. Built after
+            # populate because every one of them reads the tables it fills.
+            for name, rows in materialize(con).items():
+                result[0][name] = rows
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
