@@ -305,6 +305,13 @@ run-expenditure-staging:
 # atomic too.
 CANDIDATE_DB := $(PANCHAYAT_DB_PATH).candidate
 
+# Exempt the one total whose source is known to be short (#171), by name, so
+# the other two are enforced on every full-state build. Before #175 this was a
+# blanket --skip-reconciliation, which meant a defect that silently doubled
+# activity_expenditure could reach a green build AND a green conformance run.
+# Staging overrides it: a 20-GP sample cannot hit a full-state total at all.
+RECONCILIATION ?= --exempt-reconciliation reconciliation.voucher_amount_total
+
 warehouse: _require_mode_env
 	@test -n "$(SNAPSHOT_ID)" || { \
 	  echo "SNAPSHOT_ID is required: make warehouse SNAPSHOT_ID=<id>"; exit 1; }
@@ -312,18 +319,30 @@ warehouse: _require_mode_env
 	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
-	@echo "  --skip-reconciliation: the targets are 20-GP pilot figures (#62),"
-	@echo "  so all three miss at full state -- activity_expenditure by a"
-	@echo "  factor of 308. Two are now known exactly and match production:"
-	@echo "  78053445024.44 and 258086866807.00. The third cannot be set,"
-	@echo "  because the voucher extract covers 6,436 of 6,794 GPs (#171)."
-	@echo "  Until the two are updated and the voucher one is exempted on its"
-	@echo "  own (#175), nothing here catches a doubled or malformed"
-	@echo "  expenditure load. The build is provisional -- see #50. Geography"
-	@echo "  coverage is NOT skipped: it is what catches a sample built as if"
-	@echo "  it were the state."
+	@# Derived from the flags actually passed, never spelled a second time:
+	@# a recipe that describes a build it is not running is how the note
+	@# above this one came to claim activity_expenditure had no loader.
+	@case "$(RECONCILIATION) $(CONFORMANCE_EXTRA)" in \
+	  *--skip-reconciliation*) \
+	    echo "  Reconciliation is OFF: a 20-GP sample cannot hit a full-state" ; \
+	    echo "  total, so all three are skipped." ;; \
+	  *) \
+	    echo "  Reconciliation is ON for activity_expenditure and planned_cost," ; \
+	    echo "  which match production exactly. Only voucher_amount_total is" ; \
+	    echo "  exempted, because its extract covers 6,436 of 6,794 GPs (#171)" ; \
+	    echo "  and #172 would move it even then -- and it is exempted by name," ; \
+	    echo "  so the other two are still checked. Baselines are full-state as" ; \
+	    echo "  of #175; #62 and #50 track what remains." ;; \
+	esac
+	@case "$(CONFORMANCE_EXTRA)" in \
+	  *--skip-geography*) \
+	    echo "  Geography coverage is skipped: this build is not the state." ;; \
+	  *) \
+	    echo "  Geography coverage is NOT skipped: it is what catches a sample" ; \
+	    echo "  built as if it were the state." ;; \
+	esac
 	uv run python scripts/check_warehouse_conformance.py \
-	  $(CANDIDATE_DB) --skip-reconciliation $(CONFORMANCE_EXTRA)
+	  $(CANDIDATE_DB) $(RECONCILIATION) $(CONFORMANCE_EXTRA)
 	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)
 	@echo "[$(MODE)] promoted to $(PANCHAYAT_DB_PATH)"
 
@@ -331,7 +350,7 @@ warehouse: _require_mode_env
 # not pretending to be.
 warehouse-staging:
 	@$(MAKE) warehouse MODE=staging SNAPSHOT_ID=$(SNAPSHOT_ID) \
-	  CONFORMANCE_EXTRA=--skip-geography
+	  RECONCILIATION=--skip-reconciliation CONFORMANCE_EXTRA=--skip-geography
 
 exhibits:
 	uv run dvc repro
