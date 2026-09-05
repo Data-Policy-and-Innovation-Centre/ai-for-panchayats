@@ -319,14 +319,28 @@ warehouse: _require_mode_env
 	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
-	@echo "  Reconciliation is ON for activity_expenditure and planned_cost,"
-	@echo "  which match production exactly. Only voucher_amount_total is"
-	@echo "  exempted, because its extract covers 6,436 of 6,794 GPs (#171)"
-	@echo "  and #172 would move it even then -- and it is exempted by name,"
-	@echo "  so the other two are still checked. Geography coverage is NOT"
-	@echo "  skipped: it is what catches a sample built as if it were the"
-	@echo "  state. Baselines are full-state as of #175; #62 and #50 track"
-	@echo "  what remains."
+	@# Derived from the flags actually passed, never spelled a second time:
+	@# a recipe that describes a build it is not running is how the note
+	@# above this one came to claim activity_expenditure had no loader.
+	@case "$(RECONCILIATION) $(CONFORMANCE_EXTRA)" in \
+	  *--skip-reconciliation*) \
+	    echo "  Reconciliation is OFF: a 20-GP sample cannot hit a full-state" ; \
+	    echo "  total, so all three are skipped." ;; \
+	  *) \
+	    echo "  Reconciliation is ON for activity_expenditure and planned_cost," ; \
+	    echo "  which match production exactly. Only voucher_amount_total is" ; \
+	    echo "  exempted, because its extract covers 6,436 of 6,794 GPs (#171)" ; \
+	    echo "  and #172 would move it even then -- and it is exempted by name," ; \
+	    echo "  so the other two are still checked. Baselines are full-state as" ; \
+	    echo "  of #175; #62 and #50 track what remains." ;; \
+	esac
+	@case "$(CONFORMANCE_EXTRA)" in \
+	  *--skip-geography*) \
+	    echo "  Geography coverage is skipped: this build is not the state." ;; \
+	  *) \
+	    echo "  Geography coverage is NOT skipped: it is what catches a sample" ; \
+	    echo "  built as if it were the state." ;; \
+	esac
 	uv run python scripts/check_warehouse_conformance.py \
 	  $(CANDIDATE_DB) $(RECONCILIATION) $(CONFORMANCE_EXTRA)
 	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)
