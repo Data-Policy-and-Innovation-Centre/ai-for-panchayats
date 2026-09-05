@@ -17,6 +17,7 @@ from decimal import Decimal
 import duckdb
 
 from warehouse.geography import gp_geography
+from warehouse.schema import DDL as REAL_DDL
 
 from warehouse.conformance import (
     EXPECTED_ACTIVITY_EXPENDITURE_TOTAL,
@@ -37,6 +38,7 @@ from warehouse.conformance import (
     check_primary_keys,
     check_reconciliation_totals,
     check_required_foreign_keys,
+    check_satellite_payload_population,
     check_satellite_row_parity,
     check_surrogate_key_types,
     check_table_existence,
@@ -560,6 +562,141 @@ def test_beneficiary_count_type_flags_missing_required_column(tmp_path):
 # ---------------------------------------------------------------------------
 # Section 5: data-level invariants
 # ---------------------------------------------------------------------------
+
+def _real_activity_asset(con: duckdb.DuckDBPyConnection) -> None:
+    """Replace the stub activity_asset with the DDL the build actually ships.
+
+    FULL_DDL's satellites carry only `activity_code`, which is right for the
+    checks that only count rows -- but a payload check needs payload columns,
+    and inventing a shape here would test a table nobody builds. Nothing has
+    a foreign key onto activity_asset, so this needs no _drop_with_dependents.
+    """
+
+    con.execute("DROP TABLE activity_asset")
+    con.execute(REAL_DDL["activity_asset"])
+
+
+def test_satellite_payload_flags_a_table_that_is_all_padding(tmp_path):
+    """The exact shape #159 shipped in, which every existing check passed.
+
+    The 1:1 satellites are padded to one row per planned_activity by design,
+    so row parity is silent about whether any data arrived. activity_asset
+    held 4,073,745 rows with every asset column NULL and conformance said
+    PASS; the deployed chatbot answered every asset question with
+    'Uncategorised' over a healthy-looking four-million-row table.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+    findings = check_satellite_payload_population(con)
+    assert [f.check for f in findings] == ["data.satellite_payload.activity_asset"]
+    assert findings[0].severity == "violation"
+    assert "every payload column is NULL" in findings[0].actual
+    con.close()
+
+
+def test_satellite_payload_reports_one_dead_column_without_failing(tmp_path):
+    """A column the source never sends is worth stating, not worth failing.
+
+    asset_name is the real case: the portal sends `astNm` on every record and
+    its value is always null, so nothing can populate it from this source.
+    The five asset_loc_* columns are a different story (#177) -- the source
+    does carry them and normalize drops them -- but neither is a reason to
+    fail a build, and both are a reason to say so in the report.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code, asset_category) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1', 'Roads')"
+    )
+    findings = check_satellite_payload_population(con)
+    assert findings, "a dead column must still be reported"
+    assert all(f.severity == "informational" for f in findings), (
+        "one populated column means the table is working; the rest are notes"
+    )
+    dead = {f.check for f in findings}
+    assert "data.satellite_payload.activity_asset.asset_name" in dead
+    assert "data.satellite_payload.activity_asset.asset_category" not in dead
+    con.close()
+
+
+def test_satellite_payload_says_nothing_about_an_empty_satellite(tmp_path):
+    """An empty table is section 5's business, not this check's.
+
+    Firing here as well would report the same fixture twice and make the
+    synthetic-fixture path noisy for a condition row parity already owns.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    assert check_satellite_payload_population(con) == []
+    con.close()
+
+
+def test_all_null_satellite_is_a_violation_only_at_full_state(tmp_path):
+    """The same fact means different things about a fixture and about the state.
+
+    A three-activity fixture whose records carry no training or delegation
+    fields has an all-NULL satellite and is not wrong for it. The full-state
+    build is: 4,073,745 rows of nothing means whatever routes data into that
+    table is broken. So this rides `skip_geography`, which already answers
+    exactly that question -- is this the state, or a fixture? -- rather than
+    inventing a second flag that could disagree with it.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+
+    def severity_of(*, full_state: bool) -> str:
+        findings = check_satellite_payload_population(con, full_state=full_state)
+        table_level = [f for f in findings if f.check == "data.satellite_payload.activity_asset"]
+        assert len(table_level) == 1
+        return table_level[0].severity
+
+    assert severity_of(full_state=True) == "violation"
+    assert severity_of(full_state=False) == "informational", (
+        "a fixture must not be failed for a satellite its records never populate"
+    )
+    con.close()
+
+
+def test_satellite_payload_runs_by_default(tmp_path):
+    """Registered in ALL_CHECKS, not merely available to be called.
+
+    #159 is a check that existed in nobody's head; one that exists but is
+    never invoked would be the same defect wearing a test.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    _real_activity_asset(con)
+    con.execute("INSERT INTO planned_activity VALUES ('A1', NULL, 10.0, NULL)")
+    con.execute(
+        "INSERT INTO activity_asset (source_system, source_run_id, activity_code) "
+        "VALUES ('egramSwaraj', 'run-1', 'A1')"
+    )
+    findings = check_conformance(
+        con, skip_derived=True, skip_reconciliation=True, skip_geography=True,
+    )
+    assert any(f.check == "data.satellite_payload.activity_asset" for f in findings)
+    con.close()
+
 
 def test_satellite_row_parity_passes_when_empty(tmp_path):
     con = _connect(tmp_path)
