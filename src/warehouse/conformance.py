@@ -242,9 +242,21 @@ GP_PROFILE_MEASURES: tuple[str, ...] = (
 # Section 6: reconciliation totals -- the exact published totals from the
 # reference build. Kept as easy-to-update constants; compared with exact
 # decimal arithmetic, never binary float ``==``.
-EXPECTED_VOUCHER_AMOUNT_TOTAL = Decimal("1350542247.18")
-EXPECTED_ACTIVITY_EXPENDITURE_TOTAL = Decimal("253475090.46")
-EXPECTED_PLANNED_COST_TOTAL = Decimal("773088536.00")
+#
+# Full-state figures (#175). The first two were measured from the full-state
+# build and agree with the externally-built production database exactly, to
+# the paisa; they were the 20-GP pilot figures until #175, which is why every
+# real build had to skip this whole section and so checked none of it.
+#
+# The voucher total is NOT the production figure. Production reads
+# 455046197982.47; ours reads what our source can support, because the
+# accounting extract covers 6,436 of 6,794 GPs (#171). It is recorded here
+# rather than left at the pilot value so that the number is visible and the
+# gap is one subtraction, but it is exempted by name in every real build
+# until #171 lands -- see EXEMPTABLE_RECONCILIATION_CHECKS.
+EXPECTED_VOUCHER_AMOUNT_TOTAL = Decimal("428724765277.36")
+EXPECTED_ACTIVITY_EXPENDITURE_TOTAL = Decimal("78053445024.44")
+EXPECTED_PLANNED_COST_TOTAL = Decimal("258086866807.00")
 
 RECONCILIATION_TARGETS: tuple[tuple[str, str, str, Decimal], ...] = (
     ("reconciliation.voucher_amount_total", "voucher", "amount", EXPECTED_VOUCHER_AMOUNT_TOTAL),
@@ -257,6 +269,11 @@ RECONCILIATION_TARGETS: tuple[tuple[str, str, str, Decimal], ...] = (
         "total_cost", EXPECTED_PLANNED_COST_TOTAL,
     ),
 )
+
+# The names ``exempt_reconciliation`` accepts, derived from the targets rather
+# than spelled a second time, so a renamed target cannot leave a stale
+# exemption quietly matching nothing.
+EXEMPTABLE_RECONCILIATION_CHECKS = frozenset(name for name, *_ in RECONCILIATION_TARGETS)
 
 
 # ---------------------------------------------------------------------------
@@ -905,17 +922,35 @@ def check_gp_profile_completeness(con: duckdb.DuckDBPyConnection) -> list[Findin
     return findings
 
 
-def check_reconciliation_totals(con: duckdb.DuckDBPyConnection) -> list[Finding]:
+def check_reconciliation_totals(
+    con: duckdb.DuckDBPyConnection, exempt: frozenset[str] = frozenset(),
+) -> list[Finding]:
     """Section 6: the exact published totals from the reference build.
 
     Skipped entirely by the caller (via ``check_conformance``'s
     ``skip_reconciliation``) when the database under test is a synthetic
     fixture rather than the real build.
+
+    ``exempt`` names individual targets to leave unchecked, for a total whose
+    source is known to be incomplete. It exists so that "one total cannot be
+    hit yet" stops meaning "check none of them" -- which is how a defect that
+    silently doubled activity_expenditure could have reached a green build
+    and a green conformance run (#175).
+
+    An exemption is never silent: it reports what it did not check and what
+    the target was, so the report says so rather than simply looking clean.
     """
 
     findings: list[Finding] = []
     actual_tables = _existing_tables(con)
     for check_name, table, column, expected in RECONCILIATION_TARGETS:
+        if check_name in exempt:
+            findings.append(Finding(
+                check=check_name, severity="informational",
+                expected=str(expected), actual="not checked",
+                detail="exempted for this run; the target is recorded, not asserted",
+            ))
+            continue
         if table not in actual_tables:
             continue  # already reported by check_table_existence
         if column not in _columns(con, table):
@@ -961,7 +996,7 @@ ALL_CHECKS = (
 def check_conformance(
     con: duckdb.DuckDBPyConnection, *,
     skip_reconciliation: bool = False, skip_geography: bool = False,
-    skip_derived: bool = False,
+    skip_derived: bool = False, exempt_reconciliation: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     """Run every check and return the combined findings, in a stable order.
 
@@ -971,7 +1006,9 @@ def check_conformance(
     reconciliation totals -- and while geography rode that same flag, no real
     build ever asserted its own scale. A 20-GP build reported "PASS".
 
-    ``skip_reconciliation`` omits the exact published totals.
+    ``skip_reconciliation`` omits the exact published totals; prefer
+    ``exempt_reconciliation`` on a real build, which omits named targets only
+    and reports each one it skipped (#175).
     ``skip_geography`` omits full-state coverage -- geography AND gp_profile
     demographics, which are the same question about two tables; use it for
     synthetic
@@ -994,7 +1031,7 @@ def check_conformance(
         findings.extend(check_geography_completeness(con))
         findings.extend(check_gp_profile_completeness(con))
     if not skip_reconciliation:
-        findings.extend(check_reconciliation_totals(con))
+        findings.extend(check_reconciliation_totals(con, exempt_reconciliation))
     return findings
 
 
