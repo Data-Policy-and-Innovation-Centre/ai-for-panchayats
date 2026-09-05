@@ -12,3 +12,18 @@ output "account_id" {
   description = "Resolved at apply time so no tracked file has to contain it."
   value       = data.aws_caller_identity.current.account_id
 }
+
+output "plan_role_arn" {
+  description = "Role for `terraform plan` on pull requests. Read-only; cannot write state or read secret values."
+  value       = aws_iam_role.plan.arn
+}
+
+output "apply_role_arn" {
+  description = "Role for `terraform apply` from the production environment."
+  value       = aws_iam_role.apply.arn
+}
+
+output "apply_boundary_arn" {
+  description = "The permissions boundary every role the apply role creates must carry."
+  value       = aws_iam_policy.apply_boundary.arn
+}

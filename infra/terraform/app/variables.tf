@@ -233,3 +233,17 @@ variable "basic_auth_username" {
   type        = string
   default     = "pilot"
 }
+
+variable "iam_permissions_boundary" {
+  description = <<-EOT
+    Permissions boundary attached to every IAM role this module creates.
+
+    Empty means no boundary, which is what a human applying locally gets. CI
+    passes the boundary published by infra/terraform/ci, whose apply role may
+    only call iam:CreateRole when the request carries exactly that ARN -- so
+    without this variable the CI apply fails AccessDenied on the first role,
+    after the network is already built (#89).
+  EOT
+  type        = string
+  default     = ""
+}

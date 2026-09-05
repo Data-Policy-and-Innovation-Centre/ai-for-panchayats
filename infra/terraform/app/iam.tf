@@ -33,8 +33,9 @@ data "aws_iam_policy_document" "ecs_assume" {
 }
 
 resource "aws_iam_role" "execution" {
-  name               = "${var.name}-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+  name                 = "${var.name}-execution"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_assume.json
+  permissions_boundary = var.iam_permissions_boundary != "" ? var.iam_permissions_boundary : null
 }
 
 resource "aws_iam_role_policy_attachment" "execution_managed" {
@@ -58,8 +59,9 @@ resource "aws_iam_role_policy" "execution_secrets" {
 }
 
 resource "aws_iam_role" "task" {
-  name               = "${var.name}-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+  name                 = "${var.name}-task"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_assume.json
+  permissions_boundary = var.iam_permissions_boundary != "" ? var.iam_permissions_boundary : null
 }
 
 # Read-only, and only the one prefix that holds deployable snapshots. No write,
