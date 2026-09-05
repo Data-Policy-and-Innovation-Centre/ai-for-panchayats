@@ -312,13 +312,16 @@ warehouse: _require_mode_env
 	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
-	@echo "  --skip-reconciliation: the published totals still cannot be hit."
-	@echo "  voucher now has a loader (#129) but its extract covers 6,436 of"
-	@echo "  6,794 GPs (#171); activity_expenditure has no loader yet (#49); and"
-	@echo "  the targets themselves are 20-GP pilot figures (#62). The build is"
-	@echo "  provisional until those are settled -- see #50. Geography coverage"
-	@echo "  is NOT skipped here: it is what catches a sample built as if it"
-	@echo "  were the state."
+	@echo "  --skip-reconciliation: the targets are 20-GP pilot figures (#62),"
+	@echo "  so all three miss at full state -- activity_expenditure by a"
+	@echo "  factor of 308. Two are now known exactly and match production:"
+	@echo "  78053445024.44 and 258086866807.00. The third cannot be set,"
+	@echo "  because the voucher extract covers 6,436 of 6,794 GPs (#171)."
+	@echo "  Until the two are updated and the voucher one is exempted on its"
+	@echo "  own (#175), nothing here catches a doubled or malformed"
+	@echo "  expenditure load. The build is provisional -- see #50. Geography"
+	@echo "  coverage is NOT skipped: it is what catches a sample built as if"
+	@echo "  it were the state."
 	uv run python scripts/check_warehouse_conformance.py \
 	  $(CANDIDATE_DB) --skip-reconciliation $(CONFORMANCE_EXTRA)
 	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)
