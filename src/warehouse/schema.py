@@ -595,6 +595,11 @@ KIND_TABLES: dict[str, tuple[str, ...]] = {
     # it. activity_voucher is deliberately not listed: it is filled from the
     # expenditure source (#49), not from this one.
     "VOUCHER": ("voucher",),
+    # The activity-wise expenditure extract: one large flat CSV, its own raw
+    # run, its own snapshot (#49). Fills two tables -- the expenditure lines
+    # and the bridge to voucher that its own pipe-delimited cells describe.
+    # Recognized but not required, like PROFILE and VOUCHER.
+    "EXPENDITURE": ("activity_expenditure", "activity_voucher"),
 }
 
 # The kinds a build cannot be missing. The five eGramSwaraj endpoints arrive

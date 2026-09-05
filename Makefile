@@ -1,6 +1,6 @@
 .DEFAULT_GOAL  := help
 .PHONY: help setup pull ingest publish-raw push run run-staging run-profile \
-        run-profile-staging run-accounting run-accounting-staging warehouse warehouse-staging sample exhibits deliver \
+        run-profile-staging run-accounting run-accounting-staging run-expenditure run-expenditure-staging warehouse warehouse-staging sample exhibits deliver \
         box-paths status _require_mode_env
 BOX_REMOTE      ?= box
 BOX_PROJECT_ROOT ?= /2. Projects/11. PR&DW/AI for Panchayats
@@ -21,6 +21,7 @@ help:
 	@echo "  make ingest DATA=f.csv Copy an original source file from Box"
 	@echo "  make run-profile      Publish+normalize the GP profile extract (#123)"
 	@echo "  make run-accounting   Publish+normalize the accounting extract (#129)"
+	@echo "  make run-expenditure  Publish+normalize the expenditure extract (#49)"
 	@echo "  make publish-raw DATA=f.csv Copy a local raw file to Box"
 	@echo "  make push DATA=f.csv Version and share a locally-ingested file via DVC"
 	@echo "  make run             Publish + normalize the scraped tree (full state)"
@@ -259,6 +260,35 @@ run-accounting: _require_mode_env
 run-accounting-staging:
 	@$(MAKE) run-accounting MODE=staging
 
+# The same two stages for the activity-wise expenditure extract (#49), which
+# fills activity_expenditure and activity_voucher. One 770 MB CSV, so it
+# publishes with --payload like run-profile rather than --payload-tree.
+EXPENDITURE_SOURCE ?= egramswaraj_expenditure
+EXPENDITURE_RUN_ID ?= $(RUN_ID)
+EXPENDITURE_CSV    ?= data/raw/eGramSwaraj_Data/Expenditure/Activity_wise_Expenditure_all_GPs/expenditure_all.csv
+EXPENDITURE_RUN    := $(PIPELINE_RAW_ROOT)/$(EXPENDITURE_SOURCE)/$(EXPENDITURE_RUN_ID)
+
+run-expenditure: _require_mode_env
+	@test -f "$(EXPENDITURE_CSV)" || { \
+	  echo "No expenditure extract at $(EXPENDITURE_CSV); pull it from Box with"; \
+	  echo "  make ingest DATA='eGramSwaraj_Data/Expenditure/Activity_wise_Expenditure_all_GPs/expenditure_all.csv'"; \
+	  exit 1; }
+	@echo "[$(MODE)] publishing expenditure run $(EXPENDITURE_RUN_ID) from $(EXPENDITURE_CSV)..."
+	uv run python main.py ingest \
+	  --raw-root $(PIPELINE_RAW_ROOT) --source $(EXPENDITURE_SOURCE) --run-id $(EXPENDITURE_RUN_ID) \
+	  --code-sha $(CODE_SHA) --config-hash $(CONFIG_HASH) \
+	  --payload $(notdir $(EXPENDITURE_CSV))=$(EXPENDITURE_CSV)
+	@echo "[$(MODE)] verifying the published file against its hash..."
+	uv run python main.py validate-run $(EXPENDITURE_RUN)
+	@echo "[$(MODE)] normalizing..."
+	uv run python main.py normalize --run-path $(EXPENDITURE_RUN) \
+	  --output-root $(PANCHAYAT_CANONICAL_ROOT)
+	@echo ""
+	@echo "Next: paste the stanza above, then build with ALL snapshots."
+
+run-expenditure-staging:
+	@$(MAKE) run-expenditure MODE=staging
+
 # Stage 3-4: build the warehouse from an approved snapshot, then check it.
 #
 # The build goes to a candidate path and is renamed over the real one only
@@ -282,13 +312,16 @@ warehouse: _require_mode_env
 	  build --snapshot-id $(SNAPSHOT_ID)
 	@echo ""
 	@echo "[$(MODE)] checking conformance..."
-	@echo "  --skip-reconciliation: the published totals still cannot be hit."
-	@echo "  voucher now has a loader (#129) but its extract covers 6,436 of"
-	@echo "  6,794 GPs (#171); activity_expenditure has no loader yet (#49); and"
-	@echo "  the targets themselves are 20-GP pilot figures (#62). The build is"
-	@echo "  provisional until those are settled -- see #50. Geography coverage"
-	@echo "  is NOT skipped here: it is what catches a sample built as if it"
-	@echo "  were the state."
+	@echo "  --skip-reconciliation: the targets are 20-GP pilot figures (#62),"
+	@echo "  so all three miss at full state -- activity_expenditure by a"
+	@echo "  factor of 308. Two are now known exactly and match production:"
+	@echo "  78053445024.44 and 258086866807.00. The third cannot be set,"
+	@echo "  because the voucher extract covers 6,436 of 6,794 GPs (#171)."
+	@echo "  Until the two are updated and the voucher one is exempted on its"
+	@echo "  own (#175), nothing here catches a doubled or malformed"
+	@echo "  expenditure load. The build is provisional -- see #50. Geography"
+	@echo "  coverage is NOT skipped: it is what catches a sample built as if"
+	@echo "  it were the state."
 	uv run python scripts/check_warehouse_conformance.py \
 	  $(CANDIDATE_DB) --skip-reconciliation $(CONFORMANCE_EXTRA)
 	@mv -f $(CANDIDATE_DB) $(PANCHAYAT_DB_PATH)

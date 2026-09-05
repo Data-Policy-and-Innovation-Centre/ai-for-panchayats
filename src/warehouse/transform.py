@@ -45,6 +45,8 @@ conflicting duplicate: quarantined, not kept as a second row.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Mapping
@@ -407,9 +409,170 @@ VOUCHER_COLUMNS: list[str] = [
     "direction", "type", "date", "month", "amount",
 ]
 
+ACTIVITY_VOUCHER_COLUMNS: list[str] = [
+    "expenditure_id", "voucher_pk", "gp_lgd_code", "fiscal_year",
+    "voucher_no", "voucher_date", "voucher_cost",
+]
+# The three parallel pipe-delimited cells, and the column each becomes.
+AV_PIPE_COLUMNS: dict[str, str] = {
+    "Voucher No": "voucher_no",
+    "Voucher Cost": "voucher_cost",
+    "Voucher Date": "voucher_date",
+}
+# `XVFC/2021-22/P/2` -> 2021-22. The fiscal year of a voucher comes from the
+# voucher number, never from the plan year: #49 records that vouchers are
+# often paid in a later year than the plan they settle, and voucher.fiscal_year
+# is half the key this table joins on.
+VOUCHER_NO_YEAR_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})(?!\d)")
+
+
+class MisalignedVoucherCells(ValueError):
+    """The parallel voucher cells of one row split to different lengths."""
+
+
+def _voucher_fiscal_year(voucher_no: object) -> str | None:
+    """The `YYYY-YYYY` fiscal year named inside a voucher number."""
+
+    if not isinstance(voucher_no, str):
+        return None
+    match = VOUCHER_NO_YEAR_RE.search(voucher_no)
+    if match is None:
+        return None
+    start, end = match.group(1), match.group(2)
+    # "2021-22" -> "2021-2022": the century comes from the start year, so the
+    # 1999-00 rollover cannot produce "1999-1900".
+    return f"{start}-{int(start) // 100 * 100 + int(end) + (100 if int(end) < int(start) % 100 else 0)}"
+
+
+def activity_voucher(
+    source: pd.DataFrame, expenditures: pd.DataFrame, voucher_keys: pd.DataFrame,
+    quarantine: Quarantine, *, source_system: str, source_run_id: str,
+) -> pd.DataFrame:
+    """Explode the parallel voucher cells into one row per voucher reference (#49).
+
+    The source packs a variable number of voucher references into three
+    pipe-delimited cells that line up positionally::
+
+        Voucher No:   XVFC/2023-24/P/7 | XVFC/2023-24/P/7 | XVFC/2023-24/P/7
+        Voucher Cost: 1028.0           | 1143.0           | 116972.0
+        Voucher Date: 05/07/2023       | 05/07/2023       | 05/07/2023
+
+    **Different lengths raise rather than truncate**, which #49 names
+    explicitly. `zip` would silently drop the tail of the longer cells, and
+    the rows it dropped would be real payments -- money vanishing with no
+    error and no quarantine row. A row whose cells disagree is corrupt, and
+    the whole load should stop rather than publish a partial ledger.
+
+    Note the same `voucher_no` legitimately repeats within one row, as above:
+    three separate payments settled against one voucher. That is why
+    `activity_voucher` has no primary key, and why nothing here deduplicates.
+
+    ``voucher_pk`` is left NULL where the accounting extract does not reach
+    the cited voucher. #49 records this as by design -- vouchers cited by the
+    expenditure file but absent from accounting are legitimately unmatched,
+    not invalid -- and #171 makes it much more common than the pilot's 488,
+    since the accounting extract is missing 358 GPs entirely. The rows are
+    kept either way; dropping them would lose the expenditure's own record of
+    what it paid.
+    """
+
+    if source.empty:
+        return pd.DataFrame(columns=ACTIVITY_VOUCHER_COLUMNS)
+
+    keep = ["gp_lgd_code", "plan_code", "activity_code", "s_no"]
+    identity = _base_identity(source)
+    frame = pd.DataFrame({
+        "gp_lgd_code": identity["gp_lgd_code"],
+        "activity_code": to_code(identity["activity_code"]),
+    })
+    for canonical, candidates in (("plan_code", RE_CANDIDATES["plan_code"]),
+                                  ("s_no", RE_CANDIDATES["s_no"])):
+        series, _ = _first_present(source, "activity_voucher", canonical, candidates, required=True)
+        frame[canonical] = to_code(series)
+    for column, target in AV_PIPE_COLUMNS.items():
+        series, _ = _first_present(
+            source, "activity_voucher", target, (column, target), required=True,
+        )
+        frame[target] = series.astype("string")
+
+    split = {
+        target: frame[target].fillna("").map(lambda text: [p.strip() for p in text.split("|")])
+        for target in AV_PIPE_COLUMNS.values()
+    }
+    lengths = pd.DataFrame(split).map(len)
+    misaligned = (lengths.nunique(axis=1) > 1)
+    if misaligned.any():
+        offending = frame.loc[misaligned, keep].head(3).to_dict("records")
+        raise MisalignedVoucherCells(
+            f"{int(misaligned.sum())} row(s) have Voucher No/Cost/Date cells of "
+            f"differing lengths; the first few are {offending}. Positional "
+            f"recombination is only meaningful when the three agree, so this is "
+            f"refused rather than zip-truncated (#49)."
+        )
+
+    exploded = frame.assign(**split).explode(list(AV_PIPE_COLUMNS.values()))
+    def _blank(column: str) -> pd.Series:
+        return exploded[column].astype("string").fillna("").str.strip() == ""
+
+    # A position with nothing in any of the three cells is not a voucher
+    # reference at all -- a row citing no vouchers explodes to one empty
+    # position -- and is dropped silently.
+    #
+    # A position with a blank voucher_no but a populated cost or date is a
+    # different thing entirely: a payment whose voucher number is missing.
+    # Dropping it silently (as `str.len() > 0` alone did) would make
+    # sum(voucher_cost) quietly fall below the expenditure row's own
+    # total_expenditure, which is the one arithmetic anybody would use to
+    # check this table. Quarantined instead, keyed by activity_code since the
+    # voucher number is exactly what it lacks.
+    all_blank = _blank("voucher_no") & _blank("voucher_cost") & _blank("voucher_date")
+    partial = _blank("voucher_no") & ~all_blank
+    if partial.any():
+        quarantine.add(
+            "activity_voucher", "partial_voucher_slot",
+            "voucher position has a cost or date but no voucher number",
+            "activity_code", exploded.loc[partial, "activity_code"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    exploded = exploded[~all_blank & ~partial]
+    if exploded.empty:
+        return pd.DataFrame(columns=ACTIVITY_VOUCHER_COLUMNS)
+
+    exploded["fiscal_year"] = exploded["voucher_no"].map(_voucher_fiscal_year)
+    exploded["voucher_cost"] = to_decimal_money(exploded["voucher_cost"])
+    # dayfirst: the expenditure file writes DD/MM/YYYY here, same as the
+    # accounting source, even though its other dates are ISO.
+    exploded["voucher_date"] = to_datetime(exploded["voucher_date"], dayfirst=True)
+
+    # `indicator`, not an index comparison: `merge` returns a fresh RangeIndex
+    # while `explode` leaves repeated original labels, so `linked.index` and
+    # `exploded.index` share no meaning and selecting the unmatched rows by
+    # index membership names the wrong vouchers. Same device `_dedupe` uses.
+    linked = exploded.merge(
+        expenditures[["expenditure_id", *keep]], how="left", on=keep, indicator=True,
+    )
+    unmatched = linked["_merge"].to_numpy() == "left_only"
+    if unmatched.any():
+        # An expenditure line that did not survive its own quarantine cannot
+        # have a bridge row: expenditure_id is a foreign key into it.
+        quarantine.add(
+            "activity_voucher", "orphan_expenditure",
+            "voucher reference has no loaded activity_expenditure row",
+            "voucher_no", linked.loc[unmatched, "voucher_no"],
+            source_system=source_system, source_run_id=source_run_id,
+        )
+    linked = linked.loc[~unmatched].drop(columns="_merge")
+    linked = linked.merge(
+        voucher_keys, how="left", on=["gp_lgd_code", "fiscal_year", "voucher_no"],
+    )
+    out = _ensure_columns(linked, ACTIVITY_VOUCHER_COLUMNS)
+    return out[ACTIVITY_VOUCHER_COLUMNS].reset_index(drop=True)
+
+
 def voucher(
     frame: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
     *, source_system: str, source_run_id: str, start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shape one voucher frame and assign its voucher_pk (#46, #129).
 
@@ -478,6 +641,30 @@ def voucher(
         out, "voucher", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    # `_dedupe` above only sees this frame. Two accounting snapshots in one
+    # build can each hold the same (gp, year, voucher_no) -- legitimately, if
+    # a later run re-scrapes GPs the first one covered -- and each would
+    # survive its own dedupe, so the second insert would hit the table's
+    # UNIQUE constraint and abort the build. Checked against what earlier
+    # snapshots already inserted, the way `_merge_gram_panchayat` does for the
+    # conformed dimension, and passed in as a set the way `_restrict` takes
+    # `gp_codes`. Filtered before ids are handed out, so voucher_pk stays
+    # dense and activity_voucher's foreign key has no gaps to explain.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                out["gp_lgd_code"], out["fiscal_year"], out["voucher_no"], strict=True,
+            )],
+            index=out.index,
+        )
+        if already.any():
+            quarantine.add(
+                "voucher", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this voucher",
+                "voucher_no", out.loc[already, "voucher_no"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
     out = out.sort_values(
         ["gp_lgd_code", "fiscal_year", "voucher_no"], kind="mergesort",
     ).reset_index(drop=True)
@@ -488,7 +675,8 @@ def voucher(
 
 
 def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine,
-               *, source_system: str, source_run_id: str) -> pd.DataFrame:
+               *, source_system: str, source_run_id: str,
+               loaded_keys: set[str] | None = None) -> pd.DataFrame:
     """One row per GP, from the panchayat profile extract (#123).
 
     Two rejections, kept apart because they mean different things:
@@ -579,6 +767,20 @@ def gp_profile(profile: pd.DataFrame, gp_codes: set[str], quarantine: Quarantine
         out, "gp_profile", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id,
     )
+    # The same cross-snapshot collision `voucher` guards against, and for the
+    # same reason: `_dedupe` sees one frame, but two profile snapshots in one
+    # build can both carry a GP and the second insert would hit gp_lgd_code's
+    # PRIMARY KEY. Present since #123; found by reviewing the sibling.
+    if loaded_keys:
+        already = out["gp_lgd_code"].isin(loaded_keys)
+        if already.any():
+            quarantine.add(
+                "gp_profile", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this GP's profile",
+                "gp_lgd_code", out.loc[already, "gp_lgd_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        out = out[~already]
 
     bad = unreadable.reindex(out.index, fill_value=False)
     if bad.any():
@@ -1260,6 +1462,7 @@ def activity_expenditure(
     *, source_system: str, source_run_id: str,
     resolutions: FieldResolutions | None = None,
     start_id: int = 1,
+    loaded_keys: set[tuple[str, str, str, str]] | None = None,
 ) -> pd.DataFrame:
     """Shape one activity_expenditure frame and assign its expenditure_id.
 
@@ -1310,6 +1513,38 @@ def activity_expenditure(
         frame, "activity_expenditure", "gp_lgd_code", gp_codes, quarantine,
         source_system=source_system, source_run_id=source_run_id, reason_code="orphan_gp",
     )
+    # The same cross-snapshot guard voucher and gp_profile carry, and the most
+    # important of the three: those two collide on a UNIQUE/PRIMARY KEY and
+    # abort the build, so a second overlapping snapshot fails loudly. This
+    # table's only key is the `expenditure_id` surrogate assigned below, so
+    # nothing would stop the duplicates -- `total_expenditure` would silently
+    # double and the activity_voucher bridge would duplicate with it, on a
+    # green build and a green conformance run.
+    #
+    # Note the `_dedupe` above cannot catch this even in principle: its key
+    # includes source_run_id, so the same business row observed by two runs is
+    # two rows to it. That is right within a frame and wrong across them.
+    #
+    # Bridge rows for the rows dropped here find no expenditure_id and are
+    # counted by activity_voucher's own orphan_expenditure path, which is the
+    # correct outcome -- they are duplicate references to an already-loaded
+    # expenditure line.
+    if loaded_keys:
+        already = pd.Series(
+            [key in loaded_keys for key in zip(
+                frame["gp_lgd_code"], frame["plan_code"],
+                frame["activity_code"], frame["s_no"], strict=True,
+            )],
+            index=frame.index,
+        )
+        if already.any():
+            quarantine.add(
+                "activity_expenditure", "cross_snapshot_duplicate_key",
+                "an earlier snapshot in this build already loaded this expenditure line",
+                "activity_code", frame.loc[already, "activity_code"],
+                source_system=source_system, source_run_id=source_run_id,
+            )
+        frame = frame[~already]
     frame = frame.reset_index(drop=True)
     frame.insert(0, "expenditure_id", range(start_id, start_id + len(frame)))
     return frame
