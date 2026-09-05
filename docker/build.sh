@@ -127,13 +127,26 @@ touch "$CTX/scripts/__init__.py" "$CTX/src/__init__.py"
 # buildx is present. The legacy builder cannot emit attestations at all, so
 # omitting them there is not a downgrade -- and passing them would abort the
 # build with "unknown flag" after the npm build has already run.
+# Provenance the image carries in itself (#85). The consumer commit is taken
+# from what the clone RESOLVED to, never from CONSUMER_REF: the ref may be an
+# abbreviation or a branch, and a label recording "master" identifies nothing.
+# This is the value that makes the label true rather than merely present.
+REPO_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+CONSUMER_COMMIT="$(git -C "$CTX/consumer" rev-parse HEAD)"
+BUILD_ARGS=(
+  --build-arg "REPO_COMMIT=$REPO_COMMIT"
+  --build-arg "CONSUMER_COMMIT=$CONSUMER_COMMIT"
+  --build-arg "IMAGE_TAG=$TAG"
+)
+echo "[build] repo $REPO_COMMIT consumer $CONSUMER_COMMIT tag $TAG"
+
 if docker buildx version >/dev/null 2>&1; then
   echo "[build] docker buildx build --platform $PLATFORM -t $IMAGE:$TAG"
-  docker buildx build --provenance=false --sbom=false --load \
+  docker buildx build --provenance=false --sbom=false --load "${BUILD_ARGS[@]}" \
     --platform "$PLATFORM" -f "$CTX/docker/Dockerfile" -t "$IMAGE:$TAG" "$CTX"
 else
   echo "[build] docker build --platform $PLATFORM -t $IMAGE:$TAG (no buildx)"
-  docker build \
+  docker build "${BUILD_ARGS[@]}" \
     --platform "$PLATFORM" -f "$CTX/docker/Dockerfile" -t "$IMAGE:$TAG" "$CTX"
 fi
 # Assert what was actually built, not what was asked for. The checks above
