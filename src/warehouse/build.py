@@ -120,6 +120,27 @@ def _merge_gram_panchayat(
     return insert(con, "gram_panchayat", new_rows, batch_size=batch_size)
 
 
+def _canonical_asset_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Asset columns under one spelling, so the two shapes can be concatenated.
+
+    `assetDetails` is a mapping in this source and a list elsewhere, and
+    `ASSET_CHILD_RENAMES` accepts both spellings -- `astTyp` from a child
+    table, `assetDetails_astTyp` folded onto the `pl` frame. Concatenating
+    the two raw and renaming afterwards produces two columns both called
+    `asset_type`, and the build dies in `load.insert` on a duplicate column
+    label. Renaming each frame to the canonical name *before* the concat
+    makes them align instead.
+
+    A frame carrying both spellings for one field would still collide, so the
+    duplicate is dropped rather than left to fail deeper in: the first
+    occurrence wins, which is the prefixed `pl` spelling this source actually
+    uses.
+    """
+
+    renamed = frame.rename(columns=transform.ASSET_CHILD_RENAMES)
+    return renamed.loc[:, ~renamed.columns.duplicated()]
+
+
 def populate(
     con: duckdb.DuckDBPyConnection, selected: tuple[SelectedSnapshot, ...],
     *, batch_size: int = DEFAULT_BATCH_SIZE,
@@ -262,12 +283,27 @@ def populate(
             # Not added to `asset_children`: that list feeds `used`, which
             # tracks which canonical DATASETS were consumed, and `pl` is
             # already counted there. Adding it would double-count.
-            if set(pl.columns) & set(transform.ASSET_CHILD_RENAMES):
-                asset_frames.append(pl)
+            #
+            # Only the rows that actually carry mapped asset values. A single
+            # mapping-shaped record puts the `assetDetails_*` columns on the
+            # whole union schema, so an unfiltered `pl` contributes a row for
+            # EVERY activity -- including ones whose assets came from a list
+            # and are about to arrive as real child rows. `_pl_child` dedupes
+            # with keep="first" and `pl` is appended first, so the empty
+            # parent row would win and the populated child row would be
+            # quarantined as a conflict: real asset data replaced by padding,
+            # on a green build. Dropping the empty rows here costs nothing --
+            # `_pl_child` synthesizes the 1:1 padding itself, from
+            # activity_codes, after the dedupe.
+            asset_columns = [c for c in pl.columns if c in transform.ASSET_CHILD_RENAMES]
+            if asset_columns:
+                populated = pl[asset_columns].notna().any(axis=1)
+                if populated.any():
+                    asset_frames.append(_canonical_asset_columns(pl.loc[populated]))
             for name in _child_tables(tables, "pl", ""):
                 frame = _read(root, tables, name)
                 if set(frame.columns) & set(transform.ASSET_CHILD_RENAMES):
-                    asset_frames.append(frame)
+                    asset_frames.append(_canonical_asset_columns(frame))
                     asset_children.append(name)
                 elif set(frame.columns) & set(transform.FUND_CHILD_RENAMES):
                     fund_frames.append(frame)
@@ -396,7 +432,21 @@ def populate(
     # to resolve against. The expenditure_id counter continues from the loop's
     # `re`-driven call above rather than restarting, so the two paths cannot
     # both claim id 1 -- the same rule voucher_pk follows across snapshots.
-    loaded_expenditure_keys: set[tuple[str, str, str, str]] = set()
+    # Seeded from what is already in the table, not empty. The loop above has
+    # its own `re`-driven call into transform.activity_expenditure, and the
+    # comment right there says the expenditure_id counter continues across the
+    # two paths rather than restarting -- the key set has to as well, or an
+    # overlapping EXPENDITURE snapshot walks straight past the guard added for
+    # exactly this and double-counts the money and the bridge under fresh
+    # surrogate ids. Read back rather than accumulated, for the same reason
+    # voucher_keys is read back below: this has to cover every row in the
+    # build, not only the ones this code path put there.
+    loaded_expenditure_keys: set[tuple[str, str, str, str]] = {
+        (gp, plan, activity, s_no)
+        for gp, plan, activity, s_no in con.execute(
+            "SELECT gp_lgd_code, plan_code, activity_code, s_no FROM activity_expenditure"
+        ).fetchall()
+    }
     for source_system, source_run_id, frame in expenditure_frames:
         expenditures = transform.activity_expenditure(
             frame, all_gp_codes, quarantine,
@@ -418,9 +468,28 @@ def populate(
         voucher_keys = con.execute(
             "SELECT gp_lgd_code, fiscal_year, voucher_no, voucher_pk FROM voucher"
         ).fetchdf()
+        # And the expenditures, for exactly the same reason. `expenditures`
+        # is this frame's surviving rows only: the cross-snapshot guard above
+        # drops a line already loaded through the `re` path, and resolving the
+        # bridge against that filtered frame would quarantine its vouchers as
+        # orphan_expenditure -- suppressing the duplicate fact row and losing
+        # the bridge rows with it, which is a worse trade than the duplicate.
+        expenditure_keys = con.execute(
+            "SELECT gp_lgd_code, plan_code, activity_code, s_no, expenditure_id "
+            "FROM activity_expenditure"
+        ).fetchdf()
+        # Which expenditure lines already carry their references, so a second
+        # snapshot restating the same line cannot contribute them twice now
+        # that the resolution above spans the whole table.
+        linked_expenditure_ids = {
+            row[0] for row in con.execute(
+                "SELECT DISTINCT expenditure_id FROM activity_voucher"
+            ).fetchall()
+        }
         add_count("activity_voucher", insert(con, "activity_voucher", transform.activity_voucher(
-            frame, expenditures, voucher_keys, quarantine,
+            frame, expenditure_keys, voucher_keys, quarantine,
             source_system=source_system, source_run_id=source_run_id,
+            linked_expenditure_ids=linked_expenditure_ids,
         ), batch_size=batch_size))
 
     add_count("quarantine", insert(con, "quarantine", quarantine.frame(), batch_size=batch_size))

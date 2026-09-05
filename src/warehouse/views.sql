@@ -58,9 +58,31 @@ GROUP BY activity_code;
 --    scheme columns below take the largest-value row so the join
 --    stays 1:1. Query admin_approval_scheme directly if you need
 --    the full multi-scheme split.
+--  * admin_approval and technical_approval are keyed on row_id, not
+--    on activity_code, so neither is 1:1 with an activity by
+--    construction. At full state 44 activity_codes have two
+--    admin_approval rows and none have two technical_approval rows
+--    -- and those 44 were exactly the +44 rows v_activity carried
+--    past planned_activity (#133). Both are collapsed below on the
+--    same rule the scheme columns use: largest value wins, row_id
+--    breaks a tie so the choice is deterministic rather than
+--    whatever order the scan returned. Query the base tables if you
+--    need every approval record.
 -- ------------------------------------------------------------
 CREATE OR REPLACE VIEW v_approval AS
-WITH sch AS (
+WITH aa AS (
+    SELECT * FROM admin_approval
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY activity_code
+        ORDER BY COALESCE(work_proposed_cost, 0) DESC, row_id
+    ) = 1),
+ta AS (
+    SELECT * FROM technical_approval
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY activity_code
+        ORDER BY COALESCE(tec_approval_cost, 0) DESC, row_id
+    ) = 1),
+sch AS (
     SELECT activity_code,
            SUM(COALESCE(fund_sanctioned_general,0)) AS fund_sanctioned_general,
            SUM(COALESCE(fund_sanctioned_sc,0))      AS fund_sanctioned_sc,
@@ -119,8 +141,8 @@ SELECT
       WHEN '4250' THEN 'Untied'
       ELSE 'Other'
     END AS tied_untied
-FROM admin_approval aa
-LEFT JOIN technical_approval ta ON ta.activity_code = aa.activity_code
+FROM aa
+LEFT JOIN ta  ON ta.activity_code = aa.activity_code
 LEFT JOIN sch                   ON sch.activity_code = aa.activity_code
 LEFT JOIN dim_code fs ON fs.variable = 'fund_scheme_code'
                      AND fs.code = sch.scheme_code

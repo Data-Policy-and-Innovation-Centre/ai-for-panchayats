@@ -1528,3 +1528,182 @@ def test_a_second_expenditure_snapshot_does_not_double_the_money(tmp_path: Path)
         ).fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_the_re_path_and_an_expenditure_snapshot_do_not_double_the_same_line(tmp_path: Path):
+    """Two code paths write activity_expenditure; the guard has to cover both.
+
+    `build.populate` loads this table twice: once inside the snapshot loop,
+    from an `re` dataset that carries expenditure spellings, and once after
+    it, from the EXPENDITURE snapshots #49 added. The expenditure_id counter
+    already continues across the two -- the comment there says so -- but the
+    cross-snapshot key set started empty, so a business line present in both
+    walked straight past the guard and loaded twice under fresh surrogate ids.
+
+    Nothing catches that downstream: activity_expenditure's only key is the
+    surrogate, so there is no constraint to violate, and the money simply
+    doubles on a green build. Only #175's reconciliation would notice, and
+    only at full state.
+    """
+
+    settings = make_settings(tmp_path)
+    # An `re` payload carrying expenditure spellings, so the in-loop path
+    # actually loads rows rather than shaping an empty frame.
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [{"activityCd": 44134242, "planCode": "4810158", "totalCost": 200000.0}],
+        },
+        "LGD_123_Test_GP/2021_RE.json": {
+            "data": [{
+                "planCode": "4810158", "sNo": "1", "activityCd": 44134242,
+                "totalExpenditure": 119143.0, "schemeName": "XV Finance Commission",
+            }],
+        },
+    })
+    normalize(run, settings.canonical_root, chunk_size=100)
+    # The same business line again, this time through the EXPENDITURE lane.
+    _expenditure_snapshot(tmp_path, settings, "exp-1", _expenditure_row(
+        s_no="1", activity="44134242", total="119143.0",
+        v_no="XVFC/2022-23/P/7", v_cost="119143.0", v_date="05/07/2023",
+    ))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "exp-1"), settings=settings, registry=spec_registry,
+    )
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        rows, total = con.execute(
+            "SELECT COUNT(*), SUM(total_expenditure) FROM activity_expenditure"
+        ).fetchone()
+        assert rows == 1, (
+            "the same (gp, plan, activity, s_no) line reached both load paths; "
+            "it must be loaded once"
+        )
+        assert total == Decimal("119143.00"), "the money must not double"
+        # Suppressing the duplicate fact row must not take the bridge with
+        # it. The EXPENDITURE row carries the voucher reference and the `re`
+        # row does not, so if the bridge resolves against only the surviving
+        # (filtered) frame, that voucher is quarantined as orphan_expenditure
+        # and the bridge silently understates -- trading a doubled total for
+        # a missing one.
+        bridge, linked_cost = con.execute(
+            "SELECT COUNT(*), SUM(voucher_cost) FROM activity_voucher"
+        ).fetchone()
+        assert bridge == 1, "the voucher on the deduplicated row must still link"
+        assert linked_cost == Decimal("119143.00")
+        assert con.execute(
+            "SELECT COUNT(*) FROM quarantine WHERE reason_code = 'orphan_expenditure'"
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_a_mapping_shaped_asset_does_not_blank_a_list_shaped_one(tmp_path: Path):
+    """Both `assetDetails` shapes in one snapshot must not cancel each other out.
+
+    `assetDetails` arrives as a mapping in this source, so normalize folds it
+    into the `pl` frame as `assetDetails_*` and build reads assets off `pl`
+    (#159/#160). It arrives as a list elsewhere, and then normalize emits a
+    `pl__assetdetails` child table instead.
+
+    With both in one snapshot the union schema puts the `assetDetails_*`
+    columns on every `pl` row, so an unfiltered `pl` contributes a row for the
+    list-shaped activity too -- empty in those columns. `_pl_child` dedupes
+    with keep="first" and `pl` is appended first, so that empty row wins and
+    the populated child row is quarantined as a conflicting duplicate: real
+    asset data silently replaced by padding, on a green build.
+    """
+
+    settings = make_settings(tmp_path)
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [
+                {   # mapping-shaped: lands on the pl frame
+                    "activityCd": 1, "planCode": "P1", "totalCost": 100.0,
+                    "assetDetails": {"astTyp": "well", "astCtgry": "water"},
+                },
+                {   # list-shaped: lands in pl__assetdetails
+                    "activityCd": 2, "planCode": "P1", "totalCost": 200.0,
+                    "assetDetails": [{"astTyp": "road", "astCtgry": "transport"}],
+                },
+            ],
+        },
+    })
+    normalize(run, settings.canonical_root, chunk_size=100)
+    result = build(
+        snapshot_ids=("snap-1",), settings=settings,
+        registry=registry(approved("snap-1", "egramSwaraj", "run-1")),
+    )
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assets = dict(con.execute(
+            "SELECT activity_code, asset_type FROM activity_asset ORDER BY activity_code"
+        ).fetchall())
+        assert assets == {"1": "well", "2": "road"}, (
+            "the list-shaped asset was replaced by the union schema's empty parent row"
+        )
+    finally:
+        con.close()
+    assert result.quarantine_count == 0, "nothing here is a genuine conflict"
+
+
+def test_the_bridge_guard_fires_even_when_an_orphan_upcasts_the_id(tmp_path: Path):
+    """The cross-snapshot bridge guard, on the dtype production actually hits.
+
+    `expenditure_id` arrives from a left merge. With every reference matched
+    it stays int64; one unmatched reference upcasts the whole column to
+    float64 via NaN. The guard compares it against a set of Python ints read
+    back from DuckDB, so this pins that `5.0` still matches `5` -- and it is
+    not a hypothetical dtype: #171 leaves 358 GPs out of the accounting
+    extract, so unmatched references are ordinary on real data, which means
+    float64 is the shape the guard meets in production.
+
+    Without the guard the restated line's voucher doubles the bridge; with a
+    guard that failed to match across the dtype it would double just as
+    silently.
+    """
+
+    settings, _ = _build_settings_and_registry(tmp_path)
+    line = _expenditure_row(
+        s_no="1", activity="44134242", total="119143.0",
+        v_no="XVFC/2022-23/P/7", v_cost="119143.0", v_date="05/07/2023",
+    )
+    _expenditure_snapshot(tmp_path, settings, "exp-1", line)
+    # The second snapshot restates that line AND carries one for a GP that
+    # does not exist, whose expenditure row is restricted away -- leaving its
+    # voucher reference unmatched, which is what upcasts the column.
+    _expenditure_snapshot(tmp_path, settings, "exp-2", "\n".join([
+        line,
+        _expenditure_row(
+            s_no="1", activity="99999999", total="500.0", gp="999",
+            v_no="XVFC/2022-23/P/9", v_cost="500.0", v_date="06/07/2023",
+        ),
+    ]))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+        approved("exp-2", "egramswaraj_expenditure", "exp-2"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "exp-1", "exp-2"),
+        settings=settings, registry=spec_registry,
+    )
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM activity_expenditure").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM activity_voucher").fetchone()[0] == 1, (
+            "the restated line's voucher must not be added a second time"
+        )
+        assert con.execute(
+            "SELECT COUNT(*) FROM quarantine "
+            "WHERE table_name = 'activity_voucher' "
+            "AND reason_code = 'cross_snapshot_duplicate_key'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()

@@ -237,3 +237,70 @@ def test_days_since_sanction_is_computed_per_query_not_frozen_at_build():
         assert drifted == 0
     finally:
         con.close()
+
+
+def test_duplicate_approvals_do_not_fan_out_the_activity_views():
+    """v_activity is documented as strictly one row per activity (#133).
+
+    `admin_approval` and `technical_approval` are keyed on row_id, not on
+    activity_code, so neither is 1:1 with an activity by construction and the
+    join was free to multiply. At full state that produced exactly 44 rows of
+    fan-out -- 44 activity_codes with two admin_approval rows -- which
+    propagates through v_asset and every analytical SUM built on these views,
+    overstating counts and money.
+
+    Two approvals with different costs, so the collapse also has to pick the
+    documented winner rather than merely picking one.
+    """
+
+    con = _empty_warehouse()
+    _seed_activity(con, "A1", total_cost=100.0)
+    for row_id, cost in (("r1", 10.0), ("r2", 99.0)):
+        con.execute(
+            "INSERT INTO admin_approval "
+            "(source_system, source_run_id, row_id, gp_lgd_code, activity_code, "
+            " plan_year, work_proposed_cost, adm_approval_authority) "
+            "VALUES ('s', 'r', ?, '111', 'A1', '2021-2022', ?, 'SARPANCH')",
+            [row_id, cost],
+        )
+    con.execute(
+        "INSERT INTO technical_approval "
+        "(source_system, source_run_id, row_id, gp_lgd_code, activity_code, plan_year) "
+        "VALUES ('s', 'r', 't1', '111', 'A1', '2021-2022')"
+    )
+    materialize(con)
+
+    assert con.execute("SELECT COUNT(*) FROM v_approval").fetchone()[0] == 1
+    assert con.execute("SELECT COUNT(*) FROM v_activity").fetchone()[0] == 1, (
+        "one planned activity must yield exactly one v_activity row"
+    )
+    # Largest value wins, mirroring what the scheme columns already do.
+    assert con.execute(
+        "SELECT work_proposed_cost FROM v_approval WHERE activity_code = 'A1'"
+    ).fetchone()[0] == 99.0
+
+
+def test_the_approval_collapse_is_deterministic_when_costs_tie():
+    """A tie must not be settled by scan order.
+
+    Picking arbitrarily would make the view's contents depend on how the
+    table happened to be read, so two builds of the same data could disagree.
+    row_id breaks the tie because it is the approval's own identity.
+    """
+
+    con = _empty_warehouse()
+    _seed_activity(con, "A1", total_cost=100.0)
+    for row_id, authority in (("r2", "BDO"), ("r1", "SARPANCH")):
+        con.execute(
+            "INSERT INTO admin_approval "
+            "(source_system, source_run_id, row_id, gp_lgd_code, activity_code, "
+            " plan_year, work_proposed_cost, adm_approval_authority) "
+            "VALUES ('s', 'r', ?, '111', 'A1', '2021-2022', 50.0, ?)",
+            [row_id, authority],
+        )
+    materialize(con)
+
+    assert con.execute("SELECT COUNT(*) FROM v_approval").fetchone()[0] == 1
+    assert con.execute(
+        "SELECT authority_raw FROM v_approval WHERE activity_code = 'A1'"
+    ).fetchone()[0] == "SARPANCH", "the lowest row_id wins a tie, not the insertion order"
