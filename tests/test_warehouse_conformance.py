@@ -15,14 +15,18 @@ from __future__ import annotations
 from decimal import Decimal
 
 import duckdb
+import pytest
 
+from scripts import check_warehouse_conformance as conformance_cli
 from warehouse.geography import gp_geography
 
 from warehouse.conformance import (
+    EXEMPTABLE_RECONCILIATION_CHECKS,
     EXPECTED_ACTIVITY_EXPENDITURE_TOTAL,
     GP_PROFILE_MEASURES,
     EXPECTED_PLANNED_COST_TOTAL,
     EXPECTED_VOUCHER_AMOUNT_TOTAL,
+    RECONCILIATION_TARGETS,
     check_activity_expenditure_fk_not_enforced,
     check_activity_nsap_empty,
     check_activity_voucher_nullable,
@@ -759,6 +763,79 @@ def test_reconciliation_included_by_default_and_fails_on_empty_fixture(tmp_path)
     assert len(reconciliation_findings) == 3
     assert all(f.severity == "violation" for f in reconciliation_findings)
     con.close()
+
+
+def test_exempting_one_total_still_checks_the_others(tmp_path):
+    """The point of #175: one unhittable total must not switch off the rest.
+
+    Before this, `make warehouse` passed a blanket --skip-reconciliation
+    because the voucher total cannot be hit until #171. The cost was that
+    nothing checked the other two either -- so the cross-snapshot defect
+    fixed in f128944, which silently doubles activity_expenditure, would have
+    reached a green build AND a green conformance run.
+    """
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.execute("INSERT INTO gram_panchayat (gp_lgd_code, gp_name) VALUES ('GP1', 'Test GP')")
+    # The voucher total is short, exactly as the real build's is (#171).
+    con.execute(
+        "INSERT INTO voucher VALUES (1, 'GP1', '2025-2026', 'V1', ?, 'payment')",
+        [EXPECTED_VOUCHER_AMOUNT_TOTAL - Decimal("1000000.00")],
+    )
+    # And the expenditure total is doubled, as an overlapping snapshot would
+    # have made it.
+    con.execute(
+        "INSERT INTO activity_expenditure VALUES (1, 'A1', ?, NULL)",
+        [EXPECTED_ACTIVITY_EXPENDITURE_TOTAL * 2],
+    )
+    con.execute(
+        "INSERT INTO planned_activity VALUES ('A1', NULL, ?, NULL)",
+        [float(EXPECTED_PLANNED_COST_TOTAL)],
+    )
+
+    exempt = frozenset({"reconciliation.voucher_amount_total"})
+    findings = check_reconciliation_totals(con, exempt)
+    by_check = {f.check: f for f in findings}
+
+    violations = [f for f in findings if f.severity == "violation"]
+    assert [f.check for f in violations] == ["reconciliation.activity_expenditure_total"], (
+        "the doubled expenditure must still be caught while voucher is exempt"
+    )
+    # The exemption is reported, not silent: a clean-looking report that
+    # quietly checked nothing is the failure mode this replaces.
+    exempted = by_check["reconciliation.voucher_amount_total"]
+    assert exempted.severity == "informational"
+    assert exempted.actual == "not checked"
+    assert exempted.expected == str(EXPECTED_VOUCHER_AMOUNT_TOTAL)
+    con.close()
+
+
+def test_exemption_names_are_derived_from_the_targets(tmp_path):
+    """A stale exemption must not silently match nothing.
+
+    The CLI restricts --exempt-reconciliation to this set, so a target that
+    gets renamed takes its accepted spelling with it rather than leaving an
+    exemption that quietly enforces a check the operator believes is off.
+    """
+
+    assert EXEMPTABLE_RECONCILIATION_CHECKS == {
+        name for name, *_ in RECONCILIATION_TARGETS
+    }
+    assert "reconciliation.voucher_amount_total" in EXEMPTABLE_RECONCILIATION_CHECKS
+
+
+def test_the_cli_refuses_an_unknown_exemption(tmp_path):
+    """Rejected at the boundary rather than accepted and ignored."""
+
+    con = _connect(tmp_path)
+    build_full_schema(con)
+    con.close()
+    database = str(tmp_path / "test.duckdb")
+
+    with pytest.raises(SystemExit) as exit_info:
+        conformance_cli.main([database, "--exempt-reconciliation", "reconciliation.typo"])
+    assert exit_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------
