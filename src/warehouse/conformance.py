@@ -190,6 +190,13 @@ SATELLITE_TABLES: tuple[str, ...] = (
     "activity_training", "activity_community_service",
 )
 PARENT_TABLE_FOR_SATELLITES = "planned_activity"
+# The three columns every satellite carries that are not payload: two
+# provenance columns and the foreign key. Everything else in a satellite is
+# data the source was supposed to supply, which is what
+# ``check_satellite_payload_population`` looks at.
+SATELLITE_IDENTITY_COLUMNS: frozenset[str] = frozenset({
+    "source_system", "source_run_id", "activity_code",
+})
 VOUCHER_DIRECTION_TABLE = "voucher"
 VOUCHER_DIRECTION_COLUMN = "direction"
 VOUCHER_ALLOWED_DIRECTIONS: frozenset[str] = frozenset({"payment", "receipt"})
@@ -574,6 +581,82 @@ def check_beneficiary_count_type(con: duckdb.DuckDBPyConnection) -> list[Finding
             expected="an integer type", actual=data_type,
         )]
     return []
+
+
+def check_satellite_payload_population(
+    con: duckdb.DuckDBPyConnection, *, full_state: bool = True,
+) -> list[Finding]:
+    """Section 5b: a satellite must carry data, not just the right row count.
+
+    The 1:1 satellites are padded to one row per planned_activity on purpose
+    (see ``transform._pl_child``), so row parity -- which section 5 already
+    checks -- says nothing at all about whether the payload arrived. That is
+    the exact shape #159 shipped in: ``activity_asset`` held 4,073,745 rows,
+    every asset column NULL, and passed every check the warehouse had. A
+    deployed chatbot answered every asset question with 'Uncategorised' over
+    a healthy-looking four-million-row table.
+
+    Two levels, because the two mean different things:
+
+    * every payload column NULL is a **violation** -- the table is filler,
+      and whatever routes data into it is not working. Only on a full-state
+      build: a three-activity fixture whose records carry no training or
+      delegation fields has an all-NULL satellite and is not wrong for it,
+      so ``full_state=False`` reports the same thing as a note. This rides
+      the same "is this the state?" question as geography and gp_profile
+      completeness, and takes it from the same flag.
+    * one column NULL throughout is **informational** -- usually the source
+      simply never sends it, which is worth stating in the report rather
+      than leaving to be rediscovered. Two are known as of this writing:
+      ``asset_name`` (the portal sends ``astNm`` on every record and its
+      value is always null) and the five ``asset_loc_*`` columns (the source
+      does carry ``assetLocationDetails``, but it is a list nested inside a
+      flattened dict, so normalize drops it -- see #177).
+    """
+
+    findings: list[Finding] = []
+    actual_tables = _existing_tables(con)
+    for table in SATELLITE_TABLES:
+        if table not in actual_tables:
+            continue
+        if _row_count(con, table) == 0:
+            continue  # an empty satellite is section 5's business, not this one
+        payload = [c for c in _columns(con, table) if c not in SATELLITE_IDENTITY_COLUMNS]
+        if not payload:
+            # A satellite reduced to its identity columns cannot hold data at
+            # all, and nothing else notices: check_table_existence compares
+            # table NAMES, and row parity, primary keys and foreign keys all
+            # still pass on a table with no payload. That is this check's own
+            # blind spot, one level up from the one it was written for.
+            if full_state:
+                findings.append(Finding(
+                    check=f"data.satellite_payload.{table}", severity="violation",
+                    expected="payload column(s) beyond "
+                             f"{sorted(SATELLITE_IDENTITY_COLUMNS)}",
+                    actual="the table has only identity columns",
+                    detail="schema drift: this table cannot carry data, and every "
+                           "other check still passes on it",
+                ))
+            continue
+        selects = ", ".join(f'COUNT("{column}")' for column in payload)
+        counts = con.execute(f"SELECT {selects} FROM {table}").fetchone() or ()
+        empty = [column for column, count in zip(payload, counts) if count == 0]
+        if len(empty) == len(payload):
+            findings.append(Finding(
+                check=f"data.satellite_payload.{table}",
+                severity="violation" if full_state else "informational",
+                expected=f"at least one of {len(payload)} payload column(s) populated",
+                actual="every payload column is NULL in every row",
+                detail="row parity passes because these rows are 1:1 padding; "
+                       "nothing is routing data into this table",
+            ))
+            continue
+        for column in empty:
+            findings.append(Finding(
+                check=f"data.satellite_payload.{table}.{column}", severity="informational",
+                expected="some non-NULL value", actual="NULL in every row",
+            ))
+    return findings
 
 
 def check_satellite_row_parity(con: duckdb.DuckDBPyConnection) -> list[Finding]:
@@ -1030,6 +1113,10 @@ def check_conformance(
         # Makefile pass; what it means is "this is not the state".
         findings.extend(check_geography_completeness(con))
         findings.extend(check_gp_profile_completeness(con))
+    # Always runs; ``skip_geography`` decides only whether an all-NULL
+    # satellite is a violation or a note, because that is the same question
+    # the flag already answers -- is this the state, or a fixture?
+    findings.extend(check_satellite_payload_population(con, full_state=not skip_geography))
     if not skip_reconciliation:
         findings.extend(check_reconciliation_totals(con, exempt_reconciliation))
     return findings
