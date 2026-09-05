@@ -589,6 +589,17 @@ KIND_TABLES: dict[str, tuple[str, ...]] = {
     # declares it and `build` knows what it fills -- but NOT required, see
     # REQUIRED_KINDS.
     "PROFILE": ("gp_profile",),
+    # The accounting extract: nested per-GP-per-year JSON, its own raw run,
+    # its own snapshot (#129). Like PROFILE, recognized but NOT required --
+    # requiring it would mean no rebuild of the scrape could be done without
+    # it. activity_voucher is deliberately not listed: it is filled from the
+    # expenditure source (#49), not from this one.
+    "VOUCHER": ("voucher",),
+    # The activity-wise expenditure extract: one large flat CSV, its own raw
+    # run, its own snapshot (#49). Fills two tables -- the expenditure lines
+    # and the bridge to voucher that its own pipe-delimited cells describe.
+    # Recognized but not required, like PROFILE and VOUCHER.
+    "EXPENDITURE": ("activity_expenditure", "activity_voucher"),
 }
 
 # The kinds a build cannot be missing. The five eGramSwaraj endpoints arrive

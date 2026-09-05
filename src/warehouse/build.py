@@ -153,6 +153,16 @@ def populate(
     # #161 is open about elsewhere in this function. Deferring is the whole
     # fix here: one row per GP, no per-snapshot state, nothing to interleave.
     profile_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for exactly the reason profile_frames is: voucher has a
+    # FOREIGN KEY to gram_panchayat, so loading an accounting snapshot ahead
+    # of the scrape snapshots naming the same GPs would quarantine every
+    # voucher as an orphan and still finish green (#161).
+    voucher_frames: list[tuple[str, str, pd.DataFrame]] = []
+    # Deferred for a further reason than voucher's: activity_voucher bridges
+    # activity_expenditure to voucher, so it needs expenditure_id AND
+    # voucher_pk to exist. Both are assigned after the loop, so the
+    # expenditure source has to be held until they are.
+    expenditure_frames: list[tuple[str, str, pd.DataFrame]] = []
 
     def add_count(table: str, n: int) -> None:
         counts[table] = counts.get(table, 0) + n
@@ -185,6 +195,18 @@ def populate(
                 (source_system, source_run_id, _read(root, tables, "profile"))
             )
             used.append("profile")
+
+        if "voucher" in tables:
+            voucher_frames.append(
+                (source_system, source_run_id, _read(root, tables, "voucher"))
+            )
+            used.append("voucher")
+
+        if "expenditure" in tables:
+            expenditure_frames.append(
+                (source_system, source_run_id, _read(root, tables, "expenditure"))
+            )
+            used.append("expenditure")
 
         # Every kind independently records its own GP via the same
         # folder-name parser, so the dimension is built from all of them,
@@ -341,9 +363,63 @@ def populate(
 
     # After the loop, deliberately: see profile_frames above.
     all_gp_codes = set(con.execute("SELECT gp_lgd_code FROM gram_panchayat").fetchdf()["gp_lgd_code"])
+    loaded_profile_keys: set[str] = set()
     for source_system, source_run_id, frame in profile_frames:
-        add_count("gp_profile", insert(con, "gp_profile", transform.gp_profile(
+        profiles = transform.gp_profile(
             frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            loaded_keys=loaded_profile_keys,
+        )
+        add_count("gp_profile", insert(con, "gp_profile", profiles, batch_size=batch_size))
+        loaded_profile_keys.update(profiles["gp_lgd_code"])
+
+    # voucher_pk advances across snapshots the same way expenditure_id and
+    # nsap_id do inside the loop: the counter is the caller's, so two
+    # accounting snapshots in one build cannot both claim id 1 and collide on
+    # the INTEGER PRIMARY KEY.
+    next_voucher_pk = 1
+    loaded_voucher_keys: set[tuple[str, str, str]] = set()
+    for source_system, source_run_id, frame in voucher_frames:
+        vouchers = transform.voucher(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            start_id=next_voucher_pk, loaded_keys=loaded_voucher_keys,
+        )
+        add_count("voucher", insert(con, "voucher", vouchers, batch_size=batch_size))
+        next_voucher_pk += len(vouchers)
+        loaded_voucher_keys.update(zip(
+            vouchers["gp_lgd_code"], vouchers["fiscal_year"], vouchers["voucher_no"],
+            strict=True,
+        ))
+
+    # activity_expenditure and its bridge, after voucher so voucher_pk exists
+    # to resolve against. The expenditure_id counter continues from the loop's
+    # `re`-driven call above rather than restarting, so the two paths cannot
+    # both claim id 1 -- the same rule voucher_pk follows across snapshots.
+    loaded_expenditure_keys: set[tuple[str, str, str, str]] = set()
+    for source_system, source_run_id, frame in expenditure_frames:
+        expenditures = transform.activity_expenditure(
+            frame, all_gp_codes, quarantine,
+            source_system=source_system, source_run_id=source_run_id,
+            resolutions=resolutions, start_id=next_expenditure_id,
+            loaded_keys=loaded_expenditure_keys,
+        )
+        add_count("activity_expenditure", insert(
+            con, "activity_expenditure", expenditures, batch_size=batch_size,
+        ))
+        next_expenditure_id += len(expenditures)
+        loaded_expenditure_keys.update(zip(
+            expenditures["gp_lgd_code"], expenditures["plan_code"],
+            expenditures["activity_code"], expenditures["s_no"], strict=True,
+        ))
+        # Read back rather than held: voucher may span several snapshots, and
+        # the bridge has to resolve against every voucher in the build, not
+        # only the ones this snapshot happened to carry.
+        voucher_keys = con.execute(
+            "SELECT gp_lgd_code, fiscal_year, voucher_no, voucher_pk FROM voucher"
+        ).fetchdf()
+        add_count("activity_voucher", insert(con, "activity_voucher", transform.activity_voucher(
+            frame, expenditures, voucher_keys, quarantine,
             source_system=source_system, source_run_id=source_run_id,
         ), batch_size=batch_size))
 
