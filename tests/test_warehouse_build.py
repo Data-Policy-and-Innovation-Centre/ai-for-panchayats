@@ -1528,3 +1528,111 @@ def test_a_second_expenditure_snapshot_does_not_double_the_money(tmp_path: Path)
         ).fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_the_re_path_and_an_expenditure_snapshot_do_not_double_the_same_line(tmp_path: Path):
+    """Two code paths write activity_expenditure; the guard has to cover both.
+
+    `build.populate` loads this table twice: once inside the snapshot loop,
+    from an `re` dataset that carries expenditure spellings, and once after
+    it, from the EXPENDITURE snapshots #49 added. The expenditure_id counter
+    already continues across the two -- the comment there says so -- but the
+    cross-snapshot key set started empty, so a business line present in both
+    walked straight past the guard and loaded twice under fresh surrogate ids.
+
+    Nothing catches that downstream: activity_expenditure's only key is the
+    surrogate, so there is no constraint to violate, and the money simply
+    doubles on a green build. Only #175's reconciliation would notice, and
+    only at full state.
+    """
+
+    settings = make_settings(tmp_path)
+    # An `re` payload carrying expenditure spellings, so the in-loop path
+    # actually loads rows rather than shaping an empty frame.
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [{"activityCd": 44134242, "planCode": "4810158", "totalCost": 200000.0}],
+        },
+        "LGD_123_Test_GP/2021_RE.json": {
+            "data": [{
+                "planCode": "4810158", "sNo": "1", "activityCd": 44134242,
+                "totalExpenditure": 119143.0, "schemeName": "XV Finance Commission",
+            }],
+        },
+    })
+    normalize(run, settings.canonical_root, chunk_size=100)
+    # The same business line again, this time through the EXPENDITURE lane.
+    _expenditure_snapshot(tmp_path, settings, "exp-1", _expenditure_row(
+        s_no="1", activity="44134242", total="119143.0",
+        v_no="XVFC/2022-23/P/7", v_cost="119143.0", v_date="05/07/2023",
+    ))
+    spec_registry = registry(
+        approved("snap-1", "egramSwaraj", "run-1"),
+        approved("exp-1", "egramswaraj_expenditure", "exp-1"),
+    )
+    result = build(
+        snapshot_ids=("snap-1", "exp-1"), settings=settings, registry=spec_registry,
+    )
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        rows, total = con.execute(
+            "SELECT COUNT(*), SUM(total_expenditure) FROM activity_expenditure"
+        ).fetchone()
+        assert rows == 1, (
+            "the same (gp, plan, activity, s_no) line reached both load paths; "
+            "it must be loaded once"
+        )
+        assert total == Decimal("119143.00"), "the money must not double"
+    finally:
+        con.close()
+
+
+def test_a_mapping_shaped_asset_does_not_blank_a_list_shaped_one(tmp_path: Path):
+    """Both `assetDetails` shapes in one snapshot must not cancel each other out.
+
+    `assetDetails` arrives as a mapping in this source, so normalize folds it
+    into the `pl` frame as `assetDetails_*` and build reads assets off `pl`
+    (#159/#160). It arrives as a list elsewhere, and then normalize emits a
+    `pl__assetdetails` child table instead.
+
+    With both in one snapshot the union schema puts the `assetDetails_*`
+    columns on every `pl` row, so an unfiltered `pl` contributes a row for the
+    list-shaped activity too -- empty in those columns. `_pl_child` dedupes
+    with keep="first" and `pl` is appended first, so that empty row wins and
+    the populated child row is quarantined as a conflicting duplicate: real
+    asset data silently replaced by padding, on a green build.
+    """
+
+    settings = make_settings(tmp_path)
+    run = publish_raw_run(tmp_path, "run-1", {
+        "LGD_123_Test_GP/2021_PL.json": {
+            "data": [
+                {   # mapping-shaped: lands on the pl frame
+                    "activityCd": 1, "planCode": "P1", "totalCost": 100.0,
+                    "assetDetails": {"astTyp": "well", "astCtgry": "water"},
+                },
+                {   # list-shaped: lands in pl__assetdetails
+                    "activityCd": 2, "planCode": "P1", "totalCost": 200.0,
+                    "assetDetails": [{"astTyp": "road", "astCtgry": "transport"}],
+                },
+            ],
+        },
+    })
+    normalize(run, settings.canonical_root, chunk_size=100)
+    result = build(
+        snapshot_ids=("snap-1",), settings=settings,
+        registry=registry(approved("snap-1", "egramSwaraj", "run-1")),
+    )
+
+    con = duckdb.connect(str(result.target), read_only=True)
+    try:
+        assets = dict(con.execute(
+            "SELECT activity_code, asset_type FROM activity_asset ORDER BY activity_code"
+        ).fetchall())
+        assert assets == {"1": "well", "2": "road"}, (
+            "the list-shaped asset was replaced by the union schema's empty parent row"
+        )
+    finally:
+        con.close()
+    assert result.quarantine_count == 0, "nothing here is a genuine conflict"
