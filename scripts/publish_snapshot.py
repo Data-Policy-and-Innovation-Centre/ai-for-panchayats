@@ -142,7 +142,12 @@ def main(argv: list[str] | None = None) -> int:
             sys.executable, "scripts/build_snapshot_manifest.py",
             str(args.artifact), "--bucket", args.bucket, "--key", key,
             "--version-id", version_id, "--label", args.label,
-            "--output", str(args.manifest),
+            # --out, not --output. build_snapshot_manifest.py declares "--out";
+            # argparse rejects the long form with exit 2, and this subprocess
+            # runs AFTER the ~6.4 GB upload, so the wrong spelling means every
+            # real publish pays for the upload and then fails to write the
+            # manifest it exists to produce.
+            "--out", str(args.manifest),
         ],
         capture_output=True, text=True,
     )
