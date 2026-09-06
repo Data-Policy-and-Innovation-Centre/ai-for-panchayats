@@ -27,3 +27,9 @@ variable "ecr_repository_name" {
   type        = string
   default     = "prdw-chatbot"
 }
+
+variable "app_name_prefix" {
+  description = "The name prefix every resource in infra/terraform/app carries (its var.name). Everything the apply role may touch is scoped to it, so a broad service action cannot reach another project's resources in the same account."
+  type        = string
+  default     = "prdw-chatbot"
+}
