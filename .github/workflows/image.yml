@@ -33,18 +33,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
           python-version-file: .python-version
 
-      # The tag is computable with no clone, no docker daemon and no AWS call,
-      # which is the property that lets it be a job output regardless of what
-      # the rest of this job does.
+      # Plain python3, NOT `uv run`. uv discovers the project and syncs its
+      # dependencies first, and pyproject pulls `dpic` over ssh:// -- so on a
+      # runner without the deploy key this job would die on its very first
+      # command, before any build. compute_image_tag.py imports only the
+      # standard library, so it needs none of that (#90 review).
       - name: Compute the image tag from the build inputs
         id: tag
         run: |
-          tag="$(uv run python scripts/compute_image_tag.py --platform linux/arm64)"
+          tag="$(python3 scripts/compute_image_tag.py --platform linux/arm64)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "::notice title=Image tag::$tag"
 
@@ -57,26 +58,29 @@ jobs:
       # would assert something about the deployed image that nobody verified.
       # CI, which has to be reproducible, pins exactly; a developer keeps the
       # looser local check.
+      # Read from docker/.node-version and docker/.npm-version rather than
+      # written here. Both live under docker/, which compute_image_tag.py
+      # hashes -- so a toolchain bump changes the tag and forces a rebuild.
+      # Pinned as literals in this file they would not be hashed, and bumping
+      # Node would compute the OLD tag, find it in ECR, skip the build, and
+      # never publish the toolchain change at all (#90 review).
       - uses: actions/setup-node@v4
         with:
-          node-version: '24.20.0'
+          node-version-file: docker/.node-version
 
-      - name: Pin npm exactly and prove the majors agree
+      - name: Pin npm to the hashed version
         run: |
-          # npm 11.19.0 is what Node 24.20.0 bundles; installed explicitly so
-          # the version is stated rather than inherited from the runner image.
-          npm install -g npm@11.19.0
+          npm install -g "npm@$(tr -d '[:space:]' < docker/.npm-version)"
           node --version && npm --version
-          # build.sh independently enforces the major from docker/.node-version.
-          # If CI's pin ever drifts to a different major, the build fails there
-          # with a clear message rather than silently producing a different
-          # dashboard bundle -- so this asserts the two agree up front.
-          want="$(tr -d '[:space:]' < docker/.node-version)"
-          have="$(node --version)"; have="${have#v}"
-          if [ "${have%%.*}" != "${want%%.*}" ]; then
-            echo "::error title=Node major drift::CI pins ${have} but docker/.node-version says ${want}"
-            exit 1
-          fi
+
+      # ubuntu-latest is x86_64 and both build paths request linux/arm64. The
+      # Dockerfile runs `pip install` for the target platform, so without
+      # binfmt emulation registered the first RUN fails with an exec-format
+      # error. buildx alone does not register it (#90 review).
+      - name: Set up QEMU for the arm64 build
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
@@ -89,6 +93,13 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
           aws-region: ap-south-1
+
+      # configure-aws-credentials authenticates the AWS CLI, not the Docker
+      # client. Without this the push reaches ECR with no registry credentials
+      # and fails (#90 review).
+      - name: Log Docker in to ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Resolve the registry at runtime
         if: github.event_name == 'push'

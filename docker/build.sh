@@ -88,8 +88,12 @@ docker info >/dev/null 2>&1 || {
 # The frontend is built on the HOST, outside Docker, so the Node that happens
 # to be installed is a build input as real as any pinned package -- and the
 # consumer only declares `engines: {node: ">=20.0.0"}`, a floor, which permits
-# any future major. docker/.node-version records the major that produced the
-# image now in production.
+# any future major. docker/.node-version records the EXACT version CI builds
+# with; this check compares only the major, so a developer on any 24.x can
+# still build locally while CI stays reproducible. Both that file and
+# docker/.npm-version live under docker/, so they are hashed into the image
+# tag -- a toolchain bump therefore mints a new tag rather than silently
+# reusing the old one (#90 review).
 NODE_VERSION_FILE="$REPO_ROOT/docker/.node-version"
 [[ -f "$NODE_VERSION_FILE" ]] || { echo "[build] missing $NODE_VERSION_FILE" >&2; exit 2; }
 # Compare majors on both sides. .node-version conventionally holds a full
