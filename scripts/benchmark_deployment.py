@@ -69,10 +69,14 @@ import urllib.request
 # upstream; it is a router defect, not a benchmark problem, but it decides what
 # can be measured here.
 #
-# Coverage is deliberately narrow for a second reason: with #61 unresolved,
-# every district, block and GP question clarifies whatever the phrasing, so
-# including one would benchmark the clarifier again. Widen this list when #61
-# lands.
+# #61 HAS LANDED, and the list is widened accordingly. Geography questions used
+# to clarify whatever the phrasing, because gram_panchayat carried no district or
+# block; the full-state artifact published 2026-09-06 fills them, and the four
+# geography questions below were each confirmed to reach tier2 against production
+# before being added here. One that did NOT is left out on purpose --
+# "What is the status of the GPDP in <district> in 2024?" still clarifies, so it
+# would benchmark the clarifier again, which is the trap this comment has always
+# been about.
 #
 # Six distinct templates: EXP-025, IMP-002, PLU-007, STS-003, STS-006, PLN-012.
 # Row counts range from 1 to 200, so the set spans a single aggregate through a
@@ -86,6 +90,12 @@ QUESTIONS = [
     "How many activities are in WORK COMPLETED status for 2024?",
     "What percentage of taken-up activities are completed in 2024?",
     "What is the status of the GPDP in 2024?",
+    # Geography, unmeasurable until #61 landed. Verified to reach tier2:
+    # PLN-001, PLN-004, EXP-025, STS-003.
+    "How many Gram Panchayats in Anugul have uploaded the GPDP in 2024-2025?",
+    "What percentage of Gram Panchayats in Cuttack have uploaded their GPDP in 2024-2025?",
+    "What is the total actual expenditure under each focus area in Khordha in 2024?",
+    "How many activities are in WORK COMPLETED status in Puri in 2024?",
 ]
 
 # The fields that constitute the answer, and nothing else.
