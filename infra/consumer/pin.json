@@ -1,6 +1,6 @@
 {
   "repo": "https://github.com/Data-Policy-and-Innovation-Centre/Odisha_PRDW.git",
-  "commit": "0f70811f7071f13e2d6620bef3f430375728284f",
-  "resolved_at": "2026-09-05T00:00:00Z",
-  "subject": "Merge pull request #2 from Data-Policy-and-Innovation-Centre/fix/startup-llm-timeout"
+  "commit": "6b8e02da60a3ccd859d0dd8c6425ca69bd9049c1",
+  "resolved_at": "2026-09-06T12:08:00Z",
+  "subject": "Merge pull request #3 from Data-Policy-and-Innovation-Centre/fix/prefer-shipped-views"
 }
