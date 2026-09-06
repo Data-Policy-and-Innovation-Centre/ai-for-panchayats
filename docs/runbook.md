@@ -52,23 +52,24 @@ inspection, not by reading the issue text:
   today is a human running `terraform apply`, exactly as #92 describes.
 - **There is no `production` environment gate.** No workflow in the tree uses
   `environment:` at all.
-- **The image tag IS now derived from input hashes** (#90). It is
-  `<12-hex digest of the build inputs>-<consumer short SHA>-arm64`, computed by
-  `scripts/compute_image_tag.py`. Recompute it for any checkout with:
+- **The image tag is derived from a hash of the build inputs (#90).** It is
+  `<12 hex of the input digest>-<consumer short ref><arch suffix>`, computed by
+  `scripts/compute_image_tag.py` over `docker/`, `src/deploy/`,
+  `scripts/fetch_snapshot.py`, `infra/snapshots/` and `infra/consumer/pin.json`.
+  Two commits that change none of those produce the **same** tag, which against
+  an IMMUTABLE repository is what makes a re-run a no-op rather than a failure.
+  The corollary matters at 3am: **the tag does not name a commit**, so a tag
+  cannot be mapped back to one by inspection -- see §"Finding the image for a
+  commit". Images built before #90 landed carry the older
+  `<repo short HEAD>-<consumer short ref><arch suffix>` form; both shapes are
+  accepted for rollback.
+
+  Recompute the tag for any checkout, and see exactly which files decide it:
 
   ```bash
-  python3 scripts/compute_image_tag.py            # the tag for this tree
-  python3 scripts/compute_image_tag.py --list-inputs   # the 17 files that decide it
+  python3 scripts/compute_image_tag.py --platform linux/arm64
+  python3 scripts/compute_image_tag.py --list-inputs
   ```
-
-  The consequence for an incident: **the first segment is no longer a commit
-  SHA and cannot be matched against one.** Two commits that changed no build
-  input share a tag deliberately, and a commit that changed one has a tag you
-  cannot derive by looking at git alone -- you have to check that commit out
-  and run the command above.
-
-  Images built before #90 landed still carry the old
-  `<repo short HEAD>-<consumer short ref>` shape, so ECR holds both forms.
 - **The ECS deployment circuit breaker is not enabled.**
   `aws_ecs_service.app` (`infra/terraform/app/service.tf:298-349`) declares no
   `deployment_circuit_breaker` block and no `deployment_controller`. Terraform
@@ -422,30 +423,41 @@ git log --oneline -- infra/snapshots/full_state.json
 git show <commit>:infra/snapshots/full_state.json | jq '{version_id, sha256}'
 ```
 
-Then find the image tag built from that commit. **Matching the commit's short
-SHA against the tag no longer works** — since #90 the first segment is a digest
-of the build inputs, not a commit (see §1). Three routes, in order of
-directness:
+Then find the image for that commit. Since #90 the first tag segment is a
+digest of the build inputs, **not** a short SHA, so matching a commit prefix
+against ECR no longer works. Three routes, cheapest first:
 
-1. **Ask the running task.** `GET /deployment.json` on the deployed URL returns
-   `build.repo_commit`, `build.consumer_commit` and `build.image_tag` (#85). If
-   the bad image is still serving, this is the fastest way to learn what it is,
-   and the only one that needs no clone.
+1. **Ask the running service.** `GET /deployment.json` reports the live
+   `image_tag` and `consumer_commit` (#85). This is the only route that needs
+   no local checkout, and it is the right one for "what is running now".
+2. **Recompute the tag at that commit.** The digest is a pure function of the
+   tracked inputs, so checking the commit out and re-running the resolver
+   reproduces the tag without building anything:
 
-2. **Recompute the tag from the commit you want.** Check out the known-good
-   commit and run `python3 scripts/compute_image_tag.py`. That is the tag,
-   exactly, provided the build inputs in that tree are what produced it.
+   ```bash
+   git checkout <commit>
+   python3 scripts/compute_image_tag.py --platform linux/arm64
+   ```
 
-3. **Read the labels off candidate images.** Every image since #85 carries
-   `org.opencontainers.image.revision` (this repo's commit) and
-   `in.dpic.panchayats.consumer-commit`. Pull a candidate and
-   `docker inspect --format '{{json .Config.Labels}}'`, or read `/app/BUILD_INFO`
-   inside it. This is the route that works when the tree has moved on and
-   route 2 would recompute a different digest.
+3. **Read the image's own provenance.** Every image carries the commit it was
+   built from as an OCI label and in `/app/BUILD_INFO`:
 
-If none matches, do not conclude the image is gone; match on the snapshot
-instead, by starting each candidate and reading its startup line, or by
-`docker pull`ing it and reading `/app/manifest/full_state.json` directly.
+   ```bash
+   docker pull <registry>/prdw-chatbot:<tag>
+   docker inspect --format '{{json .Config.Labels}}' <registry>/prdw-chatbot:<tag>
+   ```
+
+   Note the asymmetry, because it will mislead you otherwise: a tag maps to
+   exactly one set of *inputs*, but the commit recorded inside it is whichever
+   qualifying commit happened to build and publish first. Treat that label as
+   "a commit whose inputs produced this image", not "the commit deployed".
+
+   This is also the route that still works when the tree has moved on and
+   route 2 would recompute a different digest than the one you are hunting.
+
+If none of these resolves it, do not conclude the image is gone; match on the
+snapshot instead, by starting each candidate tag and reading its startup line,
+or by `docker pull`ing it and reading `/app/manifest/full_state.json` directly.
 
 > **OPEN QUESTION 3.** There is no recorded mapping from image tag to
 > deployment time. The only sources would be ECR push timestamps and, once #92
