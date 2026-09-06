@@ -8,6 +8,67 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# --- consumer pin (#83) -----------------------------------------------------
+# Which commit of the consumer we build is a fact about this repository, so it
+# lives in git rather than only inside an ECR tag string. This block runs
+# FIRST, above the tool checks, because it does no work: it reads a file and
+# matches a regex. Validating the ref before discovering there is no docker
+# means `CONSUMER_REF=master` is reported as the ref problem it is, on any
+# machine, instead of as a missing prerequisite.
+PIN_FILE="${PIN_FILE:-$REPO_ROOT/infra/consumer/pin.json}"
+
+# Recorded before the pin is consulted, so the error below names the thing the
+# caller actually has to change. The pin branch is entered when EITHER value is
+# missing, so deriving the source from that branch would blame the pin file for
+# an env var the caller set.
+if [[ -n "${CONSUMER_REF:-}" ]]; then
+  CONSUMER_REF_SOURCE="the CONSUMER_REF environment variable"
+else
+  CONSUMER_REF_SOURCE="$PIN_FILE"
+fi
+
+if [[ -z "${CONSUMER_REF:-}" || -z "${CONSUMER_REPO:-}" ]]; then
+  [[ -f "$PIN_FILE" ]] || {
+    echo "[build] no CONSUMER_REF set and no pin at $PIN_FILE" >&2
+    echo "[build] Set CONSUMER_REF to a 40-hex commit, or restore the pin." >&2
+    exit 2; }
+  command -v python3 >/dev/null 2>&1 || {
+    echo "[build] python3 is required to read $PIN_FILE" >&2; exit 2; }
+  # Read both fields in one pass. A pin missing either key, or holding a
+  # non-string, is a broken pin and must not fall back to a default.
+  PIN_VALUES="$(python3 -c '
+import json, sys
+pin = json.load(open(sys.argv[1]))
+for key in ("repo", "commit"):
+    value = pin.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"pin is missing a usable {key!r}")
+    print(value.strip())
+' "$PIN_FILE")" || {
+    echo "[build] $PIN_FILE is not a usable consumer pin" >&2; exit 2; }
+  CONSUMER_REPO="${CONSUMER_REPO:-$(printf '%s\n' "$PIN_VALUES" | sed -n 1p)}"
+  CONSUMER_REF="${CONSUMER_REF:-$(printf '%s\n' "$PIN_VALUES" | sed -n 2p)}"
+fi
+
+# A full 40-hex SHA, lowercase, and nothing else. The tag is built with the
+# string slice ${CONSUMER_REF:0:7}, so a branch name does not fail -- it
+# produces a tag ending "-master" naming an image nobody can trace back to a
+# commit. Git writes SHAs lowercase, so requiring lowercase costs nothing and
+# keeps the pin comparison below a plain string equality.
+if [[ ! "$CONSUMER_REF" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[build] CONSUMER_REF must be a full 40-character lowercase hex commit SHA." >&2
+  echo "[build] got '$CONSUMER_REF' (${#CONSUMER_REF} chars), from $CONSUMER_REF_SOURCE." >&2
+  echo "[build] A branch or short SHA cannot be traced back from the image tag." >&2
+  exit 2
+fi
+
+# The seam the tests use: everything above is pure validation, so resolving
+# the ref is observable without a clone, a network call or a docker daemon.
+if [[ "${1:-}" == "--print-consumer-ref" ]]; then
+  echo "$CONSUMER_REF"
+  exit 0
+fi
+
 # Prerequisites, checked before anything else happens (#84). The clone and
 # `npm ci` take minutes; discovering there is no docker afterwards wastes all
 # of it. This sits above every other line that does work -- in particular above
@@ -46,8 +107,6 @@ if [[ "$HAVE_NODE_MAJOR" != "$WANT_NODE_MAJOR" ]]; then
   exit 2
 fi
 echo "[build] node $HAVE_NODE (major $WANT_NODE_MAJOR pinned), npm $(npm --version)"
-CONSUMER_REPO="${CONSUMER_REPO:-https://github.com/Data-Policy-and-Innovation-Centre/Odisha_PRDW.git}"
-CONSUMER_REF="${CONSUMER_REF:?set CONSUMER_REF to the consumer commit to build}"
 IMAGE="${IMAGE:-odisha-prdw-chatbot}"
 # ARM64 by default, because that is what the service runs: variables.tf
 # defaults cpu_architecture to ARM64 (Graviton is 44% cheaper per vCPU-hour in
@@ -67,7 +126,7 @@ case "$PLATFORM" in
   *) echo "[build] unsupported PLATFORM '$PLATFORM' (expected linux/arm64 or linux/amd64)" >&2; exit 2 ;;
 esac
 
-TAG="${TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD)-${CONSUMER_REF:0:7}${ARCH_SUFFIX}}"
+TAG="${TAG:-$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)-${CONSUMER_REF:0:7}${ARCH_SUFFIX}}"
 
 # An explicitly supplied TAG still has to agree with the platform being built.
 if [[ "$ARCH_SUFFIX" == "-arm64" && "$TAG" != *-arm64 ]]; then
@@ -84,9 +143,19 @@ fi
 CTX="$(mktemp -d)"
 trap 'rm -rf "$CTX"' EXIT
 
-echo "[build] cloning consumer at $CONSUMER_REF"
+echo "[build] cloning consumer at $CONSUMER_REF (from $CONSUMER_REF_SOURCE)"
 git clone --quiet "$CONSUMER_REPO" "$CTX/consumer"
 git -C "$CTX/consumer" checkout --quiet "$CONSUMER_REF"
+
+# What the clone resolved to, not what we asked for. `checkout <sha>` of a
+# 40-hex ref should be an identity, so a mismatch means the ref named
+# something other than a commit -- a tag or branch that happens to be 40 hex
+# characters -- and the image would carry a provenance label that is a lie.
+RESOLVED="$(git -C "$CTX/consumer" rev-parse HEAD)"
+if [[ "$RESOLVED" != "$CONSUMER_REF" ]]; then
+  echo "[build] $CONSUMER_REF_SOURCE names $CONSUMER_REF but the clone resolved to $RESOLVED." >&2
+  exit 2
+fi
 
 # The dashboard reads `import.meta.env.VITE_API_BASE_URL || "http://localhost:8000"`.
 # An empty string is FALSY, so building with "" does not select the current
