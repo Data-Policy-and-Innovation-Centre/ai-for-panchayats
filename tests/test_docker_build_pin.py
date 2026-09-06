@@ -23,7 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD_SH = ROOT / "docker" / "build.sh"
 PIN = ROOT / "infra" / "consumer" / "pin.json"
 
-PINNED_COMMIT = "0f70811f7071f13e2d6620bef3f430375728284f"
+# Deliberately hardcoded rather than read from pin.json: the point is that a
+# change to the pin cannot pass silently. Bumping it is a two-file edit on
+# purpose, so the diff says a consumer version changed.
+PINNED_COMMIT = "6b8e02da60a3ccd859d0dd8c6425ca69bd9049c1"
 
 
 def _resolve(ref: str | None = None, *, pin_file: Path | None = None):
