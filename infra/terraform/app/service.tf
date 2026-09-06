@@ -155,6 +155,25 @@ resource "aws_ecs_task_definition" "app" {
 
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
 
+    # No `healthCheck` here, deliberately (#86).
+    #
+    # Fargate ignores the image's HEALTHCHECK instruction entirely and reads
+    # only this field, so the Dockerfile's is inert in production. The obvious
+    # response is to restate it here -- and it would be wrong for a
+    # load-balanced service.
+    #
+    # ALB target health already decides whether this task receives traffic and
+    # whether the deployment circuit breaker trips. A container healthCheck
+    # would add a SECOND, independent way for the same task to be declared
+    # dead, with its own startPeriod that must be kept in agreement with
+    # health_check_grace_period_seconds by hand. Two timers governing one
+    # startup is how a task gets killed at 300s by the timer nobody remembered
+    # while the other still had 120s of grace left.
+    #
+    # Add one only if a failure mode appears that ALB health cannot see -- a
+    # process alive and serving 200s while its database handle is gone, say.
+    # Until then the single signal is the correct number of signals.
+
     environment = [
       { name = "DB_ENGINE", value = "duckdb_file" },
       { name = "SNAPSHOT_PATH", value = "/var/snapshot/database.duckdb" },
@@ -303,7 +322,107 @@ resource "aws_ecs_service" "app" {
   launch_type     = "FARGATE"
 
   # Long enough for the snapshot download and verification to finish.
+  #
+  # How the three startup windows relate (#86), because they are set in three
+  # different places and only agree by intention:
+  #
+  #   1. This grace period, 420s, is the only one that matters to ECS. During
+  #      it, ALB target health cannot mark the task unhealthy at all. It has to
+  #      exceed the real startup cost: ~1 GB downloaded and SHA-256'd, then the
+  #      application's vector retriever rebuilt, measured end to end at about
+  #      two minutes. 420s is roughly 3.5x that, which is the headroom that
+  #      absorbs a slow S3 day rather than restarting into one.
+  #
+  #   2. The target group's window is `interval 30 x unhealthy_threshold 5` =
+  #      150s to declare a target unhealthy, and `30 x healthy_threshold 2` =
+  #      60s to declare it healthy.
+  #
+  #      These clocks run in PARALLEL with the grace period, not after it. The
+  #      ALB starts health-checking the moment the task registers as a target,
+  #      which is essentially when the grace period starts. The grace period
+  #      does not pause or reset that state machine -- it only governs when the
+  #      ECS *scheduler* is allowed to act on a status the ALB has already
+  #      computed.
+  #
+  #      So for a task that never opens its port: unhealthy at ~150s, ignored
+  #      until grace expires, then pulled essentially at ~420s. Not 420 + 150.
+  #      The grace period is therefore doing exactly one job -- protecting a
+  #      SLOW but healthy task, which is the ~2 minute snapshot download --
+  #      and it is not a detection delay for a broken one.
+  #
+  #   3. The Dockerfile's HEALTHCHECK is INERT here. Fargate reads the task
+  #      definition's `healthCheck`, never the image's, and this task
+  #      definition deliberately defines none -- see the note in
+  #      container_definitions above. So ALB target health is the only signal
+  #      the circuit breaker can act on, and item 2 is the whole story.
   health_check_grace_period_seconds = local.start_period_seconds
+
+  # An apply used to report success as soon as AWS accepted the update --
+  # about 30 seconds -- while the previous task kept serving. A rollout that
+  # never became healthy was indistinguishable, from Terraform's point of
+  # view, from one that succeeded (#86).
+  wait_for_steady_state = true
+
+  # Stated rather than inherited from the provider's defaults, because the
+  # pair is a deployment strategy and reading it out of documentation for a
+  # different version is how it silently changes.
+  #
+  # 100/200 with desired_count = 1 means: start the new task, keep the old one
+  # serving, and only drain it once the new one is healthy. It costs a second
+  # Fargate task for the ~2 minutes of overlap (about $0.008 a deploy) and
+  # buys zero-downtime rollouts. The alternative, 0/100, stops the old task
+  # first and is a guaranteed outage on a single-task service.
+  #
+  # #93's post-deploy check exists because of this choice: with the old task
+  # serving throughout, a browser check against the public URL can pass in
+  # full while the deployment under test never rolled at all.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  # Fail a bad rollout instead of leaving it retrying forever, and put the
+  # previous task definition back.
+  #
+  # THE TRAP, and it is the reason this block gets a comment rather than a
+  # line: when the breaker trips, ECS marks the deployment failed and rolls
+  # back, then the service reaches steady state again -- on the OLD task
+  # definition. `wait_for_steady_state` above is satisfied by that. So
+  # `terraform apply` can exit 0, and Terraform state will record the image
+  # tag it just applied, while the service is running the previous one.
+  # Terraform is not wrong here so much as blind: it asked for a change, the
+  # change was accepted, and the service is stable.
+  #
+  # This is a known, unfixed provider limitation rather than a guess:
+  # hashicorp/terraform-provider-aws#19519 reports exactly it, and the feature
+  # request to make the waiter fail on a rolled-back deployment, #20858, was
+  # closed as not planned. So it will not quietly fix itself under a provider
+  # bump, and the external check is load-bearing rather than belt-and-braces.
+  #
+  # What detects it is #93's post-deploy verification, which asserts the
+  # service's primary deployment carries the task-definition revision THIS run
+  # registered -- not merely that a deployment finished. Nothing inside
+  # Terraform can catch this, which is why the check lives outside it.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  # With wait_for_steady_state, an apply now blocks for as long as the rollout
+  # takes. Sized against the windows documented above: the 420s grace period,
+  # by the end of which a broken task is already known-unhealthy and is pulled
+  # immediately -- NOT 420 + 150, for the reason item 2 gives -- plus whatever
+  # retries the breaker allows before it trips, which AWS does not publish as a
+  # fixed number and which is therefore headroom rather than a computed sum,
+  # plus room for the pull of a ~600 MB image and the ~2 minute snapshot
+  # download each attempt repeats in full (a retried task is a fresh task with
+  # fresh ephemeral storage, so nothing is cached). The provider's default
+  # of 20m is the same number; it is written down
+  # so that a rollout hanging for half an hour is a failed apply with a
+  # timeout, rather than a job someone cancels -- and a cancelled apply is
+  # exactly what leaves the orphaned S3 lockfile #92 has to deal with.
+  timeouts {
+    update = "20m"
+    create = "20m"
+  }
 
   network_configuration {
     subnets = aws_subnet.public[*].id
