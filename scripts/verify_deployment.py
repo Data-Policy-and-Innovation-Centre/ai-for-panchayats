@@ -26,6 +26,7 @@ import argparse
 import base64
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -35,6 +36,26 @@ TIMEOUT_SECONDS = 30
 
 class VerificationError(AssertionError):
     """A deployment assertion failed. Each one is independently fatal."""
+
+
+ROLLOUT_TIMEOUT_SECONDS = 300
+ROLLOUT_POLL_SECONDS = 10
+
+
+class RolloutInProgress(VerificationError):
+    """ECS has not finished flipping rolloutState yet -- the one retryable state.
+
+    `wait_for_steady_state = true` returns when the SERVICE is stable, which is
+    not the same instant the deployment's rolloutState becomes COMPLETED. The
+    first deploy of the caveat fix failed here on a rollout that reached
+    COMPLETED seconds later: a good deployment reported as a failure. A check
+    that fails good deploys is worse than no check, because it is the one people
+    learn to ignore.
+
+    Only IN_PROGRESS is retried. FAILED is a circuit-breaker trip, and a
+    COMPLETED rollout on the wrong revision is a rollback -- both are final, so
+    waiting on them would only delay the report.
+    """
 
 
 def check_rollout(service: dict[str, Any], expected_task_definition: str) -> list[str]:
@@ -47,7 +68,8 @@ def check_rollout(service: dict[str, Any], expected_task_definition: str) -> lis
 
     state = primary.get("rolloutState")
     if state != "COMPLETED":
-        raise VerificationError(
+        error = RolloutInProgress if state == "IN_PROGRESS" else VerificationError
+        raise error(
             f"primary deployment rolloutState is {state!r}, not 'COMPLETED'"
             + (
                 f" -- rolloutStateReason: {primary.get('rolloutStateReason')!r}"
@@ -74,6 +96,40 @@ def check_rollout(service: dict[str, Any], expected_task_definition: str) -> lis
         f"rollout      COMPLETED on {actual}",
         f"runningCount {running}",
     ]
+
+
+def wait_for_rollout(
+    ecs: Any,
+    cluster: str,
+    service_name: str,
+    expected_task_definition: str,
+    *,
+    timeout: float = ROLLOUT_TIMEOUT_SECONDS,
+    interval: float = ROLLOUT_POLL_SECONDS,
+    sleep: Any = time.sleep,
+    clock: Any = time.monotonic,
+) -> tuple[dict[str, Any], list[str]]:
+    """Re-read the service until the rollout settles, or give up loudly.
+
+    Retries ONLY RolloutInProgress. Every other failure -- a trip, a rollback, a
+    service scaled to zero -- is reported on the first read, so this cannot turn
+    a real failure into a five-minute wait.
+    """
+
+    deadline = clock() + timeout
+    while True:
+        described = ecs.describe_services(cluster=cluster, services=[service_name])
+        services = described.get("services", [])
+        if not services:
+            raise VerificationError(f"no service {service_name!r} in cluster {cluster!r}")
+        try:
+            return services[0], check_rollout(services[0], expected_task_definition)
+        except RolloutInProgress as pending:
+            if clock() >= deadline:
+                raise VerificationError(
+                    f"{pending} -- still not COMPLETED after {timeout:.0f}s"
+                ) from pending
+            sleep(interval)
 
 
 def fetch_json(url: str, auth: str | None = None) -> Any:
@@ -217,11 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     lines: list[str] = []
     try:
         ecs = boto3.client("ecs", region_name=args.region)
-        described = ecs.describe_services(cluster=args.cluster, services=[args.service])
-        services = described.get("services", [])
-        if not services:
-            raise VerificationError(f"no service {args.service!r} in cluster {args.cluster!r}")
-        lines += check_rollout(services[0], args.task_definition)
+        _service, rollout_lines = wait_for_rollout(
+            ecs, args.cluster, args.service, args.task_definition
+        )
+        lines += rollout_lines
 
         auth = None
         if args.auth_user and args.auth_password:
