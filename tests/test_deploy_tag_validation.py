@@ -62,3 +62,25 @@ def test_the_guard_is_anchored_at_both_ends() -> None:
     # whole point of validating before the value reaches a shell.
     src = _guard().pattern
     assert src.startswith("^") and src.endswith("$")
+
+
+def test_every_var_file_the_workflow_names_is_tracked() -> None:
+    """A -var-file the repository does not contain fails every deploy.
+
+    This is not hypothetical: infra/terraform/.gitignore ignores *.tfvars, so
+    the file was added, silently skipped by `git add -A`, and pushed as a
+    dangling reference. `git ls-files` is the check, not os.path.exists --
+    the file is present on disk either way.
+    """
+    import subprocess
+
+    root = WORKFLOW.parents[2]
+    named = re.findall(r"-var-file=(\S+)", WORKFLOW.read_text())
+    assert named, "the deploy plan should pin the production variable set"
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+    ).stdout.split()
+    for var_file in named:
+        # -chdir puts the module directory in front of the relative path.
+        path = f"infra/terraform/app/{var_file}"
+        assert path in tracked, f"{path} is named by the workflow but is not tracked by git"
