@@ -46,8 +46,16 @@ data "aws_iam_policy_document" "plan" {
       # here -- including janasunani-ci-deploy's exact trust policy and
       # permissions. The same reasoning that ruled out ReadOnlyAccess above
       # applies to IAM and was missed the first time.
-      "iam:ListRoles",
-      "iam:ListPolicies",
+      #
+      # iam:ListRoles and iam:ListPolicies USED TO SIT HERE, directly under
+      # that comment and contradicting it: ListRoles returns each role's
+      # AssumeRolePolicyDocument, so `aws iam list-roles` dumps the account's
+      # entire trust graph -- exactly the thing the comment says is excluded.
+      # Verified by running it. Reachable by any contributor with push, whose
+      # PR runs from its own head, into a log that is world-readable because
+      # this repository is public. Terraform refreshes NAMED roles with
+      # GetRole, which ReadTheAppModulesOwnRolesInDetail below already grants,
+      # so nothing legitimate needed the enumeration.
       "kms:DescribeKey",
       "kms:GetKeyPolicy",
       "kms:ListAliases",
@@ -277,6 +285,35 @@ data "aws_iam_policy_document" "apply" {
       test     = "Null"
       variable = "aws:ResourceTag/Project"
       values   = ["false"]
+    }
+  }
+
+  # cloudwatch:* on "*" was the only broad grant in this policy with no
+  # matching Deny -- ec2 has three, elasticloadbalancing two, cloudfront two,
+  # ecs/ecr three. Verified before fixing: cloudwatch:DeleteAlarms against a
+  # janasunani alarm returned `allowed`. That is the permission an attacker
+  # uses FIRST, because it removes the alerting that would reveal every other
+  # action in this policy being used. alarms.tf creates only metric alarms and
+  # default_tags stamps them, so the same tag handle works here.
+  #
+  # TagResource/UntagResource are inside this statement for the same reason
+  # they are inside the CloudFront one: a Deny keyed on a mutable tag is only
+  # as strong as the tagging permission in front of it.
+  statement {
+    sid    = "NeverTouchAnotherProjectsAlarms"
+    effect = "Deny"
+    actions = [
+      "cloudwatch:DeleteAlarms", "cloudwatch:PutMetricAlarm",
+      "cloudwatch:SetAlarmState", "cloudwatch:DisableAlarmActions",
+      "cloudwatch:EnableAlarmActions", "cloudwatch:PutDashboard",
+      "cloudwatch:DeleteDashboards", "cloudwatch:TagResource",
+      "cloudwatch:UntagResource",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = ["odisha-prdw"]
     }
   }
 

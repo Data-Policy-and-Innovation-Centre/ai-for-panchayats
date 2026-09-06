@@ -238,12 +238,38 @@ variable "iam_permissions_boundary" {
   description = <<-EOT
     Permissions boundary attached to every IAM role this module creates.
 
-    Empty means no boundary, which is what a human applying locally gets. CI
-    passes the boundary published by infra/terraform/ci, whose apply role may
-    only call iam:CreateRole when the request carries exactly that ARN -- so
-    without this variable the CI apply fails AccessDenied on the first role,
-    after the network is already built (#89).
+    Empty means "the conventional boundary for this account", NOT "no
+    boundary". Override only to point at a differently-named policy.
+
+    It used to mean no boundary, and that was a hole rather than a
+    convenience. Nothing in the repository ever set it -- not a workflow, not
+    a tfvars, not the runbook -- so every role this module has created carries
+    no boundary at all, verified against the live roles. The apply role may
+    call iam:PutRolePolicy and iam:AttachRolePolicy on prdw-chatbot* WITHOUT
+    a boundary condition, because iam:PermissionsBoundary is not populated for
+    those calls. So an unbounded task role could be given Action:* Resource:*,
+    passed to ECS and run -- account admin in an account shared with sibling
+    projects. Every Deny in infra/terraform/ci bounds the APPLY role, none of
+    them bind the role it just rewrote. Found by security review on #89.
   EOT
   type        = string
   default     = ""
+}
+
+variable "iam_permissions_boundary_name" {
+  description = <<-EOT
+    Name of the boundary policy published by infra/terraform/ci.
+
+    Coupled to that module's "<github_repository>-ci-apply-boundary" by
+    hand, because the two are separate root modules with separate state and
+    neither can read the other's variables. tests/test_infra_naming_coupling.py
+    is what keeps them equal.
+  EOT
+  type        = string
+  default     = "ai-for-panchayats-ci-apply-boundary"
+
+  validation {
+    condition     = length(var.iam_permissions_boundary_name) > 0
+    error_message = "The boundary name cannot be empty: an empty name builds a malformed ARN and CreateRole fails at apply time with a confusing error."
+  }
 }

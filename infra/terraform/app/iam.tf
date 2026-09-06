@@ -22,6 +22,18 @@ locals {
   kms_key_arn       = data.terraform_remote_state.snapshot.outputs.kms_key_arn
 }
 
+# The boundary is mandatory. `var.iam_permissions_boundary` empty no longer
+# means "none" -- it means "the conventional policy in this account" -- so a
+# role cannot be created or converged without a ceiling on it. Partition is
+# spelled literally to match audit.tf, which does the same.
+locals {
+  iam_boundary_arn = (
+    var.iam_permissions_boundary != ""
+    ? var.iam_permissions_boundary
+    : "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/${var.iam_permissions_boundary_name}"
+  )
+}
+
 data "aws_iam_policy_document" "ecs_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -35,7 +47,7 @@ data "aws_iam_policy_document" "ecs_assume" {
 resource "aws_iam_role" "execution" {
   name                 = "${var.name}-execution"
   assume_role_policy   = data.aws_iam_policy_document.ecs_assume.json
-  permissions_boundary = var.iam_permissions_boundary != "" ? var.iam_permissions_boundary : null
+  permissions_boundary = local.iam_boundary_arn
 }
 
 resource "aws_iam_role_policy_attachment" "execution_managed" {
@@ -61,7 +73,7 @@ resource "aws_iam_role_policy" "execution_secrets" {
 resource "aws_iam_role" "task" {
   name                 = "${var.name}-task"
   assume_role_policy   = data.aws_iam_policy_document.ecs_assume.json
-  permissions_boundary = var.iam_permissions_boundary != "" ? var.iam_permissions_boundary : null
+  permissions_boundary = local.iam_boundary_arn
 }
 
 # Read-only, and only the one prefix that holds deployable snapshots. No write,

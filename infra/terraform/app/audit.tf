@@ -285,7 +285,7 @@ resource "aws_iam_role" "flow" {
 
   name                 = "${var.name}-flow-logs"
   assume_role_policy   = data.aws_iam_policy_document.flow_assume.json
-  permissions_boundary = var.iam_permissions_boundary != "" ? var.iam_permissions_boundary : null
+  permissions_boundary = local.iam_boundary_arn
 }
 
 resource "aws_iam_role_policy" "flow" {

@@ -80,6 +80,12 @@ data "aws_iam_policy_document" "apply_boundary" {
       "s3:GetObject",
       "s3:GetObjectVersion",
       "s3:ListBucket",
+      # Present because prdw-chatbot-task's inline policy already grants it and
+      # a boundary is an INTERSECTION: attaching this boundary without it would
+      # silently strip GetBucketLocation from the running task, and boto3 uses
+      # it for region resolution. Verified against the live role before the
+      # boundary was made mandatory, rather than discovered in production.
+      "s3:GetBucketLocation",
     ]
     resources = [
       "arn:${data.aws_partition.current.partition}:s3:::dpic-prdw-snapshots",

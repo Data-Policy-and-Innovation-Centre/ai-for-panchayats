@@ -77,3 +77,57 @@ def test_no_policy_hardcodes_the_app_name():
         f"{app_name!r} appears literally in a policy expression; scope through "
         "var.app_name_prefix so the coupling test above can catch drift"
     )
+
+
+def test_the_boundary_name_matches_between_the_two_modules() -> None:
+    """app's boundary name must equal ci's "<github_repository>-ci-apply-boundary".
+
+    The app module attaches the boundary by NAME, built into an ARN from the
+    caller's account id, because it cannot read the ci module's variables. If
+    the two drift the failure is loud but late: CreateRole fails at apply time
+    against a policy ARN that does not exist, after part of the stack is built.
+
+    This exists because the boundary stopped being optional. While it defaulted
+    to "" a wrong name was harmless; now it is the only thing standing between
+    the apply role and account admin, so it has to be pinned.
+    """
+    app_name = re.search(
+        r'variable "iam_permissions_boundary_name".*?default\s*=\s*"([^"]+)"',
+        (ROOT / "infra/terraform/app/variables.tf").read_text(),
+        re.S,
+    ).group(1)
+
+    ci_repo = re.search(
+        r'variable "github_repository".*?default\s*=\s*"([^"]+)"',
+        (ROOT / "infra/terraform/ci/variables.tf").read_text(),
+        re.S,
+    ).group(1)
+
+    ci_policy = re.search(
+        r'resource "aws_iam_policy" "apply_boundary".*?name\s*=\s*"([^"]+)"',
+        (ROOT / "infra/terraform/ci/roles.tf").read_text(),
+        re.S,
+    ).group(1)
+
+    expected = ci_policy.replace("${var.github_repository}", ci_repo)
+    assert app_name == expected, (
+        f"app/variables.tf names the boundary {app_name!r} but ci/roles.tf creates "
+        f"{expected!r}; CreateRole would fail against a non-existent policy ARN"
+    )
+
+
+def test_the_boundary_is_not_optional() -> None:
+    """No role may be created without a ceiling.
+
+    The regression this pins: `permissions_boundary = var.x != "" ? var.x : null`
+    silently created unbounded roles, and nothing in the repository ever set the
+    variable. Verified against the live roles at the time: all three carried
+    PermissionsBoundary = None.
+    """
+    for rel in ("infra/terraform/app/iam.tf", "infra/terraform/app/audit.tf"):
+        src = (ROOT / rel).read_text()
+        for line in src.splitlines():
+            if "permissions_boundary" in line and "=" in line and not line.strip().startswith("#"):
+                assert "null" not in line, (
+                    f"{rel} can still create a role with no boundary: {line.strip()!r}"
+                )
