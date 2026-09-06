@@ -26,7 +26,7 @@ PIN = ROOT / "infra" / "consumer" / "pin.json"
 # Deliberately hardcoded rather than read from pin.json: the point is that a
 # change to the pin cannot pass silently. Bumping it is a two-file edit on
 # purpose, so the diff says a consumer version changed.
-PINNED_COMMIT = "6b8e02da60a3ccd859d0dd8c6425ca69bd9049c1"
+PINNED_COMMIT = "5aab8df474b5aa0f5179d71b509c5a49bc2acf84"
 
 
 def _resolve(ref: str | None = None, *, pin_file: Path | None = None):
