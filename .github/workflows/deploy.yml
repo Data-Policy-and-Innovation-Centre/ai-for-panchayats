@@ -115,7 +115,13 @@ jobs:
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
         run: |
-          if ! printf '%s' "$TAG" | grep -Eq '^[0-9a-f]{12}-[0-9a-f]{7}-arm64$'; then
+          # TWO shapes, deliberately. <12hex>-<7hex>-arm64 is what #90 mints
+          # now; <7hex>-<7hex>-arm64 is the pre-#90 form, and every image that
+          # predates this change carries it -- including the one in production
+          # right now. Accepting only the new shape would mean the first
+          # content-tagged deploy could not be rolled back to the image it
+          # replaced, which is exactly when rollback matters most (#92 review).
+          if ! printf '%s' "$TAG" | grep -Eq '^([0-9a-f]{12}|[0-9a-f]{7})-[0-9a-f]{7}-arm64$'; then
             echo "::error title=Malformed tag::'$TAG' is not <12hex>-<7hex>-arm64"
             exit 1
           fi
