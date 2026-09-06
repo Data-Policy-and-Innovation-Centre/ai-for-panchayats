@@ -1,0 +1,103 @@
+name: Terraform Plan
+
+# Shows what an infrastructure change would do, before it is merged (#91).
+on:
+  pull_request:
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+concurrency:
+  group: tf-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write   # to post the plan where a reviewer sees it
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    # A fork PR receives no OIDC id-token, so an AWS-touching job would sit
+    # permanently red on contributions we do not control. Skipped, not failed
+    # -- a required check that can never pass on a fork makes such a PR
+    # unmergeable, which is a worse outcome than not planning it.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [app, snapshot]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          terraform_wrapper: false
+
+      # -lockfile=readonly: a PR must not be able to change the provider
+      # selections the apply on main will use.
+      - name: Init
+        run: terraform -chdir=infra/terraform/${{ matrix.module }} init -input=false -lockfile=readonly
+
+      # The app module's image_tag is required with no default, so a PR that
+      # touches only infra/ has no tag to supply and plan would hard-fail.
+      # Resolve the CURRENTLY DEPLOYED tag rather than inventing one: planning
+      # against a tag nobody is running would show a spurious task-definition
+      # replacement in every infrastructure PR.
+      - name: Resolve the deployed image tag
+        if: matrix.module == 'app'
+        id: tag
+        run: |
+          td="$(aws ecs describe-services --cluster prdw-chatbot --services prdw-chatbot \
+                  --query 'services[0].taskDefinition' --output text)"
+          image="$(aws ecs describe-task-definition --task-definition "$td" \
+                  --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+          echo "tag=${image##*:}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Planning against the deployed tag::${image##*:} (from $td)"
+
+      # -lock=false: a plan must never take the S3 lock, or a pull request can
+      # block an apply on main.
+      - name: Plan
+        id: plan
+        shell: bash
+        run: |
+          args=(-input=false -lock=false -no-color)
+          if [ "${{ matrix.module }}" = "app" ]; then
+            args+=(-var "image_tag=${{ steps.tag.outputs.tag }}")
+          fi
+          # GitHub runs `shell: bash` as `bash -eo pipefail`, so a failing
+          # plan would abort this step at the pipeline and the exit code would
+          # never be recorded -- leaving the explicit failure step below
+          # comparing an empty string. Disable errexit around the pipeline and
+          # read PIPESTATUS[0], which is terraform's status rather than tee's.
+          set +e
+          terraform -chdir=infra/terraform/${{ matrix.module }} plan "${args[@]}" \
+            2>&1 | tee /tmp/plan-${{ matrix.module }}.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "exit=$status" >> "$GITHUB_OUTPUT"
+
+      # Terraform redacts values it knows are sensitive as `(sensitive value)`
+      # in -no-color output, so the plan text is safe to publish. The summary
+      # is used rather than a PR comment so nothing has to be granted write
+      # access to conversations to render it.
+      - name: Publish the plan
+        if: always()
+        run: |
+          {
+            echo "### terraform plan — \`${{ matrix.module }}\`"
+            echo
+            echo '```terraform'
+            tail -c 60000 /tmp/plan-${{ matrix.module }}.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if the plan failed
+        run: test "${{ steps.plan.outputs.exit }}" = "0"
