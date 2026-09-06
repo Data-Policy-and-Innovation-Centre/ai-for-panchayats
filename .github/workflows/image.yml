@@ -9,6 +9,14 @@ name: Image
 # instead of a hard failure.
 on:
   pull_request:
+    paths:
+      - 'docker/**'
+      - 'src/deploy/**'
+      - 'scripts/fetch_snapshot.py'
+      - 'infra/snapshots/**'
+      - 'infra/consumer/pin.json'
+      - 'scripts/compute_image_tag.py'
+      - '.github/workflows/image.yml'
   push:
     branches:
       - main
@@ -52,12 +60,6 @@ jobs:
       # Exact, not the major that build.sh enforces. The dashboard bundle is a
       # build output: a different Node can change it, and the image is supposed
       # to be reproducible from its inputs.
-      # Pinned HERE rather than in docker/.node-version, deliberately. That
-      # file records the Node MAJOR that produced the image now in production
-      # and build.sh enforces only the major, so writing an exact patch there
-      # would assert something about the deployed image that nobody verified.
-      # CI, which has to be reproducible, pins exactly; a developer keeps the
-      # looser local check.
       # Read from docker/.node-version and docker/.npm-version rather than
       # written here. Both live under docker/, which compute_image_tag.py
       # hashes -- so a toolchain bump changes the tag and forces a rebuild.
