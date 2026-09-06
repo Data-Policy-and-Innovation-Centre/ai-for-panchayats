@@ -241,6 +241,45 @@ data "aws_iam_policy_document" "apply" {
     }
   }
 
+  # The Deny above keys on a MUTABLE tag, and the Allow grants ec2:*,
+  # elasticloadbalancing:* and tag:*. Without this an attacker stamps
+  # Project=odisha-prdw onto another project's security group, route table or
+  # load balancer, the StringNotEquals above stops matching, and every revoke
+  # or modify in that list becomes permitted. Same bypass already closed for
+  # CloudFront; Codex found the EC2/ELB half in round 3.
+  #
+  # TWO conditions, ANDed, and the second one is load-bearing. Denying on
+  # StringNotEquals alone would also deny tagging an UNTAGGED resource,
+  # because a missing key makes StringNotEquals true -- and that is how the
+  # provider tags anything it creates without tag-on-create support, so the
+  # apply would fail on its own new resources. Null=false narrows this to
+  # resources that already carry a Project tag belonging to someone else.
+  #
+  # Residual, stated rather than hidden: a resource with NO Project tag can
+  # still be captured and then mutated. Closing that needs certainty about
+  # whether the provider ever calls CreateTags against a fresh untagged
+  # resource, which only a real apply establishes. Tracked in #193.
+  statement {
+    sid    = "NeverRetagAnotherProjectsNetworkOrEdge"
+    effect = "Deny"
+    actions = [
+      "ec2:CreateTags", "ec2:DeleteTags",
+      "elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags",
+      "tag:TagResources", "tag:UntagResources",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = ["odisha-prdw"]
+    }
+    condition {
+      test     = "Null"
+      variable = "aws:ResourceTag/Project"
+      values   = ["false"]
+    }
+  }
+
   # The app module runs Fargate and creates no EC2 instance, no key pair and
   # no image. Without this, ec2:* on "*" could terminate janasunani-cpu-box.
   statement {
@@ -353,6 +392,12 @@ data "aws_iam_policy_document" "apply" {
       "ecs:UpdateService", "ecs:DeleteService", "ecs:StopTask", "ecs:RunTask",
       "ecs:DeleteCluster", "ecs:DeregisterTaskDefinition", "ecs:UpdateServicePrimaryTaskSet",
       "ecs:DeleteTaskSet", "ecs:UpdateCluster",
+      # ExecuteCommand is a SHELL inside a running task, so on a sibling
+      # workload it yields that task's role credentials and environment --
+      # strictly worse than the stop/update calls above it. It acts on a task
+      # ARN, so the not_resources list below already bounds it correctly.
+      # Found by Codex on #187 round 3.
+      "ecs:ExecuteCommand",
     ]
     not_resources = [
       "arn:${local.part}:ecs:*:${local.acct}:cluster/${local.app}",
