@@ -201,15 +201,34 @@ jobs:
           terraform -chdir=infra/terraform/app show -json /tmp/tfplan > /tmp/tfplan.json
           python3 - <<'PYEOF'
           import json, sys
+
+          # An ECS task definition is IMMUTABLE. Changing the image forces a new
+          # revision, and Terraform models that as delete+create -- so the single
+          # most routine thing a deploy does looks identical to a destructive
+          # change. The first real deploy failed here with "this apply would
+          # remove aws_ecs_task_definition.app": the guard refusing to let the
+          # deploy be a deploy.
+          #
+          # Exempt exactly that one address, and only for a REPLACEMENT -- a
+          # create paired with the delete. A bare delete of the task definition,
+          # with no create, is a real removal and still fails.
+          REPLACEABLE = {"aws_ecs_task_definition.app"}
+
           plan = json.load(open("/tmp/tfplan.json"))
-          removing = [
-              c["address"] for c in plan.get("resource_changes", [])
-              if {"delete"} & set(c["change"]["actions"])
-          ]
+          removing = []
+          for change in plan.get("resource_changes", []):
+              actions = set(change["change"]["actions"])
+              if not {"delete"} & actions:
+                  continue
+              if change["address"] in REPLACEABLE and "create" in actions:
+                  print(f"allowed: {change['address']} replaced, which is how a new revision is registered")
+                  continue
+              removing.append(change["address"])
+
           if removing:
               print("::error title=Refusing to destroy::this apply would remove " + ", ".join(removing))
               sys.exit(1)
-          print("plan destroys nothing")
+          print("plan destroys nothing but a task-definition revision")
           PYEOF
 
       - name: Apply
