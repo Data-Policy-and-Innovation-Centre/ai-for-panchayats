@@ -1,0 +1,117 @@
+name: Consumer Pin
+
+# Notice when the consumer's master moves (#96).
+#
+# The consumer's default branch is `master`, not `main`. GitHub's scheduled
+# runs fire considerably less often than the cron nominally implies and are
+# dropped entirely on a quiet repository, so this is a drift detector, not a
+# clock -- workflow_dispatch is the reliable path when someone actually wants
+# to know.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the pin against the consumer's master
+        id: drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned="$(python3 -c 'import json;print(json.load(open("infra/consumer/pin.json"))["commit"])')"
+          repo="$(python3 -c '
+          import json
+          url = json.load(open("infra/consumer/pin.json"))["repo"]
+          print(url.removeprefix("https://github.com/").removesuffix(".git"))
+          ')"
+          head="$(gh api "repos/$repo/branches/master" --jq .commit.sha)"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "head=$head"     >> "$GITHUB_OUTPUT"
+          echo "repo=$repo"     >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$head" ]; then
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Pin is current::$pinned"
+          else
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Pin is behind::$pinned -> $head"
+          fi
+
+      - name: Describe the intervening commits
+        if: steps.drift.outputs.drifted == 'true'
+        id: log
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # compare gives the commits between the two, which is what a reviewer
+          # needs in order to judge a bump rather than take it on faith.
+          gh api "repos/${{ steps.drift.outputs.repo }}/compare/${{ steps.drift.outputs.pinned }}...${{ steps.drift.outputs.head }}" \
+            --jq '.commits[] | "- `\(.sha[0:7])` \(.commit.message | split("\n")[0])"' > /tmp/commits.md || true
+          echo "count=$(wc -l < /tmp/commits.md | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Update the pin
+        if: steps.drift.outputs.drifted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          subject="$(gh api "repos/${{ steps.drift.outputs.repo }}/commits/${{ steps.drift.outputs.head }}" --jq '.commit.message | split("\n")[0]')"
+          python3 - "$subject" <<'PYEOF'
+          import json, pathlib, sys, datetime
+          path = pathlib.Path("infra/consumer/pin.json")
+          pin = json.loads(path.read_text())
+          pin["commit"] = "${{ steps.drift.outputs.head }}"
+          pin["subject"] = sys.argv[1]
+          pin["resolved_at"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+          path.write_text(json.dumps(pin, indent=2) + "\n")
+          PYEOF
+
+      - name: Compose the PR body
+        if: steps.drift.outputs.drifted == 'true'
+        run: |
+          {
+            echo "The pinned consumer commit is behind \`master\`."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| was | \`${{ steps.drift.outputs.pinned }}\` |"
+            echo "| now | \`${{ steps.drift.outputs.head }}\` |"
+            echo "| commits | ${{ steps.log.outputs.count }} |"
+            echo
+            echo "### What changed upstream"
+            echo
+            cat /tmp/commits.md
+            echo
+            echo "---"
+            echo
+            echo "Bumping the pin changes a build input, so the image tag changes and"
+            echo "the Image workflow rebuilds. **A consumer commit that does not pass"
+            echo "\`npm run build\` turns this PR red**, which is the point of building"
+            echo "on the PR rather than discovering it on main."
+          } > /tmp/pr-body.md
+
+      # A fixed branch name, so re-running while a bump PR is open updates that
+      # PR rather than opening a second one -- `create-pull-request` pushes to
+      # the same head branch and GitHub reuses the existing PR.
+      - name: Open or update the bump PR
+        if: steps.drift.outputs.drifted == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # NOT github.token. A PR opened with the default token triggers no
+          # workflows, so the bump would carry no checks at all -- no image
+          # build, no codex-review -- and this issue's fourth criterion is
+          # precisely that a consumer commit which does not build turns it red.
+          token: ${{ secrets.PIN_BUMP_TOKEN || github.token }}
+          branch: chore/consumer-pin-bump
+          base: dev
+          commit-message: "chore(#96): bump the consumer pin to ${{ steps.drift.outputs.head }}"
+          title: "chore: bump the consumer pin to `${{ steps.drift.outputs.head }}`"
+          body-path: /tmp/pr-body.md
+          delete-branch: true

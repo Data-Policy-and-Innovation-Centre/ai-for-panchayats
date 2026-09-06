@@ -56,3 +56,17 @@ output "basic_auth_password" {
   value       = local.basic_auth_enabled ? random_password.basic_auth[0].result : ""
   sensitive   = true
 }
+
+output "task_definition_arn" {
+  description = <<-EOT
+    The task-definition revision THIS apply registered.
+
+    Post-deploy verification must compare against this, not against whatever
+    `describe-services` reports afterwards. When the deployment circuit breaker
+    trips, ECS rolls back and resets the service's desired task definition to
+    the previous revision -- so a check that reads it back after the fact
+    compares the old revision against itself and passes vacuously, on exactly
+    the deployment it exists to catch (#93).
+  EOT
+  value       = aws_ecs_task_definition.app.arn
+}

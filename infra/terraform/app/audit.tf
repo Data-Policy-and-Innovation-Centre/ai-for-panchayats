@@ -283,8 +283,9 @@ data "aws_iam_policy_document" "flow_write" {
 resource "aws_iam_role" "flow" {
   count = var.enable_flow_logs ? 1 : 0
 
-  name               = "${var.name}-flow-logs"
-  assume_role_policy = data.aws_iam_policy_document.flow_assume.json
+  name                 = "${var.name}-flow-logs"
+  assume_role_policy   = data.aws_iam_policy_document.flow_assume.json
+  permissions_boundary = local.iam_boundary_arn
 }
 
 resource "aws_iam_role_policy" "flow" {

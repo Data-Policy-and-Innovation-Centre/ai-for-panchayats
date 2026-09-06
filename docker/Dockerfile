@@ -25,6 +25,24 @@ ENV PYTHONUNBUFFERED=1 \
     SNAPSHOT_PATH=/var/snapshot/database.duckdb \
     DB_ENGINE=duckdb_file
 
+# What this image is, recorded in the image itself (#85). Nothing served by a
+# running task revealed which consumer commit, image tag or snapshot version it
+# was serving, so one deployment could not be told from the next by observing
+# the app -- which is exactly what post-deploy verification has to do.
+#
+# Declared as ARGs with no default: an unset build arg would bake the string
+# "unavailable" into a real image, and a label that lies is worse than one that
+# is absent. build.sh always passes all three.
+ARG REPO_COMMIT
+ARG CONSUMER_COMMIT
+ARG IMAGE_TAG
+
+# Declared here, CONSUMED at the bottom of the file. An ARG declaration does
+# not invalidate anything; the first instruction that expands one does, and
+# every layer below it with it. Labelling here would put a value that changes
+# on every commit above `pip install`, so each build would reinstall every
+# pinned package to produce a byte-identical layer.
+
 WORKDIR /app
 
 COPY docker/requirements.txt /tmp/requirements.txt
@@ -60,5 +78,26 @@ EXPOSE 8000
 # worth an unpinned package.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
   CMD python -c "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)" 2>/dev/null || exit 1
+
+# --- provenance (#85) -------------------------------------------------------
+# Last, deliberately. Everything above is identical between two commits that
+# change no build input, so it stays cached; only these two layers rebuild.
+#
+# The same three values twice over, because they are read two different ways:
+# `docker inspect` reads labels but needs a registry round trip, and a running
+# task has to answer over HTTP without one.
+#
+# printf rather than a heredoc, so the layer does not depend on the shell's
+# heredoc handling, and every value is quoted so an unset arg yields empty
+# JSON strings rather than malformed JSON. Written after USER app, into a
+# directory that user already owns, so it needs no further chown.
+RUN printf '{\n  "repo_commit": "%s",\n  "consumer_commit": "%s",\n  "image_tag": "%s"\n}\n' \
+      "$REPO_COMMIT" "$CONSUMER_COMMIT" "$IMAGE_TAG" > /app/BUILD_INFO
+
+LABEL org.opencontainers.image.revision="$REPO_COMMIT" \
+      org.opencontainers.image.version="$IMAGE_TAG" \
+      org.opencontainers.image.source="https://github.com/Data-Policy-and-Innovation-Centre/ai-for-panchayats" \
+      in.dpic.panchayats.consumer-commit="$CONSUMER_COMMIT" \
+      in.dpic.panchayats.image-tag="$IMAGE_TAG"
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
