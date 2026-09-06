@@ -38,7 +38,6 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
           python-version-file: .python-version
@@ -66,7 +65,10 @@ jobs:
             tag="${{ inputs.image_tag }}"
             echo "::notice title=Manual deploy::$tag"
           else
-            tag="$(uv run python scripts/compute_image_tag.py --platform linux/arm64)"
+            # Plain python3: `uv run` would sync the project first, and
+            # pyproject pulls `dpic` over ssh://, which this workflow does not
+            # configure. compute_image_tag.py is stdlib-only.
+            tag="$(python3 scripts/compute_image_tag.py --platform linux/arm64)"
             echo "::notice title=Tag from main::$tag"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -108,7 +110,6 @@ jobs:
     # change -- the environment carries that setting, not this file.
     environment:
       name: production
-      url: ${{ steps.record.outputs.url }}
     outputs:
       task_definition: ${{ steps.apply.outputs.task_definition }}
     steps:
@@ -131,39 +132,47 @@ jobs:
       - name: Init
         run: terraform -chdir=infra/terraform/app init -input=false -lockfile=readonly
 
+      # Only `image_tag` is required; the other 23 variables carry committed
+      # defaults, so an apply that supplies just the tag gets production's real
+      # configuration today. That is a property of the current tree rather than
+      # a guarantee, so this refuses any plan that would destroy or replace a
+      # resource -- which is what an unintended topology change looks like,
+      # whatever caused it.
+      - name: Plan, and refuse to destroy anything
+        run: |
+          terraform -chdir=infra/terraform/app plan -input=false -no-color -out=/tmp/tfplan \
+            -var "image_tag=${{ needs.preflight.outputs.tag }}"
+          terraform -chdir=infra/terraform/app show -json /tmp/tfplan > /tmp/tfplan.json
+          python3 - <<'PYEOF'
+          import json, sys
+          plan = json.load(open("/tmp/tfplan.json"))
+          removing = [
+              c["address"] for c in plan.get("resource_changes", [])
+              if {"delete"} & set(c["change"]["actions"])
+          ]
+          if removing:
+              print("::error title=Refusing to destroy::this apply would remove " + ", ".join(removing))
+              sys.exit(1)
+          print("plan destroys nothing")
+          PYEOF
+
       - name: Apply
         id: apply
         run: |
-          terraform -chdir=infra/terraform/app apply -input=false -auto-approve -no-color \
-            -var "image_tag=${{ needs.preflight.outputs.tag }}"
-          # The revision THIS run registered. #93 asserts the service is
-          # actually running it, which is the only way to notice that the
-          # circuit breaker rolled back behind Terraform's back.
-          td="$(aws ecs describe-services --cluster prdw-chatbot --services prdw-chatbot \
-                  --query 'services[0].taskDefinition' --output text)"
+          terraform -chdir=infra/terraform/app apply -input=false -auto-approve -no-color /tmp/tfplan
+          # From TERRAFORM's output, not from describe-services.
+          #
+          # This is the correction that makes #93 mean anything. Reading it
+          # back with describe-services after the apply looks equivalent and
+          # is not: when the circuit breaker trips, ECS rolls back and resets
+          # the service's desired task definition to the PREVIOUS revision.
+          # A check seeded from that value compares the old revision against
+          # itself and passes -- vacuously, on precisely the deployment it
+          # exists to catch. terraform's output is the revision this run
+          # actually registered, whatever ECS did with it afterwards.
+          td="$(terraform -chdir=infra/terraform/app output -raw task_definition_arn)"
           echo "task_definition=$td" >> "$GITHUB_OUTPUT"
           echo "::notice title=Applied::${{ needs.preflight.outputs.tag }} as $td"
-
-      - name: Record the deployment
-        id: record
-        uses: actions/github-script@v7
-        env:
-          IMAGE_TAG: ${{ needs.preflight.outputs.tag }}
-          TASK_DEFINITION: ${{ steps.apply.outputs.task_definition }}
-        with:
-          script: |
-            const { data: deployment } = await github.rest.repos.createDeployment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              ref: context.sha, environment: 'production',
-              auto_merge: false, required_contexts: [],
-              description: `image ${process.env.IMAGE_TAG} as ${process.env.TASK_DEFINITION}`,
-            });
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              deployment_id: deployment.id, state: 'success',
-              description: `${process.env.IMAGE_TAG} / ${process.env.TASK_DEFINITION}`,
-            });
-            core.setOutput('url', `https://github.com/${context.repo.owner}/${context.repo.repo}/deployments`);
 
   # #93. Everything here asserts about the deployment, not merely about the
   # transport. Reporting `/ -> 200` as success was wrong once already.
@@ -181,6 +190,25 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
           aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          terraform_wrapper: false
+
+      # var.enable_basic_auth defaults to true, so every probe below would
+      # otherwise get CloudFront's 401 and fail for a reason that has nothing
+      # to do with the deployment. The password is masked before it can reach
+      # a log line.
+      - name: Read the basic-auth credentials
+        id: auth
+        run: |
+          terraform -chdir=infra/terraform/app init -input=false -lockfile=readonly >/dev/null
+          user="$(terraform -chdir=infra/terraform/app output -raw basic_auth_username)"
+          pass="$(terraform -chdir=infra/terraform/app output -raw basic_auth_password)"
+          echo "::add-mask::$pass"
+          echo "user=$user" >> "$GITHUB_OUTPUT"
+          echo "pass=$pass" >> "$GITHUB_OUTPUT"
 
       - name: Resolve the public URL
         id: url
@@ -203,11 +231,22 @@ jobs:
       # tests/test_verify_deployment.py.
       - name: Assert the deployment is the one this run made
         run: |
-          uv run python scripts/verify_deployment.py \
+          # --no-project: uv must not sync this repo's environment, whose
+          # `dpic` dependency comes over ssh://. boto3 is the only thing the
+          # verifier needs beyond the standard library.
+          #
+          # --skip-consumer-check on a manual rollback: an older image's
+          # consumer commit legitimately differs from the pin in the ref that
+          # is checked out, so asserting it would fail every rollback by
+          # construction.
+          uv run --no-project --with boto3 python scripts/verify_deployment.py \
             --cluster prdw-chatbot --service prdw-chatbot \
             --task-definition '${{ needs.apply.outputs.task_definition }}' \
             --image-tag '${{ needs.preflight.outputs.tag }}' \
             --consumer-commit '${{ steps.pin.outputs.commit }}' \
+            --auth-user '${{ steps.auth.outputs.user }}' \
+            --auth-password '${{ steps.auth.outputs.pass }}' \
+            ${{ github.event_name == 'workflow_dispatch' && '--skip-consumer-check' || '' }} \
             --url '${{ steps.url.outputs.url }}'
 
       # The failure that started #93: the page rendered blank because
@@ -215,13 +254,15 @@ jobs:
       # status code was 200 throughout.
       - name: Install a browser
         run: |
-          uv run --with playwright playwright install --with-deps chromium
+          uv run --no-project --with playwright playwright install --with-deps chromium
 
       - name: Assert the page actually mounts
         env:
           APP_URL: ${{ steps.url.outputs.url }}
+          APP_USER: ${{ steps.auth.outputs.user }}
+          APP_PASS: ${{ steps.auth.outputs.pass }}
         run: |
-          uv run --with playwright python - <<'PYEOF'
+          uv run --no-project --with playwright python - <<'PYEOF'
           import os, sys
           from playwright.sync_api import sync_playwright
 
@@ -229,7 +270,12 @@ jobs:
           errors: list[str] = []
           with sync_playwright() as p:
               browser = p.chromium.launch()
-              page = browser.new_page()
+              # Same basic auth the verifier uses; without it the page under
+              # test is CloudFront's 401 body, which has no #root at all.
+              context = browser.new_context(http_credentials={
+                  "username": os.environ["APP_USER"], "password": os.environ["APP_PASS"],
+              })
+              page = context.new_page()
               page.on("pageerror", lambda e: errors.append(str(e)))
               page.goto(url, wait_until="networkidle", timeout=60000)
 
@@ -259,3 +305,31 @@ jobs:
               sys.exit(1)
           print(f"secure context, crypto.randomUUID present, #root has {children} children, no uncaught exceptions")
           PYEOF
+
+  # Recorded LAST, deliberately. The first draft created the success status
+  # inside the apply job, before the rollout, identity, query and browser
+  # assertions had run -- so any verification failure left GitHub's deployment
+  # history claiming success for exactly the deployment the workflow failed to
+  # prove. Found by Codex on #191.
+  record:
+    needs: [preflight, apply, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the deployment
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ needs.preflight.outputs.tag }}
+          TASK_DEFINITION: ${{ needs.apply.outputs.task_definition }}
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: context.sha, environment: 'production',
+              auto_merge: false, required_contexts: [],
+              description: `image ${process.env.IMAGE_TAG} as ${process.env.TASK_DEFINITION}`,
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              deployment_id: deployment.id, state: 'success',
+              description: `${process.env.IMAGE_TAG} / ${process.env.TASK_DEFINITION}`,
+            });

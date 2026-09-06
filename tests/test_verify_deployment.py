@@ -7,6 +7,8 @@ together is one where a broken assertion hides behind a passing neighbour.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.verify_deployment import (
@@ -15,6 +17,8 @@ from scripts.verify_deployment import (
     check_query,
     check_rollout,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 TD = "arn:aws:ecs:ap-south-1:000000000000:task-definition/prdw-chatbot:12"
 OLD_TD = "arn:aws:ecs:ap-south-1:000000000000:task-definition/prdw-chatbot:11"
@@ -124,19 +128,40 @@ def test_html_instead_of_json_is_reported_as_a_shadowed_route():
 
 # --- query -------------------------------------------------------------------
 
-def test_the_routers_clarification_branch_is_not_a_passing_round_trip():
-    with pytest.raises(VerificationError, match="clarification"):
-        check_query({"needs_clarification": True, "answer": "Which district?"})
+# The router's real vocabulary, taken from scripts/benchmark_deployment.py.
+# The first version of these tests asserted an invented schema
+# (`needs_clarification`, a bare `answer`) and therefore passed against a
+# check that would have accepted a fallback as a real answer.
+
+@pytest.mark.parametrize("tier", ["clarify", "fallback"])
+def test_a_non_answer_tier_is_not_a_passing_round_trip(tier: str):
+    """Both deflection tiers return 200 and take about as long as a real
+    answer, so neither the status code nor the latency distinguishes them."""
+
+    with pytest.raises(VerificationError, match="deflecting"):
+        check_query({"tier": tier, "answer": "Which district?", "query_id": "q1"})
 
 
-def test_an_empty_answer_fails():
-    with pytest.raises(VerificationError, match="no non-empty answer"):
-        check_query({"answer": "   "})
+def test_prose_without_a_query_id_fails():
+    """An answer with no query_id means no query was executed -- the model
+    said something, which is not the same as the database being reachable."""
+
+    with pytest.raises(VerificationError, match="no query_id"):
+        check_query({"tier": "sql", "answer": "There are 6,794 gram panchayats."})
 
 
-def test_a_structurally_valid_answer_passes_whatever_it_says():
+def test_a_real_answer_passes_whatever_it_says():
     """Structure only. Asserting on generated text produces a check that fails
     for reasons unrelated to the deployment."""
 
-    assert check_query({"answer": "There are 6,794 gram panchayats."})
-    assert check_query({"response": "anything at all, really"})
+    assert check_query({"tier": "sql", "query_id": "q-123", "answer": "6,794."})
+    assert check_query({"tier": "rag", "query_id": "q-456", "answer": "anything at all"})
+
+
+def test_the_tier_list_matches_the_established_client():
+    """These two scripts talk to the same endpoint; they must not disagree."""
+
+    from scripts.verify_deployment import NON_ANSWER_TIERS
+    benchmark = (ROOT / "scripts" / "benchmark_deployment.py").read_text(encoding="utf-8")
+    assert 'NON_ANSWER_TIERS = {"clarify", "fallback"}' in benchmark
+    assert NON_ANSWER_TIERS == {"clarify", "fallback"}

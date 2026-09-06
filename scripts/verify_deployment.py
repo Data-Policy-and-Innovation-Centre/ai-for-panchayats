@@ -23,6 +23,7 @@ deployment_circuit_breaker in service.tf).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import urllib.error
@@ -75,8 +76,13 @@ def check_rollout(service: dict[str, Any], expected_task_definition: str) -> lis
     ]
 
 
-def fetch_json(url: str) -> Any:
+def fetch_json(url: str, auth: str | None = None) -> Any:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    # The deployment enables basic auth by default (var.enable_basic_auth), so
+    # an unauthenticated probe gets 401 from CloudFront and every assertion
+    # below fails for a reason that has nothing to do with the deployment.
+    if auth:
+        request.add_header("Authorization", auth)
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8")
@@ -93,7 +99,9 @@ def fetch_json(url: str) -> Any:
         ) from error
 
 
-def check_build_info(payload: Any, image_tag: str, consumer_commit: str) -> list[str]:
+def check_build_info(
+    payload: Any, image_tag: str, consumer_commit: str | None
+) -> list[str]:
     """The running task reports the image and consumer commit we deployed."""
 
     if not isinstance(payload, dict):
@@ -108,7 +116,10 @@ def check_build_info(payload: Any, image_tag: str, consumer_commit: str) -> list
             f"the task reports image_tag {build.get('image_tag')!r} but this run deployed "
             f"{image_tag!r}"
         )
-    if build.get("consumer_commit") != consumer_commit:
+    # None means "not asserted" -- a rollback to an older image has a consumer
+    # commit that legitimately differs from the pin in the checked-out ref, and
+    # asserting it would fail every rollback by construction.
+    if consumer_commit is not None and build.get("consumer_commit") != consumer_commit:
         raise VerificationError(
             f"the task reports consumer_commit {build.get('consumer_commit')!r} but the pin "
             f"says {consumer_commit!r}"
@@ -132,8 +143,19 @@ def check_build_info(payload: Any, image_tag: str, consumer_commit: str) -> list
     ]
 
 
+# The router's own vocabulary for "I did not actually run a query", taken from
+# scripts/benchmark_deployment.py, whose docstring records that its field list
+# was verified against the real deployed router rather than assumed.
+#
+# The first version of this function invented `needs_clarification` and
+# `clarification` instead of reading that file. `clarification` is in fact a
+# UI chip present on ordinary responses, so the check would have accepted a
+# fallback as a real answer -- the exact failure it exists to prevent.
+NON_ANSWER_TIERS = frozenset({"clarify", "fallback"})
+
+
 def check_query(payload: Any) -> list[str]:
-    """A /query round-trip returns something structurally real.
+    """A /query round-trip that actually executed a query.
 
     The assertion is on STRUCTURE, never on generated text -- asserting on a
     language model's wording produces a check that fails for reasons that have
@@ -143,20 +165,23 @@ def check_query(payload: Any) -> list[str]:
     if not isinstance(payload, dict):
         raise VerificationError(f"/query returned {type(payload).__name__}, not an object")
 
-    # The router's give-up branch is the thing to exclude: it returns a
-    # clarification rather than an answer, and #98 records it as the slow path.
-    if payload.get("needs_clarification") or payload.get("clarification"):
+    tier = payload.get("tier")
+    if tier in NON_ANSWER_TIERS:
         raise VerificationError(
-            "/query returned the router's clarification branch rather than an answer; "
-            "that is the fallback path, not a working round-trip"
+            f"/query returned tier={tier!r}, which is the router deflecting rather than "
+            "answering. A clarify or fallback response is a 200 and takes about as long "
+            "as a real answer, so neither the status code nor the latency distinguishes it."
         )
 
-    answer = payload.get("answer") or payload.get("response") or payload.get("result")
-    if not isinstance(answer, str) or not answer.strip():
+    # A real answer carries the id of the query that was executed. Without it,
+    # prose alone proves only that the model said something.
+    if not payload.get("query_id"):
         raise VerificationError(
-            f"/query returned no non-empty answer field; keys were {sorted(payload)!r}"
+            f"/query returned no query_id, so no query was executed. tier={tier!r}, "
+            f"keys were {sorted(payload)!r}"
         )
-    return [f"query        answered ({len(answer)} chars, structure only)"]
+
+    return [f"query        answered, tier={tier!r}, query_id present"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -168,6 +193,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--consumer-commit", required=True)
     parser.add_argument("--url", required=True, help="public base URL, no trailing slash")
     parser.add_argument("--region", default=None)
+    parser.add_argument(
+        "--auth-user", default=None,
+        help="basic-auth username; the deployment enables basic auth by default",
+    )
+    parser.add_argument("--auth-password", default=None)
+    parser.add_argument(
+        "--skip-consumer-check", action="store_true",
+        help=(
+            "skip only the consumer_commit assertion. Required for a rollback to an "
+            "older image, whose consumer commit legitimately differs from the pin in "
+            "the checked-out ref"
+        ),
+    )
     parser.add_argument(
         "--skip-query", action="store_true",
         help="skip the /query round-trip only; every other assertion still runs",
@@ -185,17 +223,32 @@ def main(argv: list[str] | None = None) -> int:
             raise VerificationError(f"no service {args.service!r} in cluster {args.cluster!r}")
         lines += check_rollout(services[0], args.task_definition)
 
+        auth = None
+        if args.auth_user and args.auth_password:
+            auth = "Basic " + base64.b64encode(
+                f"{args.auth_user}:{args.auth_password}".encode()
+            ).decode()
+
         lines += check_build_info(
-            fetch_json(f"{args.url.rstrip('/')}/deployment.json"),
-            args.image_tag, args.consumer_commit,
+            fetch_json(f"{args.url.rstrip('/')}/deployment.json", auth),
+            args.image_tag,
+            None if args.skip_consumer_check else args.consumer_commit,
         )
 
         if not args.skip_query:
+            # `message` and `session_id`, not `question`. Mirrored from
+            # scripts/benchmark_deployment.py rather than invented.
             request = urllib.request.Request(
                 f"{args.url.rstrip('/')}/query",
-                data=json.dumps({"question": "How many gram panchayats are there?"}).encode(),
+                data=json.dumps({
+                    "message": "How many gram panchayats are there?",
+                    "session_id": f"verify-{args.image_tag}",
+                }).encode(),
                 headers={"Content-Type": "application/json"},
+                method="POST",
             )
+            if auth:
+                request.add_header("Authorization", auth)
             try:
                 with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                     lines += check_query(json.loads(response.read().decode("utf-8")))
