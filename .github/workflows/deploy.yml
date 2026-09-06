@@ -7,9 +7,16 @@ name: Deploy
 # the same job with a different input rather than a second implementation that
 # drifts from the first.
 on:
-  push:
-    branches:
-      - main
+  # NOT `push`. Image builds and pushes the tag on the same push event, and
+  # there is no ordering between two workflows on one trigger -- so a deploy
+  # started by the same push reached the ECR check while npm, QEMU and the
+  # arm64 build were still running, found the tag absent, and failed instead
+  # of deploying the merge. workflow_run makes the dependency explicit rather
+  # than hoping the build is faster than the checkout (#191 review).
+  workflow_run:
+    workflows: ["Image"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -33,11 +40,29 @@ jobs:
   # Everything that can refuse the deploy happens here, with no credentials
   # that can change anything and before the environment gate.
   preflight:
+    # A failed or cancelled Image run must not deploy. workflow_dispatch has no
+    # workflow_run context, so it is allowed through explicitly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.head.outputs.sha }}
     steps:
+      # For workflow_run, github.sha is the tip of the default branch at
+      # dispatch time, NOT the commit that triggered the build. The only
+      # reliable value is the triggering run's head_sha.
+      - name: Resolve the commit being deployed
+        id: head
+        run: |
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Deploying commit::$sha"
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.head.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version-file: .python-version
@@ -47,22 +72,29 @@ jobs:
       # when this run's commit is no longer the tip of main is what makes the
       # queue order irrelevant.
       - name: Refuse if this commit is no longer the tip of main
-        if: github.event_name == 'push'
+        if: github.event_name != 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ steps.head.outputs.sha }}
         run: |
-          tip="$(gh api repos/${{ github.repository }}/commits/main --jq .sha)"
-          if [ "$tip" != "${{ github.sha }}" ]; then
-            echo "::error title=Stale run::${{ github.sha }} is no longer the tip of main ($tip). Refusing to deploy an older image over a newer one."
+          tip="$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)"
+          if [ "$tip" != "$DEPLOY_SHA" ]; then
+            echo "::error title=Stale run::$DEPLOY_SHA is no longer the tip of main ($tip). Refusing to deploy an older image over a newer one."
             exit 1
           fi
           echo "confirmed tip of main: $tip"
 
       - name: Resolve the tag to deploy
         id: resolve
+        env:
+          # Through the environment, never interpolated into the script body.
+          # Actions substitutes ${{ }} BEFORE bash parses, so a dispatch input
+          # containing a quote and a shell operator would execute commands --
+          # after the AWS role has been assumed (#191 review).
+          INPUT_TAG: ${{ inputs.image_tag }}
         run: |
-          if [ -n "${{ inputs.image_tag }}" ]; then
-            tag="${{ inputs.image_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
             echo "::notice title=Manual deploy::$tag"
           else
             # Plain python3: `uv run` would sync the project first, and
@@ -76,9 +108,18 @@ jobs:
       # service.tf refuses a tag whose architecture suffix contradicts the
       # task architecture, but it does so during apply. Checking here fails
       # the run before the environment gate rather than after it.
-      - name: Refuse a tag that is not arm64
+      # Tightened from "ends in -arm64" to the exact minted shape, so a tag
+      # carrying shell metacharacters cannot reach any later command even if
+      # one of them were to interpolate rather than use the environment.
+      - name: Refuse a tag that is not the shape this repo mints
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
-          case "${{ steps.resolve.outputs.tag }}" in
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9a-f]{12}-[0-9a-f]{7}-arm64$'; then
+            echo "::error title=Malformed tag::'$TAG' is not <12hex>-<7hex>-arm64"
+            exit 1
+          fi
+          case "$TAG" in
             *-arm64) ;;
             *) echo "::error title=Wrong architecture::tag does not end in -arm64"; exit 1 ;;
           esac
@@ -93,13 +134,15 @@ jobs:
       # and the circuit breaker would roll it back several minutes later.
       # This uses the read-only plan role, so it cannot mutate anything itself.
       - name: Refuse a tag that is not in the registry
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           if ! aws ecr describe-images --repository-name prdw-chatbot \
-                 --image-ids imageTag='${{ steps.resolve.outputs.tag }}' >/dev/null 2>&1; then
-            echo "::error title=No such image::${{ steps.resolve.outputs.tag }} is not in ECR. Nothing has been changed."
+                 --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "::error title=No such image::$TAG is not in ECR. Nothing has been changed."
             exit 1
           fi
-          echo "image present: ${{ steps.resolve.outputs.tag }}"
+          echo "image present: $TAG"
 
   apply:
     needs: preflight
@@ -114,6 +157,8 @@ jobs:
       task_definition: ${{ steps.apply.outputs.task_definition }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -181,6 +226,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:

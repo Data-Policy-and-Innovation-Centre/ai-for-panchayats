@@ -52,10 +52,23 @@ inspection, not by reading the issue text:
   today is a human running `terraform apply`, exactly as #92 describes.
 - **There is no `production` environment gate.** No workflow in the tree uses
   `environment:` at all.
-- **The image tag is not derived from input hashes.** It is
-  `<this repo's short HEAD>-<consumer short ref><arch suffix>`
-  (`docker/build.sh:70`). Anything that assumes a content hash is describing
-  #90's intent, not the build that exists.
+- **The image tag IS now derived from input hashes** (#90). It is
+  `<12-hex digest of the build inputs>-<consumer short SHA>-arm64`, computed by
+  `scripts/compute_image_tag.py`. Recompute it for any checkout with:
+
+  ```bash
+  python3 scripts/compute_image_tag.py            # the tag for this tree
+  python3 scripts/compute_image_tag.py --list-inputs   # the 17 files that decide it
+  ```
+
+  The consequence for an incident: **the first segment is no longer a commit
+  SHA and cannot be matched against one.** Two commits that changed no build
+  input share a tag deliberately, and a commit that changed one has a tag you
+  cannot derive by looking at git alone -- you have to check that commit out
+  and run the command above.
+
+  Images built before #90 landed still carry the old
+  `<repo short HEAD>-<consumer short ref>` shape, so ECR holds both forms.
 - **The ECS deployment circuit breaker is not enabled.**
   `aws_ecs_service.app` (`infra/terraform/app/service.tf:298-349`) declares no
   `deployment_circuit_breaker` block and no `deployment_controller`. Terraform
@@ -409,14 +422,30 @@ git log --oneline -- infra/snapshots/full_state.json
 git show <commit>:infra/snapshots/full_state.json | jq '{version_id, sha256}'
 ```
 
-Then find the image tag built from that commit: for a tag built the default
-way, the first segment is that commit's short SHA (`build.sh:70`), so list ECR
-and match the prefix. **This fails silently for any image built with an
-explicit `TAG` override**, which nothing enforces the shape of — see the
-caution in §1. If no tag matches, do not conclude the image is gone; match on
-the snapshot instead, by starting each candidate tag and reading its startup
-line, or by `docker pull`ing it and reading `/app/manifest/full_state.json`
-directly.
+Then find the image tag built from that commit. **Matching the commit's short
+SHA against the tag no longer works** — since #90 the first segment is a digest
+of the build inputs, not a commit (see §1). Three routes, in order of
+directness:
+
+1. **Ask the running task.** `GET /deployment.json` on the deployed URL returns
+   `build.repo_commit`, `build.consumer_commit` and `build.image_tag` (#85). If
+   the bad image is still serving, this is the fastest way to learn what it is,
+   and the only one that needs no clone.
+
+2. **Recompute the tag from the commit you want.** Check out the known-good
+   commit and run `python3 scripts/compute_image_tag.py`. That is the tag,
+   exactly, provided the build inputs in that tree are what produced it.
+
+3. **Read the labels off candidate images.** Every image since #85 carries
+   `org.opencontainers.image.revision` (this repo's commit) and
+   `in.dpic.panchayats.consumer-commit`. Pull a candidate and
+   `docker inspect --format '{{json .Config.Labels}}'`, or read `/app/BUILD_INFO`
+   inside it. This is the route that works when the tree has moved on and
+   route 2 would recompute a different digest.
+
+If none matches, do not conclude the image is gone; match on the snapshot
+instead, by starting each candidate and reading its startup line, or by
+`docker pull`ing it and reading `/app/manifest/full_state.json` directly.
 
 > **OPEN QUESTION 3.** There is no recorded mapping from image tag to
 > deployment time. The only sources would be ECR push timestamps and, once #92

@@ -241,7 +241,12 @@ def main(argv: list[str] | None = None) -> int:
             request = urllib.request.Request(
                 f"{args.url.rstrip('/')}/query",
                 data=json.dumps({
-                    "message": "How many gram panchayats are there?",
+                    # From benchmark_deployment.py's verified list. The first
+                    # version asked "How many gram panchayats are there?" --
+                    # yearless AND a GP question, the two shapes that file
+                    # records as always returning the clarify tier. It would
+                    # have left verification red after every successful apply.
+                    "message": "How many initiated activities have been completed in 2024?",
                     "session_id": f"verify-{args.image_tag}",
                 }).encode(),
                 headers={"Content-Type": "application/json"},

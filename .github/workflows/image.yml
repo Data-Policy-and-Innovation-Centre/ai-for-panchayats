@@ -8,7 +8,21 @@ name: Image
 # repository with IMMUTABLE tags that is what makes a re-run a harmless no-op
 # instead of a hard failure.
 on:
+  # Scoped to the hashed inputs plus this workflow. Without a filter, every
+  # documentation or Terraform PR paid for a consumer clone, npm ci, a frontend
+  # compile, QEMU setup and an arm64 docker build to produce an image whose tag
+  # had not changed. The list must track BUILD_INPUTS in
+  # scripts/compute_image_tag.py -- if they drift, a PR that changes the image
+  # stops being built.
   pull_request:
+    paths:
+      - 'docker/**'
+      - 'src/deploy/**'
+      - 'scripts/fetch_snapshot.py'
+      - 'scripts/compute_image_tag.py'
+      - 'infra/snapshots/**'
+      - 'infra/consumer/pin.json'
+      - '.github/workflows/image.yml'
   push:
     branches:
       - main
