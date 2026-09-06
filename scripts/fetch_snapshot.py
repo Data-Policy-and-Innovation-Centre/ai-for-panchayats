@@ -24,6 +24,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.deploy.errors import SnapshotError  # noqa: E402
 from src.deploy.fetch import fetch_snapshot, load_expectations  # noqa: E402
+from src.deploy.identity import write_identity  # noqa: E402
 from src.deploy.manifest import load_manifest  # noqa: E402
 
 
@@ -32,6 +33,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("manifest", type=Path, help="committed snapshot manifest JSON")
     parser.add_argument("destination", type=Path, help="task-local path to publish to")
     parser.add_argument("--region", default=None, help="AWS region; defaults to the environment")
+    parser.add_argument(
+        "--identity-out",
+        type=Path,
+        default=None,
+        help=(
+            "write the verified snapshot identity here as JSON, so the serving "
+            "process can report what it is running (#85)"
+        ),
+    )
     parser.add_argument(
         "--skip-expectations",
         action="store_true",
@@ -68,6 +78,17 @@ def main(argv: list[str] | None = None) -> int:
     except SnapshotError as exc:
         print(f"snapshot verification failed: {exc}", file=sys.stderr)
         return 1
+
+    # After the fetch, never before: the file's existence has to mean the
+    # database was proven, not that a fetch was attempted. A failure above
+    # returns 1 without reaching here, and a stale file from a previous task
+    # cannot survive because task-local storage starts empty.
+    if args.identity_out is not None:
+        try:
+            write_identity(identity, args.identity_out)
+        except OSError as exc:
+            print(f"could not write {args.identity_out}: {exc}", file=sys.stderr)
+            return 1
 
     print(identity.describe())
     return 0
