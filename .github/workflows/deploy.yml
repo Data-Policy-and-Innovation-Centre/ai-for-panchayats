@@ -191,7 +191,12 @@ jobs:
       # whatever caused it.
       - name: Plan, and refuse to destroy anything
         run: |
+          # -var-file: without it every variable except image_tag falls back to
+          # its default, so an automated deploy would silently revert any
+          # production input set by hand -- the ALB TLS cutover in
+          # docs/runbook.md being the case that would hurt (#92 review).
           terraform -chdir=infra/terraform/app plan -input=false -no-color -out=/tmp/tfplan \
+            -var-file=production.tfvars \
             -var "image_tag=${{ needs.preflight.outputs.tag }}"
           terraform -chdir=infra/terraform/app show -json /tmp/tfplan > /tmp/tfplan.json
           python3 - <<'PYEOF'
