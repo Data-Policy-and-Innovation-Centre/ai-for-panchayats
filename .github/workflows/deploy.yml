@@ -1,0 +1,393 @@
+name: Deploy
+
+# Apply on merge to main, and roll back on demand (#92), then prove the thing
+# that is running is the thing this run deployed (#93).
+#
+# Rollback is the same operation as deployment with a different tag, so it is
+# the same job with a different input rather than a second implementation that
+# drifts from the first.
+on:
+  # NOT `push`. Image builds and pushes the tag on the same push event, and
+  # there is no ordering between two workflows on one trigger -- so a deploy
+  # started by the same push reached the ECR check while npm, QEMU and the
+  # arm64 build were still running, found the tag absent, and failed instead
+  # of deploying the merge. workflow_run makes the dependency explicit rather
+  # than hoping the build is faster than the checkout (#191 review).
+  workflow_run:
+    workflows: ["Image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy. Omit to deploy the tag computed from main.'
+        required: false
+        type: string
+
+# Serialise applies. cancel-in-progress MUST stay false: cancelling an apply
+# mid-flight is what leaves an orphaned S3 lockfile requiring force-unlock,
+# because the backend uses use_lockfile and a killed process releases nothing.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+jobs:
+  # Everything that can refuse the deploy happens here, with no credentials
+  # that can change anything and before the environment gate.
+  preflight:
+    # A failed or cancelled Image run must not deploy. workflow_dispatch has no
+    # workflow_run context, so it is allowed through explicitly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      # For workflow_run, github.sha is the tip of the default branch at
+      # dispatch time, NOT the commit that triggered the build. The only
+      # reliable value is the triggering run's head_sha.
+      - name: Resolve the commit being deployed
+        id: head
+        run: |
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Deploying commit::$sha"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.head.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # An approval gate reorders runs: two queued deploys approved out of
+      # order would happily apply an older image over a newer one. Refusing
+      # when this run's commit is no longer the tip of main is what makes the
+      # queue order irrelevant.
+      - name: Refuse if this commit is no longer the tip of main
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          tip="$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)"
+          if [ "$tip" != "$DEPLOY_SHA" ]; then
+            echo "::error title=Stale run::$DEPLOY_SHA is no longer the tip of main ($tip). Refusing to deploy an older image over a newer one."
+            exit 1
+          fi
+          echo "confirmed tip of main: $tip"
+
+      - name: Resolve the tag to deploy
+        id: resolve
+        env:
+          # Through the environment, never interpolated into the script body.
+          # Actions substitutes ${{ }} BEFORE bash parses, so a dispatch input
+          # containing a quote and a shell operator would execute commands --
+          # after the AWS role has been assumed (#191 review).
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+            echo "::notice title=Manual deploy::$tag"
+          else
+            # Plain python3: `uv run` would sync the project first, and
+            # pyproject pulls `dpic` over ssh://, which this workflow does not
+            # configure. compute_image_tag.py is stdlib-only.
+            tag="$(python3 scripts/compute_image_tag.py --platform linux/arm64)"
+            echo "::notice title=Tag from main::$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # service.tf refuses a tag whose architecture suffix contradicts the
+      # task architecture, but it does so during apply. Checking here fails
+      # the run before the environment gate rather than after it.
+      # Tightened from "ends in -arm64" to the exact minted shape, so a tag
+      # carrying shell metacharacters cannot reach any later command even if
+      # one of them were to interpolate rather than use the environment.
+      - name: Refuse a tag that is not the shape this repo mints
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # TWO shapes, deliberately. <12hex>-<7hex>-arm64 is what #90 mints
+          # now; <7hex>-<7hex>-arm64 is the pre-#90 form, and every image that
+          # predates this change carries it -- including the one in production
+          # right now. Accepting only the new shape would mean the first
+          # content-tagged deploy could not be rolled back to the image it
+          # replaced, which is exactly when rollback matters most (#92 review).
+          if ! printf '%s' "$TAG" | grep -Eq '^([0-9a-f]{12}|[0-9a-f]{7})-[0-9a-f]{7}-arm64$'; then
+            echo "::error title=Malformed tag::'$TAG' is not <12hex>-<7hex>-arm64"
+            exit 1
+          fi
+          case "$TAG" in
+            *-arm64) ;;
+            *) echo "::error title=Wrong architecture::tag does not end in -arm64"; exit 1 ;;
+          esac
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      # A tag that is not in ECR must fail BEFORE any AWS mutation. Terraform
+      # would otherwise register a task definition that no task can ever pull,
+      # and the circuit breaker would roll it back several minutes later.
+      # This uses the read-only plan role, so it cannot mutate anything itself.
+      - name: Refuse a tag that is not in the registry
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          if ! aws ecr describe-images --repository-name prdw-chatbot \
+                 --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "::error title=No such image::$TAG is not in ECR. Nothing has been changed."
+            exit 1
+          fi
+          echo "image present: $TAG"
+
+  apply:
+    needs: preflight
+    runs-on: ubuntu-latest
+    # The gate. Its branch policy restricts deployments to main, so a
+    # workflow_dispatch from another ref cannot reach it. Add a required
+    # reviewer here and this becomes a human-approved deploy with no workflow
+    # change -- the environment carries that setting, not this file.
+    environment:
+      name: production
+    outputs:
+      task_definition: ${{ steps.apply.outputs.task_definition }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_APPLY_ROLE_ARN }}
+          aws-region: ap-south-1
+          # An apply waits for steady state and service.tf allows 20m for it;
+          # the session has to outlive that or credentials expire mid-apply
+          # and the S3 lock is left held.
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform -chdir=infra/terraform/app init -input=false -lockfile=readonly
+
+      # Only `image_tag` is required; the other 23 variables carry committed
+      # defaults, so an apply that supplies just the tag gets production's real
+      # configuration today. That is a property of the current tree rather than
+      # a guarantee, so this refuses any plan that would destroy or replace a
+      # resource -- which is what an unintended topology change looks like,
+      # whatever caused it.
+      - name: Plan, and refuse to destroy anything
+        run: |
+          # -var-file: without it every variable except image_tag falls back to
+          # its default, so an automated deploy would silently revert any
+          # production input set by hand -- the ALB TLS cutover in
+          # docs/runbook.md being the case that would hurt (#92 review).
+          terraform -chdir=infra/terraform/app plan -input=false -no-color -out=/tmp/tfplan \
+            -var-file=production.tfvars \
+            -var "image_tag=${{ needs.preflight.outputs.tag }}"
+          terraform -chdir=infra/terraform/app show -json /tmp/tfplan > /tmp/tfplan.json
+          python3 - <<'PYEOF'
+          import json, sys
+          plan = json.load(open("/tmp/tfplan.json"))
+          removing = [
+              c["address"] for c in plan.get("resource_changes", [])
+              if {"delete"} & set(c["change"]["actions"])
+          ]
+          if removing:
+              print("::error title=Refusing to destroy::this apply would remove " + ", ".join(removing))
+              sys.exit(1)
+          print("plan destroys nothing")
+          PYEOF
+
+      - name: Apply
+        id: apply
+        run: |
+          terraform -chdir=infra/terraform/app apply -input=false -auto-approve -no-color /tmp/tfplan
+          # From TERRAFORM's output, not from describe-services.
+          #
+          # This is the correction that makes #93 mean anything. Reading it
+          # back with describe-services after the apply looks equivalent and
+          # is not: when the circuit breaker trips, ECS rolls back and resets
+          # the service's desired task definition to the PREVIOUS revision.
+          # A check seeded from that value compares the old revision against
+          # itself and passes -- vacuously, on precisely the deployment it
+          # exists to catch. terraform's output is the revision this run
+          # actually registered, whatever ECS did with it afterwards.
+          td="$(terraform -chdir=infra/terraform/app output -raw task_definition_arn)"
+          echo "task_definition=$td" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Applied::${{ needs.preflight.outputs.tag }} as $td"
+
+  # #93. Everything here asserts about the deployment, not merely about the
+  # transport. Reporting `/ -> 200` as success was wrong once already.
+  verify:
+    needs: [preflight, apply]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          terraform_wrapper: false
+
+      # var.enable_basic_auth defaults to true, so every probe below would
+      # otherwise get CloudFront's 401 and fail for a reason that has nothing
+      # to do with the deployment. The password is masked before it can reach
+      # a log line.
+      - name: Read the basic-auth credentials
+        id: auth
+        run: |
+          terraform -chdir=infra/terraform/app init -input=false -lockfile=readonly >/dev/null
+          user="$(terraform -chdir=infra/terraform/app output -raw basic_auth_username)"
+          pass="$(terraform -chdir=infra/terraform/app output -raw basic_auth_password)"
+          echo "::add-mask::$pass"
+          echo "user=$user" >> "$GITHUB_OUTPUT"
+          echo "pass=$pass" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the public URL
+        id: url
+        run: |
+          domain="$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='prdw-chatbot'].DomainName | [0]" \
+            --output text)"
+          if [ -z "$domain" ] || [ "$domain" = "None" ]; then
+            echo "::error title=No distribution::could not resolve the CloudFront domain"; exit 1
+          fi
+          echo "url=https://$domain" >> "$GITHUB_OUTPUT"
+
+      - name: Read the pinned consumer commit
+        id: pin
+        run: |
+          echo "commit=$(python3 -c 'import json;print(json.load(open("infra/consumer/pin.json"))["commit"])')" >> "$GITHUB_OUTPUT"
+
+      # Rollout state, task-definition revision, runningCount, build info and
+      # the /query round-trip. Each fails independently; see
+      # tests/test_verify_deployment.py.
+      - name: Assert the deployment is the one this run made
+        run: |
+          # --no-project: uv must not sync this repo's environment, whose
+          # `dpic` dependency comes over ssh://. boto3 is the only thing the
+          # verifier needs beyond the standard library.
+          #
+          # --skip-consumer-check on a manual rollback: an older image's
+          # consumer commit legitimately differs from the pin in the ref that
+          # is checked out, so asserting it would fail every rollback by
+          # construction.
+          uv run --no-project --with boto3 python scripts/verify_deployment.py \
+            --cluster prdw-chatbot --service prdw-chatbot \
+            --task-definition '${{ needs.apply.outputs.task_definition }}' \
+            --image-tag '${{ needs.preflight.outputs.tag }}' \
+            --consumer-commit '${{ steps.pin.outputs.commit }}' \
+            --auth-user '${{ steps.auth.outputs.user }}' \
+            --auth-password '${{ steps.auth.outputs.pass }}' \
+            ${{ github.event_name == 'workflow_dispatch' && '--skip-consumer-check' || '' }} \
+            --url '${{ steps.url.outputs.url }}'
+
+      # The failure that started #93: the page rendered blank because
+      # crypto.randomUUID() is undefined outside a secure context, and every
+      # status code was 200 throughout.
+      - name: Install a browser
+        run: |
+          uv run --no-project --with playwright playwright install --with-deps chromium
+
+      - name: Assert the page actually mounts
+        env:
+          APP_URL: ${{ steps.url.outputs.url }}
+          APP_USER: ${{ steps.auth.outputs.user }}
+          APP_PASS: ${{ steps.auth.outputs.pass }}
+        run: |
+          uv run --no-project --with playwright python - <<'PYEOF'
+          import os, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          errors: list[str] = []
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              # Same basic auth the verifier uses; without it the page under
+              # test is CloudFront's 401 body, which has no #root at all.
+              context = browser.new_context(http_credentials={
+                  "username": os.environ["APP_USER"], "password": os.environ["APP_PASS"],
+              })
+              page = context.new_page()
+              page.on("pageerror", lambda e: errors.append(str(e)))
+              page.goto(url, wait_until="networkidle", timeout=60000)
+
+              secure = page.evaluate("window.isSecureContext")
+              has_uuid = page.evaluate("typeof crypto.randomUUID === 'function'")
+              children = page.evaluate(
+                  "document.querySelector('#root') ? "
+                  "document.querySelector('#root').childElementCount : -1"
+              )
+              browser.close()
+
+          problems = []
+          if secure is not True:
+              problems.append(f"window.isSecureContext is {secure!r}, not True")
+          if has_uuid is not True:
+              problems.append("crypto.randomUUID is not a function -- the exact cause of the blank page in #93")
+          if children == -1:
+              problems.append("no #root element in the document")
+          elif children < 1:
+              problems.append("#root has no element children; the app did not mount")
+          if errors:
+              problems.append(f"uncaught exceptions during mount: {errors}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error title=Browser check failed::{problem}", file=sys.stderr)
+              sys.exit(1)
+          print(f"secure context, crypto.randomUUID present, #root has {children} children, no uncaught exceptions")
+          PYEOF
+
+  # Recorded LAST, deliberately. The first draft created the success status
+  # inside the apply job, before the rollout, identity, query and browser
+  # assertions had run -- so any verification failure left GitHub's deployment
+  # history claiming success for exactly the deployment the workflow failed to
+  # prove. Found by Codex on #191.
+  record:
+    needs: [preflight, apply, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the deployment
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ needs.preflight.outputs.tag }}
+          TASK_DEFINITION: ${{ needs.apply.outputs.task_definition }}
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: context.sha, environment: 'production',
+              auto_merge: false, required_contexts: [],
+              description: `image ${process.env.IMAGE_TAG} as ${process.env.TASK_DEFINITION}`,
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              deployment_id: deployment.id, state: 'success',
+              description: `${process.env.IMAGE_TAG} / ${process.env.TASK_DEFINITION}`,
+            });

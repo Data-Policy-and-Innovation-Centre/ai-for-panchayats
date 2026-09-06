@@ -63,6 +63,13 @@ inspection, not by reading the issue text:
   commit". Images built before #90 landed carry the older
   `<repo short HEAD>-<consumer short ref><arch suffix>` form; both shapes are
   accepted for rollback.
+
+  Recompute the tag for any checkout, and see exactly which files decide it:
+
+  ```bash
+  python3 scripts/compute_image_tag.py --platform linux/arm64
+  python3 scripts/compute_image_tag.py --list-inputs
+  ```
 - **The ECS deployment circuit breaker is not enabled.**
   `aws_ecs_service.app` (`infra/terraform/app/service.tf:298-349`) declares no
   `deployment_circuit_breaker` block and no `deployment_controller`. Terraform
@@ -444,6 +451,9 @@ against ECR no longer works. Three routes, cheapest first:
    exactly one set of *inputs*, but the commit recorded inside it is whichever
    qualifying commit happened to build and publish first. Treat that label as
    "a commit whose inputs produced this image", not "the commit deployed".
+
+   This is also the route that still works when the tree has moved on and
+   route 2 would recompute a different digest than the one you are hunting.
 
 If none of these resolves it, do not conclude the image is gone; match on the
 snapshot instead, by starting each candidate tag and reading its startup line,

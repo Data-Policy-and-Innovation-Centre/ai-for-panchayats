@@ -130,7 +130,14 @@ case "$PLATFORM" in
   *) echo "[build] unsupported PLATFORM '$PLATFORM' (expected linux/arm64 or linux/amd64)" >&2; exit 2 ;;
 esac
 
-TAG="${TAG:-$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)-${CONSUMER_REF:0:7}${ARCH_SUFFIX}}"
+# The default comes from the shared resolver, not from HEAD. Two reasons:
+# a locally built image otherwise carries a tag the deploy workflow rejects,
+# and the same tree would mint two different official-looking schemes
+# depending on whether CI or this script built it (#92 review). It also fixes
+# a older wart -- the HEAD-derived default ignored the working tree, so a
+# dirty checkout minted a tag that named a commit it did not match. Hashing
+# file contents cannot do that.
+TAG="${TAG:-$(python3 "$REPO_ROOT/scripts/compute_image_tag.py" --platform "$PLATFORM" --root "$REPO_ROOT")}"
 
 # An explicitly supplied TAG still has to agree with the platform being built.
 if [[ "$ARCH_SUFFIX" == "-arm64" && "$TAG" != *-arm64 ]]; then
