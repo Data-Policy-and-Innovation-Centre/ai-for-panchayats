@@ -165,3 +165,90 @@ def test_the_tier_list_matches_the_established_client():
     benchmark = (ROOT / "scripts" / "benchmark_deployment.py").read_text(encoding="utf-8")
     assert 'NON_ANSWER_TIERS = {"clarify", "fallback"}' in benchmark
     assert NON_ANSWER_TIERS == {"clarify", "fallback"}
+
+
+# --- wait_for_rollout ------------------------------------------------------
+#
+# The deploy of the caveat fix applied cleanly, the service reached COMPLETED
+# seconds later, and verify still failed:
+#
+#     primary deployment rolloutState is 'IN_PROGRESS', not 'COMPLETED'
+#
+# `wait_for_steady_state = true` returns when the service is stable, which is
+# not the instant rolloutState flips. Asserting once made the check flaky, and a
+# check that fails good deploys is the one people learn to ignore.
+#
+# Distinct helper names on purpose: this module already defines `_service` and
+# `TD`, and a second definition would silently shadow them for every test above.
+
+from scripts import verify_deployment as _vd  # noqa: E402
+
+WAIT_TD = "arn:aws:ecs:ap-south-1:000000000000:task-definition/prdw-chatbot:14"
+
+
+def _rollout_service(state, task_definition=WAIT_TD, running=1):
+    return {
+        "deployments": [
+            {
+                "status": "PRIMARY",
+                "rolloutState": state,
+                "rolloutStateReason": "because",
+                "taskDefinition": task_definition,
+            }
+        ],
+        "runningCount": running,
+    }
+
+
+class _FakeEcs:
+    """Yields each queued service shape in turn, then repeats the last."""
+
+    def __init__(self, shapes):
+        self.shapes = list(shapes)
+        self.calls = 0
+
+    def describe_services(self, cluster, services):
+        shape = self.shapes[min(self.calls, len(self.shapes) - 1)]
+        self.calls += 1
+        return {"services": [shape]}
+
+
+def test_wait_polls_through_in_progress_then_succeeds():
+    ecs = _FakeEcs([
+        _rollout_service("IN_PROGRESS"),
+        _rollout_service("IN_PROGRESS"),
+        _rollout_service("COMPLETED"),
+    ])
+    slept: list[float] = []
+    _service_out, lines = _vd.wait_for_rollout(
+        ecs, "c", "s", WAIT_TD, sleep=slept.append, clock=lambda: 0.0
+    )
+    assert ecs.calls == 3
+    assert slept == [_vd.ROLLOUT_POLL_SECONDS] * 2
+    assert any("COMPLETED" in line for line in lines)
+
+
+def test_wait_fails_immediately_on_a_circuit_breaker_trip():
+    """FAILED is final; waiting on it would delay the report by five minutes."""
+    ecs = _FakeEcs([_rollout_service("FAILED")])
+    with pytest.raises(_vd.VerificationError) as caught:
+        _vd.wait_for_rollout(ecs, "c", "s", WAIT_TD, sleep=lambda _: None, clock=lambda: 0.0)
+    assert not isinstance(caught.value, _vd.RolloutInProgress)
+    assert ecs.calls == 1
+
+
+def test_wait_fails_immediately_on_a_rollback():
+    """COMPLETED on the WRONG revision is exactly what a rollback leaves."""
+    ecs = _FakeEcs([_rollout_service("COMPLETED", task_definition=WAIT_TD.replace(":14", ":11"))])
+    with pytest.raises(_vd.VerificationError):
+        _vd.wait_for_rollout(ecs, "c", "s", WAIT_TD, sleep=lambda _: None, clock=lambda: 0.0)
+    assert ecs.calls == 1
+
+
+def test_wait_gives_up_loudly_rather_than_hanging():
+    ticks = iter([0.0, 0.0, 999.0, 999.0])
+    ecs = _FakeEcs([_rollout_service("IN_PROGRESS")])
+    with pytest.raises(_vd.VerificationError, match="still not COMPLETED"):
+        _vd.wait_for_rollout(
+            ecs, "c", "s", WAIT_TD, timeout=10, sleep=lambda _: None, clock=lambda: next(ticks)
+        )
