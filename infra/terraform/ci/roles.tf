@@ -10,8 +10,11 @@ locals {
   # Distinct subjects, both exact. `:pull_request` is the sub GitHub mints for
   # every pull-request-family event regardless of target branch, so it cannot
   # collide with the push role's `ref:refs/heads/main`.
-  plan_subject  = "repo:${var.github_owner}/${var.github_repository}:pull_request"
-  apply_subject = "repo:${var.github_owner}/${var.github_repository}:environment:production"
+  plan_subject = "repo:${var.github_owner}/${var.github_repository}:pull_request"
+  # deploy.yml's preflight and verify assume the plan role from a workflow_run
+  # on main, which mints the branch subject rather than the pull_request one.
+  plan_main_subject = "repo:${var.github_owner}/${var.github_repository}:ref:refs/heads/main"
+  apply_subject     = "repo:${var.github_owner}/${var.github_repository}:environment:production"
 
   state_bucket   = "dpic-prdw-tfstate"
   app_state      = "prdw/app/terraform.tfstate"
@@ -137,7 +140,23 @@ data "aws_iam_policy_document" "plan_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [local.plan_subject]
+      # TWO subjects, and the second one is not optional. The plan role is
+      # assumed from two places, not one:
+      #
+      #   terraform-plan.yml  pull_request      -> :pull_request
+      #   deploy.yml          workflow_run/main -> :ref:refs/heads/main
+      #
+      # deploy.yml's preflight and verify jobs both name this role, and neither
+      # declares an environment, so GitHub mints the branch subject for them.
+      # With only :pull_request here the FIRST real deploy died at
+      # configure-aws-credentials with "Not authorized to perform
+      # sts:AssumeRoleWithWebIdentity" -- preflight failed and apply, verify
+      # and record were skipped. Found by running it, not by review.
+      #
+      # This is not an escalation. main can already assume the APPLY role,
+      # which is strictly more powerful than this read-only one, so trusting
+      # the same branch here grants nothing main did not already have.
+      values = [local.plan_subject, local.plan_main_subject]
     }
   }
 }
