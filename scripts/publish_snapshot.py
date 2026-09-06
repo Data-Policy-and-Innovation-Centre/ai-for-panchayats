@@ -66,6 +66,24 @@ def verify_uploaded(s3, bucket: str, key: str, version_id: str, local_bytes: int
     return remote_bytes
 
 
+def build_expectations_payload(artifact: Path) -> bytes:
+    """The private aggregates, regenerated from the artifact being published.
+
+    Regenerated rather than carried alongside, for the same reason the manifest
+    is: a gate copied from a previous build describes a file it was not built
+    from, and would either reject a good artifact or -- worse -- pass a wrong
+    one whose counts happened to match.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "scripts/build_expectations.py", str(artifact)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise PublishError(f"could not build the aggregates: {result.stderr.strip()}")
+    return result.stdout.encode()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("artifact", type=Path, help="the local .duckdb to publish")
@@ -98,11 +116,15 @@ def main(argv: list[str] | None = None) -> int:
         # "the CMK is not resolvable" is the failure a dry run most needs to
         # surface.
         cmk = resolve_cmk(kms, args.cmk)
+        # Beside the artifact, named after it: the convention the deployed
+        # manifest already follows (duckdb/database_allgps.expectations.json).
+        expectations_key = key.rsplit(".", 1)[0] + ".expectations.json"
 
         print(f"artifact   {args.artifact} ({local_bytes:,} bytes)")
         print(f"target     s3://{args.bucket}/{key}")
         print(f"encryption aws:kms {args.cmk} -> {cmk}")
         print(f"manifest   {args.manifest} (label {args.label})")
+        print(f"aggregates s3://{args.bucket}/{expectations_key}")
 
         if args.dry_run:
             print("\ndry run: nothing uploaded, no manifest written, no PR opened")
@@ -130,6 +152,24 @@ def main(argv: list[str] | None = None) -> int:
         version_id = current["VersionId"]
         verify_uploaded(s3, args.bucket, key, version_id, local_bytes)
         print(f"uploaded   versionId={version_id}, size confirmed against the local artifact")
+
+        # The manifest pins TWO objects. src/deploy/fetch.py runs these row
+        # counts against the downloaded database at startup and refuses to
+        # serve on a mismatch, and verify_deployment.py fails the deploy when a
+        # task reports aggregates=SKIPPED. Publishing the artifact alone was
+        # therefore not a partial success -- it produced a manifest that could
+        # not be deployed at all. Small object, so put_object is correct here.
+        expectations_body = build_expectations_payload(args.artifact)
+        put = s3.put_object(
+            Bucket=args.bucket, Key=expectations_key, Body=expectations_body,
+            ContentType="application/json",
+            ServerSideEncryption="aws:kms", SSEKMSKeyId=cmk,
+        )
+        expectations_version_id = put["VersionId"]
+        print(
+            f"aggregates s3://{args.bucket}/{expectations_key} "
+            f"versionId={expectations_version_id}"
+        )
     except PublishError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 1
@@ -142,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.executable, "scripts/build_snapshot_manifest.py",
             str(args.artifact), "--bucket", args.bucket, "--key", key,
             "--version-id", version_id, "--label", args.label,
+            "--expectations-key", expectations_key,
+            "--expectations-version-id", expectations_version_id,
             # --out, not --output. build_snapshot_manifest.py declares "--out";
             # argparse rejects the long form with exit 2, and this subprocess
             # runs AFTER the ~6.4 GB upload, so the wrong spelling means every
