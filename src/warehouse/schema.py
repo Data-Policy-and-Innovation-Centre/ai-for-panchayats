@@ -529,6 +529,21 @@ DDL: dict[str, str] = {
             distinct_themes INTEGER,
             source_rows     INTEGER
         )""",
+    # GP Relative Wealth Index (RWI). A static reference table providing
+    # wealth estimates at the gram panchayat level. Kept as a separate 
+    # dimension rather than folded into gp_profile so that demographic
+    # census data and external wealth indices remain cleanly decoupled.
+    "dim_rwi": """
+        CREATE TABLE dim_rwi (
+            gp_lgd_code     VARCHAR PRIMARY KEY,
+            district_name   VARCHAR,
+            block_name      VARCHAR,
+            gp_name         VARCHAR,
+            rwi_score       DOUBLE,
+            -- FOREIGN KEY to gram_panchayat is deliberately omitted because 
+            -- dim_rwi is a global reference file that contains 6,800+ GPs, 
+            -- which violates the constraint during small-scale snapshot tests.
+        )""",
     # Rows rejected by a foreign key, a uniqueness rule, or a missing
     # identity field, with the reason. Nothing is discarded silently; every
     # dropped row is countable here.
@@ -562,7 +577,7 @@ FACT_TABLES = [table for table in CREATE_ORDER if table != "quarantine"]
 # column that does not exist.
 NO_LINEAGE_TABLES = frozenset({
     "gram_panchayat", "voucher", "activity_voucher",
-    "dim_code", "dim_welfare_scheme", "dim_lsdg_theme",
+    "dim_code", "dim_welfare_scheme", "dim_lsdg_theme", "dim_rwi",
 })
 
 # Tables whose rows come straight from one canonical source_kind, keyed by

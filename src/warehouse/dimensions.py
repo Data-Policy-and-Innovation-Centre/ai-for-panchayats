@@ -54,17 +54,24 @@ DIMENSION_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "dim_code": ("variable", "code", "description", "source", "confidence"),
     "dim_lsdg_theme": ("focus_area_name", "lsdg_theme", "distinct_themes", "n_rows"),
     "dim_welfare_scheme": ("scheme_code", "scheme_name"),
+    "dim_rwi": ("gp_lgd_code", "district_name", "block_name", "gp_name", "rwi_score"),
 }
 
 # CSV spelling -> column name in the DDL. `n_rows` says nothing on its own
 # about which rows; it is the number of source activities behind the mapping.
 DIMENSION_RENAMES: Mapping[str, Mapping[str, str]] = {
     "dim_lsdg_theme": {"n_rows": "source_rows"},
+    "dim_rwi": {"gp_code": "gp_lgd_code"},
 }
 
 # Columns that are counts, not text, and are cast rather than stripped.
 DIMENSION_INTEGERS: Mapping[str, tuple[str, ...]] = {
     "dim_lsdg_theme": ("distinct_themes", "source_rows"),
+}
+
+# Decimal values that are cast as floats, rejecting corrupt characters.
+DIMENSION_FLOATS: Mapping[str, tuple[str, ...]] = {
+    "dim_rwi": ("rwi_score",),
 }
 
 # A count and the population it was counted over. `distinct_themes` is the
@@ -87,6 +94,7 @@ DIMENSION_REQUIRED: Mapping[str, tuple[str, ...]] = {
     "dim_code": ("source",),
     "dim_lsdg_theme": ("lsdg_theme",),
     "dim_welfare_scheme": ("scheme_name",),
+    "dim_rwi": ("gp_lgd_code", "rwi_score"),
 }
 
 # Columns whose duplication is a contradiction rather than a repetition,
@@ -96,6 +104,7 @@ DIMENSION_REQUIRED: Mapping[str, tuple[str, ...]] = {
 DIMENSION_KEYS: Mapping[str, tuple[str, ...]] = {
     "dim_code": ("variable", "code"),
     "dim_welfare_scheme": ("scheme_code",),
+    "dim_rwi": ("gp_lgd_code",),
 }
 
 
@@ -132,7 +141,8 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
     frame = frame.loc[:, list(kept)]
     frame = frame.rename(columns=dict(DIMENSION_RENAMES.get(name, {})))
     integers = DIMENSION_INTEGERS.get(name, ())
-    for column in [c for c in frame.columns if c not in integers]:
+    floats = DIMENSION_FLOATS.get(name, ())
+    for column in [c for c in frame.columns if c not in integers and c not in floats]:
         # Values arrive with stray whitespace ("Theme 5 - Clean and Green
         # Village "), and a trailing space in a label is visible to a user.
         frame[column] = frame[column].astype("string").str.strip()
@@ -167,6 +177,27 @@ def _load(name: str, directory: Path | None = None) -> pd.DataFrame:
                 f"{offending.head(3).to_dict('records')}"
             )
         frame[column] = numeric.astype("Int64")
+
+    for column in floats:
+        raw = frame[column].astype("string").str.strip()
+        numeric = pd.to_numeric(raw, errors="coerce")
+        invalid = raw.isna() | (raw == "") | numeric.isna()
+        if invalid.any():
+            offending = frame.loc[invalid, [*keys_for(name), column]]
+            raise DimensionError(
+                f"{path}: {column} must be a valid number; got "
+                f"{offending.head(3).to_dict('records')}"
+            )
+        frame[column] = numeric.astype("float64")
+        
+        # Enforce strict bounds for RWI score:
+        if name == "dim_rwi" and column == "rwi_score":
+            out_of_bounds = frame[(frame[column] < -2.0) | (frame[column] > 2.0)]
+            if not out_of_bounds.empty:
+                raise DimensionError(
+                    f"{path}: {column} must be between -2.0 and 2.0; got "
+                    f"{out_of_bounds.head(3).to_dict('records')}"
+                )
 
     bounded = DIMENSION_COUNT_BOUNDS.get(name)
     if bounded is not None:

@@ -71,7 +71,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset({
     "activity_asset", "activity_fund", "activity_training", "activity_community_service",
     "activity_nsap", "activity_expenditure", "voucher", "activity_voucher",
     "admin_approval", "admin_approval_scheme", "technical_approval", "physical_progress",
-    "dim_code", "dim_welfare_scheme", "dim_lsdg_theme",
+    "dim_code", "dim_welfare_scheme", "dim_lsdg_theme", "dim_rwi",
     # The twentieth: GP demographics from the panchayat profile extract
     # (#123). The Box spec documents "19 tables" and needs the same
     # amendment, or the checker and the documents now disagree.
@@ -106,6 +106,7 @@ DYNAMIC_RELATIONS: frozenset[str] = frozenset({"v_activity"})
 EXPECTED_PRIMARY_KEYS: dict[str, tuple[str, ...] | None] = {
     "gram_panchayat": ("gp_lgd_code",),
     "gp_profile": ("gp_lgd_code",),
+    "dim_rwi": ("gp_lgd_code",),
     "plan": ("plan_code",),
     "planned_activity": ("activity_code",),
     "activity_delegation": ("activity_code",),

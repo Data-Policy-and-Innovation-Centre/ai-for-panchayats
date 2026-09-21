@@ -295,3 +295,21 @@ def test_an_unrecorded_confidence_still_loads(tmp_path: Path):
     frame = _load("dim_code", tmp_path)
     assert frame["confidence"].iloc[0] == ""
     assert frame["source"].iloc[0] == "Unresolved"
+
+def test_dim_rwi_rejects_out_of_bounds_scores(tmp_path: Path):
+    """An RWI score outside [-2.0, 2.0] is impossible and must fail the build."""
+    csv = tmp_path / "dim_rwi.csv"
+    csv.write_text("gp_lgd_code,district_name,block_name,gp_name,rwi_score\n1001,D1,B1,G1,2.5")
+    
+    with pytest.raises(DimensionError, match="must be between -2.0 and 2.0"):
+        _load("dim_rwi", tmp_path)
+
+def test_dim_rwi_rejects_missing_score(tmp_path: Path):
+    """A row missing its score entirely is useless and must fail."""
+    csv = tmp_path / "dim_rwi.csv"
+    csv.write_text("gp_lgd_code,district_name,block_name,gp_name,rwi_score\n1001,D1,B1,G1,")
+    
+    # Change the match string here!
+    with pytest.raises(DimensionError, match="must be a valid number"):
+        _load("dim_rwi", tmp_path)
+

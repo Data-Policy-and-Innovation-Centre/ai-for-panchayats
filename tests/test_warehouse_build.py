@@ -29,7 +29,7 @@ from _warehouse_helpers import approved, make_settings, normalize, publish_raw_r
 
 
 # The code dictionaries, which load on every build regardless of selection.
-DIMENSION_TABLES = ("dim_code", "dim_lsdg_theme", "dim_welfare_scheme")
+DIMENSION_TABLES = ("dim_code", "dim_lsdg_theme", "dim_welfare_scheme", "dim_rwi")
 
 
 def _pl_aa_run(tmp_path: Path, run_id: str = "run-1", *, activity_code: int = 7):
@@ -188,7 +188,7 @@ def test_empty_selection_still_publishes_a_valid_empty_warehouse(tmp_path: Path)
         if table not in DIMENSION_TABLES
     }
     assert all(count == 0 for count in derived.values()), derived
-    assert [result.counts.get(table) for table in DIMENSION_TABLES] == [717, 17, 12]
+    assert [result.counts.get(table) for table in DIMENSION_TABLES] == [717, 17, 12, 6814]
 
 
 # --------------------------------------------------------------------- analytical grain
