@@ -1,11 +1,7 @@
-import os
-from pathlib import Path
+from config import directories
 
-ROOT_DIR = Path(os.environ.get(
-    "PAI_PROJECT_ROOT",
-    "/home/dpico/ai-for-panchayats"
-))
-OUTPUT_DIR = ROOT_DIR / "data" / "raw" / "PAI"
+# Output directory -- sourced from the repo's canonical config (root config.py)
+OUTPUT_DIR = directories.RAW_DATA / "PAI"
 
 BASE_URL = "https://pai.gov.in"
 PAGE_URL = f"{BASE_URL}/PS/Public/TW-GP.aspx?s=2"
@@ -43,7 +39,7 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/151.0.0.0 Safari/537.36"
+        "Chrome/154.0.0.0 Safari/537.36"
     ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
@@ -51,8 +47,13 @@ HEADERS = {
         "q=0.8,application/signed-exchange;v=b3;q=0.7"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Connection": "keep-alive",
     "Origin": BASE_URL,
     "Referer": PAGE_URL,
+    "Sec-Ch-Ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "same-origin",

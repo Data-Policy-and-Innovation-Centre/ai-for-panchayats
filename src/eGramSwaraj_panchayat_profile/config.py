@@ -4,11 +4,11 @@ from pathlib import Path
 # Base URLs
 URL = "https://egramswaraj.gov.in/knowYourPanchayat.do"
 
-# Output Directory
-# Determine the project root dynamically. 
-# Assuming config.py is at <project_root>/src/eGramSwaraj_panchayat_profile/config.py
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = PROJECT_ROOT / "data" / "raw" / "eGramSwaraj_Panchayat_profile"
+# Output Directory — project root is two levels up from this file
+# (config.py → eGramSwaraj_panchayat_profile → src → project root)
+# pyproject.toml sets pythonpath = ["src", "."] so we can also use config.directories
+from config import directories
+OUTPUT_DIR = directories.RAW_DATA / "eGramSwaraj_Panchayat_profile"
 
 # Headers for the requests
 HEADERS = {
@@ -24,13 +24,15 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 }
 
-# Cookies (these may need to be updated if your session expires)
+# Cookies — resolved at runtime from environment variables.
+# See .env.example for the required keys.
+# IMPORTANT: Rotate the eGramSwaraj session on the portal — the old
+# hardcoded values are burned in git history regardless of this fix.
+# Set EGRAM_JSESSIONID and EGRAM_SECURITY in your environment before running.
 COOKIES = {
-    "_ga": "GA1.1.585595965.1782929135",
-    "security": "a9419864-27a3-438a-9bdc-d099bcedc5de",
-    "JSESSIONID": "0C5FFFBE4D44E2172BB9C9987EB11282", 
-    "key": "value"
+    "JSESSIONID": os.environ.get("EGRAM_JSESSIONID", ""),
+    "security": os.environ.get("EGRAM_SECURITY", ""),
 }
