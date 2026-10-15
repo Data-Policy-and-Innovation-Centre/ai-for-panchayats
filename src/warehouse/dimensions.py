@@ -61,7 +61,6 @@ DIMENSION_COLUMNS: Mapping[str, tuple[str, ...]] = {
 # about which rows; it is the number of source activities behind the mapping.
 DIMENSION_RENAMES: Mapping[str, Mapping[str, str]] = {
     "dim_lsdg_theme": {"n_rows": "source_rows"},
-    "dim_rwi": {"gp_code": "gp_lgd_code"},
 }
 
 # Columns that are counts, not text, and are cast rather than stripped.

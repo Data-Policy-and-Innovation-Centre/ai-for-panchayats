@@ -188,7 +188,7 @@ def test_empty_selection_still_publishes_a_valid_empty_warehouse(tmp_path: Path)
         if table not in DIMENSION_TABLES
     }
     assert all(count == 0 for count in derived.values()), derived
-    assert [result.counts.get(table) for table in DIMENSION_TABLES] == [717, 17, 12, 6814]
+    assert [result.counts.get(table) for table in DIMENSION_TABLES] == [717, 17, 12, 6794]
 
 
 # --------------------------------------------------------------------- analytical grain

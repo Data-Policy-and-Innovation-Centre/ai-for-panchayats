@@ -313,3 +313,25 @@ def test_dim_rwi_rejects_missing_score(tmp_path: Path):
     with pytest.raises(DimensionError, match="must be a valid number"):
         _load("dim_rwi", tmp_path)
 
+def test_dim_rwi_covers_conformed_lgd_roster():
+    """dim_rwi must cover all 6,794 Gram Panchayats in the conformed LGD geography roster."""
+    from src.warehouse.geography import gp_geography
+
+    frames = dimension_frames()
+    rwi = frames["dim_rwi"]
+    assert len(rwi) == 6794, "dim_rwi must cover all 6,794 Odisha Gram Panchayats"
+
+    geography = gp_geography()
+    missing = set(rwi["gp_lgd_code"]) - set(geography.keys())
+    assert not missing, f"dim_rwi contains LGD codes not in the LGD roster: {missing}"
+
+    uncovered = set(geography.keys()) - set(rwi["gp_lgd_code"])
+    assert not uncovered, f"LGD roster contains codes missing from dim_rwi: {uncovered}"
+
+    # Verify canonical LGD code for Angarbandha
+    angarbandha = rwi[rwi["gp_lgd_code"] == "115550"]
+    assert len(angarbandha) == 1
+    assert angarbandha["gp_name"].iloc[0] == "Angarbandha"
+    assert angarbandha["district_name"].iloc[0] == "Anugul"
+    assert 0.29 <= angarbandha["rwi_score"].iloc[0] <= 0.30
+
