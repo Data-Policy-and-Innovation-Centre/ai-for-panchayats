@@ -171,8 +171,8 @@ FULL_DDL: dict[str, str] = {
     "dim_code": "CREATE TABLE dim_code (variable VARCHAR, code VARCHAR, PRIMARY KEY (variable, code))",
     "dim_welfare_scheme": "CREATE TABLE dim_welfare_scheme (scheme_code VARCHAR PRIMARY KEY)",
     "dim_lsdg_theme": "CREATE TABLE dim_lsdg_theme (theme_code VARCHAR)",
+    "dim_rwi": "CREATE TABLE dim_rwi (gp_lgd_code VARCHAR PRIMARY KEY, district_name VARCHAR, block_name VARCHAR, gp_name VARCHAR, rwi_score DOUBLE)",
 }
-
 
 def _connect(tmp_path, name: str = "warehouse.duckdb") -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(tmp_path / name))
