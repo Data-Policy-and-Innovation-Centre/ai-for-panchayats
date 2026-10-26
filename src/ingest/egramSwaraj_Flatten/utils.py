@@ -13,7 +13,9 @@ from typing import Any
 
 import pandas as pd
 
-from .config import FOLDER_RE, FILE_RE, KINDS, ROW_ID, LEADING_COLUMNS
+from collections.abc import Generator
+
+from .config import FOLDER_RE, FILE_RE, KINDS, LEADING_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ def iter_json_files(
     input_dir: Path,
     kinds: tuple[str, ...] = KINDS,
     limit_gps: int | None = None,
-) -> "Generator[Path, None, None]":
+) -> Generator[Path, None, None]:
     """Yield every <year>_<KIND>.json beneath input_dir/LGD_*/ folders.
 
     Folders are sorted for reproducibility; limit_gps caps the number of GP
