@@ -3,6 +3,14 @@ import json
 import time
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+# Bootstrap: add repo root to sys.path so first-party packages are importable
+# when running this script directly (e.g. `python scripts/run_eGramSwaraj_Panchayat_profile.py`).
+# Without this, Python puts the scripts/ directory on sys.path, not the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.eGramSwaraj_panchayat_profile.scrapper import scrape_panchayat_info
 from src.eGramSwaraj_panchayat_profile.config import OUTPUT_DIR
 
