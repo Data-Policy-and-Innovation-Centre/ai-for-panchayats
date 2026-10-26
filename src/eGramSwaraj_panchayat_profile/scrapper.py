@@ -67,10 +67,16 @@ def scrape_panchayat_info(state_id, local_body_type_code, label1, label11, label
                         else:
                             panchayat_data[sec] = sec_data
         
-        # If no data at all was found, maybe grab all text for debugging
+        # If no data at all was found, the portal likely returned an expired-session,
+        # CAPTCHA, or error page. Return None so the runner treats this as a failure
+        # and does NOT save a corrupt success file (which would permanently skip
+        # this panchayat on all future runs).
+        # Diagnostic page preview is logged separately, not mixed into scraped records.
         if not panchayat_data:
-            panchayat_data["raw_content_preview"] = soup.get_text()[:500]
-            
+            preview = soup.get_text()[:500].strip()
+            print(f"Warning: No panchayat data found for {label111}. Page preview: {preview!r}")
+            return None
+
         return panchayat_data
 
     except requests.exceptions.RequestException as e:
