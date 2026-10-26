@@ -275,6 +275,23 @@ def build_master(paths: list[Path], output_dir: Path, kind: str, table: str,
         written[0].replace(final)
         written = [final]
 
+    # Remove any obsolete master part files left over from a previous run that
+    # produced more parts than the current run (e.g. old _p002.csv after a
+    # smaller rerun). Glob all egramswaraj_<table>_p*.csv files in the output
+    # kind directory and delete any that are NOT in the newly written set.
+    kind_dir = output_dir / kind
+    if kind_dir.is_dir():
+        written_set = set(written)
+        for stale in kind_dir.glob(f"egramswaraj_{table}_p*.csv"):
+            if stale not in written_set:
+                stale.unlink()
+                logger.info("Removed obsolete master part: %s", stale.name)
+    # Also remove the unsplit master if we now produce parts (reverse transition).
+    unsplit = master_path(output_dir, kind, table)
+    if unsplit not in set(written) and unsplit.exists():
+        unsplit.unlink()
+        logger.info("Removed obsolete unsplit master: %s", unsplit.name)
+
     logger.info("Master %s: %d row(s), %d col(s), %d file(s)",
                 table, rows, len(columns), len(written))
     return rows, written
