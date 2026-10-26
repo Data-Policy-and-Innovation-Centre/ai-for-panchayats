@@ -6,13 +6,20 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from loguru import logger
 
+from .api import create_session, fetch_with_retry, get_blocks, get_districts
 from .config import (
-    STATE_ID, FY_ID, PAGE_URL, REQUEST_DELAY, OUTPUT_DIR,
+    FY_ID,
+    OUTPUT_DIR,
+    PAGE_URL,
+    REQUEST_DELAY,
+    STATE_ID,
 )
-from .api import create_session, fetch_with_retry, get_districts, get_blocks
 from .utils import (
-    extract_asp_hidden_fields, build_form_data, build_next_page_form,
-    parse_gp_table, has_next_page,
+    build_form_data,
+    build_next_page_form,
+    extract_asp_hidden_fields,
+    has_next_page,
+    parse_gp_table,
 )
 
 
@@ -104,7 +111,7 @@ def scrape_all():
                 )
                 logger.info("    -> {} GPs scraped.", len(records))
                 all_gp_records.extend(records)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.exception(
                     "    ✗ Failed to scrape block {} / {} — skipping.",
                     district_name, block_name,

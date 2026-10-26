@@ -138,6 +138,4 @@ def parse_gp_table(soup: BeautifulSoup,
 def has_next_page(soup: BeautifulSoup) -> bool:
     """Check if the 'Next 100 >>' button is enabled."""
     btn = soup.find("input", {"id": "btnNext"})
-    if btn and not btn.get("disabled"):
-        return True
-    return False
+    return bool(btn and not btn.get("disabled"))
