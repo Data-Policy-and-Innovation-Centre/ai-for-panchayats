@@ -1,0 +1,8 @@
+version: 1
+
+# Staging registry: smoke-test snapshots drawn from a sample of the real
+# downloaded data. Kept separate from config/snapshots.yaml so a sample can
+# never be selected by a production build -- and because snapshots.py refuses
+# any entry that is not `approved`, so a sample cannot be parked in the real
+# registry as "pending".
+snapshots: []

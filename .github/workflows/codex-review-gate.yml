@@ -1,0 +1,164 @@
+name: Codex Review Gate
+
+# Codex in GitHub publishes no check run and no commit status, so this job
+# turns its two signals -- a review naming the commit it read, or a bare :+1:
+# when it found nothing -- into one required check.
+#
+# Two GitHub constraints explain the shape of this file:
+#
+#   1. Reactions emit no webhook, and neither does resolving a review thread,
+#      so a clean :+1: and the last resolve of a round cannot trigger a run.
+#      The schedule sweeps open pull requests to catch both, and is the only
+#      thing that ever will -- see the cadence note on the cron below.
+#   2. Runs from `issue_comment` and `pull_request_review` attach to the default
+#      branch, not the pull request head. The check run is therefore created
+#      against `head_sha` through the API rather than reported by the job.
+#
+# To make the gate binding, add the check named `codex-review` -- which this
+# job creates through the API -- to the branch ruleset's required status
+# checks. The job itself is deliberately named something else: a job called
+# `codex-review` would produce a second, always-green check run under the same
+# name, and the ruleset would accept that one instead.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+  issue_comment:
+    types: [created]
+  schedule:
+    # Asks for every 5 minutes; GitHub does not deliver that. Measured over
+    # 24h on the repository this gate was ported from: 37 sweeps, not the
+    # ~288 the expression implies, with gaps of min 21 / median 41 / max 77
+    # minutes. High-frequency schedules are dropped first under load, so the
+    # rate is a request, not a guarantee.
+    #
+    # This is the gate's real latency floor, because the sweep is the *only*
+    # route by which a clean :+1: or the final thread resolve of a round is
+    # ever noticed. Expect a pull request cleared that way to sit red for
+    # tens of minutes; up to about 77 is normal, not stuck. Anything holding
+    # a merge should use `workflow_dispatch` rather than wait:
+    #
+    #     gh workflow run codex-review-gate.yml -f pr=<number>
+    #
+    # Lowering the frequency is not obviously better and has not been
+    # measured; leaving it at */5 costs nothing, since asking for more than
+    # GitHub grants is harmless.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: read
+
+# Queue rather than cancel. This workflow fires on pull_request,
+# pull_request_review, pull_request_review_comment, issue_comment and a
+# throttled cron, and every per-PR trigger shares one group. With
+# cancel-in-progress the commonest sequence -- push a fix, then comment
+# `@codex review` -- has the comment's run cancel the push's run, leaving a
+# CANCELLED `evaluate` job attached to the head commit forever. The verdict
+# check itself is green, so the pull request sits at UNSTABLE with a
+# permanently unhappy check that has to be reasoned about by hand each time.
+#
+# Cancelling is safe for the verdict (each run posts against the head_sha it
+# actually evaluated, so a late run cannot mislabel a newer commit) but it is
+# not free: it makes a passing gate look like a failing one. Runs are short,
+# and the cron sweep keys on run_id so it never queues behind anything.
+#
+# cancel-in-progress: false only protects the RUNNING job. GitHub's own
+# default still cancels a PENDING one: "only one job or workflow run can be
+# pending in a concurrency group at a time" -- a third event arriving while a
+# second is queued behind the first replaces (cancels) that second run, even
+# though nothing is in progress on it yet. A push followed quickly by
+# `@codex review` followed by a review submission reaches this: the review's
+# run supersedes the still-queued comment's run. `queue: max` is the
+# documented way to stop that -- up to 100 runs wait in the group instead of
+# the newest replacing the previous pending one -- and it is the only queue
+# mode allowed alongside cancel-in-progress: false (queue: max plus
+# cancel-in-progress: true is a validation error, since they describe
+# conflicting handling of in-progress runs).
+concurrency:
+  group: codex-review-gate-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.run_id }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    # issue_comment fires on plain issues too; only pull requests have a head.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request != null
+    steps:
+      # Never the pull request's own code. On `pull_request` the default
+      # checkout is `refs/pull/N/merge`, which would run a contributor-edited
+      # gate script with this job's `checks: write` token. The script reads
+      # only the API, so the base copy is all it needs. The consequence is
+      # that edits to the gate are not exercised here;
+      # `tests/test_check_codex_review.py` covers them on the Pipeline job.
+      #
+      # This raises the cost of self-bypass; it does not close it. On a
+      # same-repo `pull_request` the *workflow definition* also comes from the
+      # merge ref, so a branch can delete this step and keep the token.
+      # Closing that needs the decision to run from a base-controlled event.
+      # Fork PRs are not a way in: their `GITHUB_TOKEN` is read-only, so
+      # `checks: write` is never granted.
+      - name: Check out trusted base copy of the gate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || 'main' }}
+          persist-credentials: false
+
+      - name: Resolve pull requests to gate
+        id: targets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            numbers="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --limit 100 --json number --jq '.[].number' | tr '\n' ' ')"
+          else
+            numbers="$EVENT_PR"
+          fi
+
+          echo "numbers=$numbers" >> "$GITHUB_OUTPUT"
+          echo "Gating: ${numbers:-none}"
+
+      - name: Evaluate Codex review signal
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NUMBERS: ${{ steps.targets.outputs.numbers }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The trusted copy is the default branch, so until this lands there
+          # the gate has nothing to run. Stay quiet rather than failing every
+          # open pull request on a workflow that is not deployed yet.
+          if [ ! -f scripts/check_codex_review.py ]; then
+            echo "::notice::Gate not yet on the default branch; nothing to enforce."
+            exit 0
+          fi
+
+          for pr in $NUMBERS; do
+            echo "::group::PR #$pr"
+            python3 scripts/check_codex_review.py \
+              --repo "$GITHUB_REPOSITORY" \
+              --pr "$pr" \
+              --check-name codex-review \
+              --post-check-run
+            echo "::endgroup::"
+          done

@@ -12,7 +12,9 @@ from tqdm import tqdm
 class Directories:
     """Directories used by the project."""
 
-    ROOT_DIR = Path(__file__).resolve().parent
+    # ``absolute`` normalizes the usual ``__file__`` value without resolving
+    # symlinks or consulting the filesystem.
+    ROOT_DIR = Path(__file__).absolute().parent
 
     SRC = ROOT_DIR / "src"
     SCRIPTS = ROOT_DIR / "scripts"
@@ -31,23 +33,27 @@ class Directories:
     TABLES = OUTPUTS / "tables"
     LOGS = ROOT_DIR / "logs"
 
-    def __init__(self) -> None:
-        for directory in [
-            self.SRC,
-            self.SCRIPTS,
-            self.NOTEBOOKS,
-            self.TESTS,
-            self.DATA,
-            self.RAW_DATA,
-            self.INTERIM_DATA,
-            self.PROCESSED_DATA,
-            self.EXTERNAL_DATA,
-            self.OUTPUTS,
-            self.FIGURES,
-            self.REPORTS,
-            self.TABLES,
-            self.LOGS,
-        ]:
+    _DIRECTORY_ATTRIBUTES = (
+        "SRC",
+        "SCRIPTS",
+        "NOTEBOOKS",
+        "TESTS",
+        "DATA",
+        "RAW_DATA",
+        "INTERIM_DATA",
+        "PROCESSED_DATA",
+        "EXTERNAL_DATA",
+        "OUTPUTS",
+        "FIGURES",
+        "REPORTS",
+        "TABLES",
+        "LOGS",
+    )
+
+    def create_directories(self) -> None:
+        """Create the project directories when a caller explicitly opts in."""
+        for attribute in self._DIRECTORY_ATTRIBUTES:
+            directory = getattr(self, attribute)
             directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -73,7 +79,14 @@ class Settings(BaseSettings):
     model_config = ConfigDict(env_file=directories.ROOT_DIR / ".env")
 
 
-settings = Settings()
+# Keep the historical module-level ``settings`` object without probing a
+# repository .env file while importing this module. Passing the already
+# normalized DEBUG value also preserves the old defaulting behavior when an
+# unrelated environment uses a non-boolean DEBUG label such as "release".
+settings = Settings(
+    _env_file=None,
+    DEBUG=os.getenv("DEBUG", "True").lower() in ("true", "1", "yes"),
+)
 
 
 def stop_logging_to_console(
@@ -97,5 +110,3 @@ def stop_logging_to_console(
 def resume_logging_to_console() -> None:
     """Resume console logging using tqdm-safe writes."""
     logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
-
-
