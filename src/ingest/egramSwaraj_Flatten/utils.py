@@ -37,8 +37,8 @@ def iter_json_files(
     input_dir: Path,
     kinds: tuple[str, ...] = KINDS,
     limit_gps: int | None = None,
-) -> Generator[Path, None, None]:
-    """Yield every <year>_<KIND>.json beneath input_dir/LGD_*/ folders.
+) -> Generator[tuple[Path, str], None, None]:
+    """Yield every (json_file, kind) beneath input_dir/LGD_*/ folders.
 
     Folders are sorted for reproducibility; limit_gps caps the number of GP
     folders visited (useful for smoke-testing).
@@ -56,7 +56,7 @@ def iter_json_files(
             stem = json_file.stem  # e.g. "2021_PL"
             m = FILE_RE.match(stem)
             if m and m.group("kind") in kind_set:
-                yield json_file
+                yield json_file, m.group("kind")
             else:
                 logger.debug("Skipping unexpected file: %s", json_file)
 
