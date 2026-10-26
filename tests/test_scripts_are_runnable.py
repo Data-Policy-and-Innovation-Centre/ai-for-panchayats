@@ -37,6 +37,7 @@ SCRIPTS = (
     "build_warehouse.py",
     "check_warehouse_conformance.py",
     "fetch_snapshot.py",
+    "run_egram_flatten.py",
 )
 
 # Scripts that import first-party code and are deliberately NOT covered, each
@@ -56,7 +57,9 @@ SCRIPTS = (
 #                            no `--help` to probe. Adding the repo root alone
 #                            does not make it runnable.
 UNCOVERED = (
+    "run_eGramSwaraj_Panchayat_profile.py",
     "run_egram_scraper.py",
+    "run_pai_scraper.py",
     "run_panchayat_nirnay.py",
     "run_sabhasaar.py",
 )
