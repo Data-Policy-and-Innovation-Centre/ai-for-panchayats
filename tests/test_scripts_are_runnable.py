@@ -37,6 +37,7 @@ SCRIPTS = (
     "build_warehouse.py",
     "check_warehouse_conformance.py",
     "fetch_snapshot.py",
+    "run_egram_flatten.py",
 )
 
 # Scripts that import first-party code and are deliberately NOT covered, each

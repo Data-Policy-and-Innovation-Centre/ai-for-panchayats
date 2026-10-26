@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import uuid4
 
 from bs4 import BeautifulSoup
 from loguru import logger
+
+from src.pipeline.manifest import RunPublisher
 
 from .api import create_session, fetch_with_retry, get_blocks, get_districts
 from .config import (
@@ -23,8 +29,15 @@ from .utils import (
 )
 
 
-def scrape_block(session, state_id, district_id, district_name,
-                 block_id, block_name, fy_id=FY_ID):
+def scrape_block(
+    session,
+    state_id: str,
+    district_id: str,
+    district_name: str,
+    block_id: str,
+    block_name: str,
+    fy_id: str = FY_ID,
+) -> list[dict]:
     """Scrape all GP records for a single block, handling pagination."""
     resp = fetch_with_retry(session, "GET", PAGE_URL)
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -55,14 +68,14 @@ def scrape_block(session, state_id, district_id, district_name,
     return all_records
 
 
-def scrape_all():
-    """Scrape PAI scores for all GPs in Odisha."""
+def scrape_all(
+    raw_root: Path | str | None = None,
+    run_id: str | None = None,
+) -> Path:
+    """Scrape PAI scores for all GPs in Odisha and publish an immutable run."""
     logger.info("=" * 60)
     logger.info("PAI Scraper — Odisha (FY 2023-2024)")
     logger.info("=" * 60)
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Output directory: {}", OUTPUT_DIR)
 
     session = create_session()
 
@@ -71,12 +84,13 @@ def scrape_all():
         logger.error("No districts found! Check network connectivity or API changes.")
         sys.exit(1)
 
-    all_gp_records = []
+    all_gp_records: list[dict] = []
+    failures: list[dict] = []
     scrape_stats = {
         "state": "Odisha",
         "state_id": STATE_ID,
         "financial_year": "2023-2024",
-        "scrape_started_at": datetime.now().isoformat(),
+        "scrape_started_at": datetime.now(UTC).isoformat(),
         "total_districts": len(districts),
         "total_blocks": 0,
         "total_gram_panchayats": 0,
@@ -111,29 +125,75 @@ def scrape_all():
                 )
                 logger.info("    -> {} GPs scraped.", len(records))
                 all_gp_records.extend(records)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "    ✗ Failed to scrape block {} / {} — skipping.",
                     district_name, block_name,
                 )
+                failures.append({
+                    "district_id": district_id,
+                    "district_name": district_name,
+                    "block_id": block_id,
+                    "block_name": block_name,
+                    "error": str(exc),
+                })
 
     scrape_stats["total_gram_panchayats"] = len(all_gp_records)
-    scrape_stats["scrape_finished_at"] = datetime.now().isoformat()
+    scrape_stats["failed_blocks"] = len(failures)
+    scrape_stats["scrape_finished_at"] = datetime.now(UTC).isoformat()
 
     output = {
         "metadata": scrape_stats,
         "data": all_gp_records,
+        "failures": failures,
     }
 
-    # TODO: Replace this direct file write with RunPublisher from src/pipeline/
-    # once it lands. RunPublisher provides immutable, hash-verified runs with
-    # run IDs and manifests. Every other adapter in the repo is being written
-    # against it. See reviewer comment on original line 311.
-    output_file = OUTPUT_DIR / "odisha_pai_scores.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+    # Route through RunPublisher to create an immutable, hash-verified run
+    actual_raw_root = Path(raw_root) if raw_root is not None else OUTPUT_DIR.parent
+    actual_run_id = run_id or f"odisha_pai_{datetime.now(UTC).strftime('%Y%m%d_%H%M%SZ')}"
+    terminal_state = "failed" if failures else "complete"
+
+    with RunPublisher(
+        raw_root=actual_raw_root,
+        source="PAI",
+        run_id=actual_run_id,
+        requested_scope={"state_id": STATE_ID, "financial_year": "2023-2024"},
+    ) as publisher:
+        publisher.write_payload("odisha_pai_scores.json", json.dumps(output, ensure_ascii=False, indent=2))
+        run_destination = publisher.publish(
+            terminal_state=terminal_state,
+            observed_scope={
+                "state_id": STATE_ID,
+                "total_districts": len(districts),
+                "total_blocks": scrape_stats["total_blocks"],
+                "failed_blocks": len(failures),
+            },
+            counts={
+                "gram_panchayats": len(all_gp_records),
+                "failed_blocks": len(failures),
+            },
+            failures=failures,
+        )
+
+    # Only update the standalone canonical output if the run completed with ZERO failures.
+    # An incomplete, timed-out, or failed run never replaces an existing complete run.
+    standalone_file = OUTPUT_DIR / "odisha_pai_scores.json"
+    if terminal_state == "complete" and all_gp_records:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        temp_file = OUTPUT_DIR / f".odisha_pai_scores.json.tmp.{uuid4().hex}"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        temp_file.replace(standalone_file)
+        logger.info("Updated canonical output: {}", standalone_file)
+    elif failures:
+        logger.warning(
+            "Run had {} failed block(s); preserved any existing canonical output at {}",
+            len(failures), standalone_file,
+        )
 
     logger.info("=" * 60)
-    logger.info("DONE — {} GP records saved to {}", len(all_gp_records), output_file)
+    logger.info("Published run: {} (terminal_state={})", run_destination, terminal_state)
     logger.info("Stats: {}", json.dumps(scrape_stats, indent=2))
     logger.info("=" * 60)
+
+    return run_destination

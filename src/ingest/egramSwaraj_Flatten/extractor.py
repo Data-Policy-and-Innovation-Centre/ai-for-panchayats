@@ -361,8 +361,19 @@ def process(
 
     if master:
         for kind, writer in writers.items():
+            all_written_files: set[Path] = set()
             for table, paths in sorted(writer.batches.items()):
-                build_master(paths, output_dir, kind, table, master_max_rows)
+                _, written = build_master(paths, output_dir, kind, table, master_max_rows)
+                all_written_files.update(written)
+
+            # Retire any master or child tables that disappeared entirely on this rerun.
+            kind_dir = output_dir / kind
+            if kind_dir.is_dir():
+                for existing_csv in kind_dir.glob("egramswaraj_*.csv"):
+                    if existing_csv not in all_written_files:
+                        existing_csv.unlink()
+                        logger.info("[%s] Retired obsolete master/child table: %s", kind, existing_csv.name)
+
             if not keep_batches and writer.batches:
                 shutil.rmtree(output_dir / kind / BATCH_DIRNAME,
                               ignore_errors=True)

@@ -102,14 +102,21 @@ def to_records(payload: Any) -> list[dict]:
 
 
 def coerce_nested(record: dict) -> dict:
-    """JSON-encode any value that is itself a nested dict (but not a list).
+    """JSON-encode scalar nested dicts that contain no lists.
 
-    Lists are left as-is so ``split_list_columns`` can expand them into child
-    tables. Plain dicts would survive ``pd.json_normalize`` but keeping them
-    as strings makes the output schema uniform across GP folders.
+    Preserves nested dicts containing lists/arrays so split_list_columns
+    can expand them into relational child tables.
     """
+    def _contains_list(val: Any) -> bool:
+        if isinstance(val, list):
+            return True
+        if isinstance(val, dict):
+            return any(_contains_list(v) for v in val.values())
+        return False
+
     return {
-        k: json.dumps(v, ensure_ascii=False) if isinstance(v, dict) else v
+        k: (v if _contains_list(v) else json.dumps(v, ensure_ascii=False))
+        if isinstance(v, dict) else v
         for k, v in record.items()
     }
 
